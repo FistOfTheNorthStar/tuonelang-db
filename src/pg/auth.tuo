@@ -1,0 +1,314 @@
+// pg::auth — the authentication handshake, and the ADR-0019 crypto seam.
+//
+// A server's first reply to a startup packet is an `AuthenticationRequest`
+// whose Int32 sub-kind says what it wants. This module turns that sub-kind
+// into a **decision**: either a message to send back, or a typed error that
+// names precisely why the adapter cannot proceed and what the operator should
+// do about it.
+//
+// THE CRYPTO BOUNDARY — the one thing to understand here.
+//
+// Two of the three realistic methods need hashing that tuonelang v0 cannot
+// express, because v0 has no bitwise operators:
+//
+//   * `AuthenticationMD5Password` needs `md5(md5(password + user) + salt)`;
+//   * SASL/`SCRAM-SHA-256` needs SHA-256, HMAC-SHA-256, and PBKDF2.
+//
+// SHA-256 is not merely *slow* to write without `^`, `>>`, and `&` — it is
+// impossible, because it is *defined* in those terms. ADR-0019 exists to close
+// exactly this gap: Stage A adds the six operators, Stage B adds `std::crypto`
+// with `md5`, `sha256`, `hmac_sha256`, `pbkdf2_sha256`, and `base64_*`.
+//
+// So this module is written as a **seam**, not a stub:
+//
+//   * every decision, message shape, and error is implemented and spec-checked
+//     **today** — `plan` returns the right answer for all eight sub-kinds, and
+//     `pg::proto` already encodes the SASL framing byte-exactly;
+//   * the two crypto-dependent branches return a `kind_auth` error whose
+//     message names the method, the blocking primitive, and the operator's
+//     immediate fix; and
+//   * `md5_response` and `scram_client_first` are present with their **final
+//     signatures**, so when Stage B lands the change is a body swap behind an
+//     unchanged interface — no caller and no spec moves.
+//
+// This is the "refuse rather than mis-compile" rule the language applies to
+// itself, applied to a library: the adapter never pretends to authenticate.
+
+module pg::auth;
+
+// ----------------------------------------------------------------------------
+// The plan: what the client must do about an AuthenticationRequest.
+// ----------------------------------------------------------------------------
+
+/// Nothing to do — the server accepted the connection (`AuthenticationOk`).
+pub fn plan_ok() -> Int {
+    0
+}
+
+/// Send a `PasswordMessage` containing the password in the clear.
+pub fn plan_cleartext() -> Int {
+    1
+}
+
+/// Send a `PasswordMessage` containing the MD5 digest. **Blocked** until
+/// ADR-0019 Stage B; see `md5_response`.
+pub fn plan_md5() -> Int {
+    2
+}
+
+/// Begin a SASL/SCRAM-SHA-256 exchange. **Blocked** until ADR-0019 Stage B.
+pub fn plan_sasl() -> Int {
+    3
+}
+
+/// The server asked for something this adapter does not implement.
+pub fn plan_unsupported() -> Int {
+    4
+}
+
+/// Classify an `AuthenticationRequest` sub-kind into the plan a client must
+/// follow.
+///
+/// This is pure classification — no socket, no secret — which is what makes
+/// the whole handshake policy spec-checkable without a server.
+///
+/// # Example
+/// ```tuo
+/// let p = pg::auth::plan(0); // plan_ok()
+/// ```
+pub fn plan(take auth_kind: Int) -> Int {
+    if auth_kind == pg::proto::auth_ok() {
+        plan_ok()
+    } else if auth_kind == pg::proto::auth_cleartext() {
+        plan_cleartext()
+    } else if auth_kind == pg::proto::auth_md5() {
+        plan_md5()
+    } else if auth_kind == pg::proto::auth_sasl() {
+        plan_sasl()
+    } else {
+        plan_unsupported()
+    }
+}
+
+/// Can the adapter carry out `plan` in this build?
+///
+/// `plan_ok` and `plan_cleartext` are executable today. The other two become
+/// executable when ADR-0019 Stage B lands `std::crypto`, at which point this
+/// function is the single place that flips.
+///
+/// # Example
+/// ```tuo
+/// let ok = pg::auth::is_supported(pg::auth::plan_ok()); // true
+/// ```
+pub fn is_supported(take p: Int) -> Bool {
+    p == plan_ok() || p == plan_cleartext()
+}
+
+/// Does this method require crypto the language does not yet have?
+///
+/// Distinguishes "blocked on ADR-0019" from "not implemented at all"
+/// (Kerberos, GSSAPI), because those two want different answers from an
+/// operator: wait for a language feature, versus change the server's config.
+///
+/// # Example
+/// ```tuo
+/// let b = pg::auth::needs_crypto(pg::auth::plan_md5()); // true
+/// ```
+pub fn needs_crypto(take p: Int) -> Bool {
+    p == plan_md5() || p == plan_sasl()
+}
+
+/// A human-readable name for an authentication sub-kind, for diagnostics.
+///
+/// # Example
+/// ```tuo
+/// let n = pg::auth::method_name(5); // "md5"
+/// ```
+pub fn method_name(take auth_kind: Int) -> Str {
+    if auth_kind == pg::proto::auth_ok() {
+        "ok"
+    } else if auth_kind == pg::proto::auth_cleartext() {
+        "cleartext password"
+    } else if auth_kind == pg::proto::auth_md5() {
+        "md5"
+    } else if auth_kind == pg::proto::auth_sasl() {
+        "SCRAM-SHA-256"
+    } else if auth_kind == pg::proto::auth_sasl_continue() {
+        "SCRAM continue"
+    } else if auth_kind == pg::proto::auth_sasl_final() {
+        "SCRAM final"
+    } else if auth_kind == pg::proto::auth_kerberos() {
+        "Kerberos V5"
+    } else if auth_kind == pg::proto::auth_gss() {
+        "GSSAPI"
+    } else {
+        "unknown"
+    }
+}
+
+/// The error the adapter reports when it cannot satisfy a demanded method.
+///
+/// The message names the method, the reason, and the **operator's fix**, which
+/// is what turns an error into something actionable rather than a dead end.
+///
+/// # Example
+/// ```tuo
+/// // let e = pg::auth::unsupported_error(5);
+/// ```
+pub fn unsupported_error(take auth_kind: Int) -> pg::error::PgError {
+    let p = plan(auth_kind);
+    var m = std::string::empty();
+    std::string::append(m, "server requested ");
+    std::string::append(m, method_name(auth_kind));
+    std::string::append(m, " authentication, which this adapter cannot perform: ");
+
+    if needs_crypto(p) {
+        std::string::append(m, "it needs hashing that tuonelang v0 has no bitwise operators for. ");
+        std::string::append(m, "ADR-0019 adds them plus std::crypto; until then, either use ");
+        std::string::append(m, "trust or password authentication for this host in pg_hba.conf, ");
+        std::string::append(m, "or connect over a channel that has already authenticated.");
+    } else {
+        std::string::append(m, "the method is not implemented. Configure the server to offer ");
+        std::string::append(m, "scram-sha-256, password, or trust for this host in pg_hba.conf.");
+    }
+
+    pg::error::new(pg::error::kind_auth(), std::string::as_str(m))
+}
+
+// ----------------------------------------------------------------------------
+// The crypto-dependent responses — final signatures, bodies pending Stage B.
+// ----------------------------------------------------------------------------
+
+/// The `PasswordMessage` body for `AuthenticationMD5Password`:
+/// `"md5" + md5(md5(password + user) + salt)`, lowercase hex.
+///
+/// **Not yet computable.** Returns `Err` until ADR-0019 Stage B lands
+/// `std::crypto::md5`; the signature is final, so the body becomes:
+///
+/// ```text
+/// let inner = std::crypto::md5(concat(password, user));
+/// let outer = std::crypto::md5(concat(inner, salt_bytes));
+/// Ok { value: concat("md5", outer) }
+/// ```
+///
+/// MD5 is cryptographically broken and PostgreSQL has deprecated it in favor
+/// of SCRAM; it is here only because servers still offer it.
+///
+/// # Example
+/// ```tuo
+/// // let r = pg::auth::md5_response("secret", "postgres", salt);
+/// ```
+pub fn md5_response(in password: Str, in user: Str, in salt: Array[Int]) -> Result[String, pg::error::PgError] {
+    var m = std::string::empty();
+    std::string::append(m, "md5 authentication needs std::crypto::md5 (ADR-0019 Stage B); ");
+    std::string::append(m, "use trust or password authentication for this host meanwhile");
+    Err { error: pg::error::new(pg::error::kind_auth(), std::string::as_str(m)) }
+}
+
+/// The SCRAM-SHA-256 `client-first-message` — `"n,,n=,r=" + nonce`.
+///
+/// **Not yet usable.** The framing is already encodable (see
+/// `pg::proto::sasl_initial`), but a SCRAM exchange cannot complete without
+/// HMAC-SHA-256 and PBKDF2 for the client proof, so this reports the same
+/// typed error rather than starting an exchange it cannot finish — which would
+/// leave the connection wedged mid-handshake.
+///
+/// # Example
+/// ```tuo
+/// // let r = pg::auth::scram_client_first("nonce");
+/// ```
+pub fn scram_client_first(in nonce: Str) -> Result[String, pg::error::PgError] {
+    var m = std::string::empty();
+    std::string::append(m, "SCRAM-SHA-256 needs std::crypto (sha256/hmac/pbkdf2, ADR-0019 ");
+    std::string::append(m, "Stage B); use trust or password authentication for this host meanwhile");
+    Err { error: pg::error::new(pg::error::kind_auth(), std::string::as_str(m)) }
+}
+
+// ----------------------------------------------------------------------------
+// Specs — the whole policy, proven without a server.
+// ----------------------------------------------------------------------------
+
+/// Spec helper: does `md5_response` currently report an auth error?
+pub fn md5_blocked() -> Bool {
+    var salt = std::array::empty();
+    std::array::push(salt, 1);
+    std::array::push(salt, 2);
+    std::array::push(salt, 3);
+    std::array::push(salt, 4);
+    match md5_response("secret", "postgres", salt) {
+        Ok { value } => false,
+        Err { error } => pg::error::kind(error) == pg::error::kind_auth(),
+    }
+}
+
+/// Spec helper: does `scram_client_first` currently report an auth error?
+pub fn scram_blocked() -> Bool {
+    match scram_client_first("nonce") {
+        Ok { value } => false,
+        Err { error } => pg::error::kind(error) == pg::error::kind_auth(),
+    }
+}
+
+/// Spec helper: the kind of the error for an unsupported method.
+pub fn unsupported_kind(take auth_kind: Int) -> Int {
+    pg::error::kind(unsupported_error(auth_kind))
+}
+
+spec plan {
+    then plan(pg::proto::auth_ok()) == plan_ok();
+    then plan(pg::proto::auth_cleartext()) == plan_cleartext();
+    then plan(pg::proto::auth_md5()) == plan_md5();
+    then plan(pg::proto::auth_sasl()) == plan_sasl();
+    // Kerberos and GSSAPI are real sub-kinds the adapter does not implement.
+    then plan(pg::proto::auth_kerberos()) == plan_unsupported();
+    then plan(pg::proto::auth_gss()) == plan_unsupported();
+    // An unknown sub-kind is refused, never guessed at.
+    then plan(99) == plan_unsupported();
+}
+
+spec is_supported {
+    // What works today, with no crypto at all.
+    then is_supported(plan_ok());
+    then is_supported(plan_cleartext());
+    // What ADR-0019 Stage B unblocks. These two flip to `true` when
+    // `std::crypto` lands and this function is updated — and this spec is the
+    // reminder that they are the only two that should.
+    then !is_supported(plan_md5());
+    then !is_supported(plan_sasl());
+    then !is_supported(plan_unsupported());
+}
+
+spec needs_crypto {
+    then needs_crypto(plan_md5());
+    then needs_crypto(plan_sasl());
+    // Kerberos is unsupported for a different reason: it is not blocked on
+    // crypto, so the operator's fix differs.
+    then !needs_crypto(plan_unsupported());
+    then !needs_crypto(plan_ok());
+    then !needs_crypto(plan_cleartext());
+}
+
+spec method_name {
+    then method_name(pg::proto::auth_ok()) == "ok";
+    then method_name(pg::proto::auth_md5()) == "md5";
+    then method_name(pg::proto::auth_sasl()) == "SCRAM-SHA-256";
+    then method_name(pg::proto::auth_cleartext()) == "cleartext password";
+    then method_name(pg::proto::auth_kerberos()) == "Kerberos V5";
+    then method_name(pg::proto::auth_gss()) == "GSSAPI";
+    then method_name(4242) == "unknown";
+}
+
+spec unsupported_error {
+    then unsupported_kind(pg::proto::auth_md5()) == pg::error::kind_auth();
+    then unsupported_kind(pg::proto::auth_sasl()) == pg::error::kind_auth();
+    then unsupported_kind(pg::proto::auth_kerberos()) == pg::error::kind_auth();
+}
+
+spec md5_response {
+    // Blocked today, and honestly so — never a wrong digest.
+    then md5_blocked();
+}
+
+spec scram_client_first {
+    then scram_blocked();
+}

@@ -1,0 +1,589 @@
+// pg::proto — the PostgreSQL frontend/backend protocol, version 3.0.
+//
+// This module is the protocol *vocabulary* and the **frontend encoders**: it
+// names every message type the adapter understands and builds the byte-exact
+// messages a client sends. Decoding of backend messages lives in `pg::message`,
+// and the socket that carries them in `pg::conn` — this module is pure, so
+// every function here is spec-checked rather than merely believed.
+//
+// FRAMING. Except for the startup packet, every message is:
+//
+//     Byte1 type | Int32 length | payload
+//
+// The length **includes its own four bytes** but excludes the type byte. That
+// off-by-four is the single most common protocol mistake, so `finish` computes
+// it in one place and every encoder goes through it.
+//
+// The startup and SSL-request packets are the deliberate exceptions: they have
+// no type byte, because the server does not yet know what protocol it is
+// speaking. `startup` handles that shape.
+//
+// Reference: PostgreSQL 16 §55.7 "Message Formats".
+
+module pg::proto;
+
+// ----------------------------------------------------------------------------
+// Protocol constants.
+// ----------------------------------------------------------------------------
+
+/// The protocol version this adapter speaks: 3.0, encoded as major 3 in the
+/// high 16 bits and minor 0 in the low 16 (`3 * 65536 + 0`).
+///
+/// # Example
+/// ```tuo
+/// let v = pg::proto::protocol_version(); // 196608
+/// ```
+pub fn protocol_version() -> Int {
+    196608
+}
+
+/// The magic code that requests an SSL/TLS upgrade before startup.
+///
+/// The adapter **declines** TLS (ADR-0014 and ADR-0017 both exclude it, and
+/// ADR-0019 explicitly does not reverse that), so this exists to name the
+/// constant a server may see from other clients, and to document why the
+/// adapter never sends it. Kept so the value is written down once, correctly.
+///
+/// # Example
+/// ```tuo
+/// let v = pg::proto::ssl_request_code(); // 80877103
+/// ```
+pub fn ssl_request_code() -> Int {
+    80877103
+}
+
+// ----------------------------------------------------------------------------
+// Frontend message type bytes — what the client sends.
+// ----------------------------------------------------------------------------
+
+/// `Q` — Query (the simple query protocol).
+pub fn msg_query() -> Int {
+    81
+}
+
+/// `P` — Parse (extended query: SQL text to a prepared statement).
+pub fn msg_parse() -> Int {
+    80
+}
+
+/// `B` — Bind (extended query: parameters to a portal).
+pub fn msg_bind() -> Int {
+    66
+}
+
+/// `D` — Describe (extended query: ask for a row description).
+pub fn msg_describe() -> Int {
+    68
+}
+
+/// `E` — Execute (extended query: run a portal).
+pub fn msg_execute() -> Int {
+    69
+}
+
+/// `S` — Sync (extended query: end the pipeline, ask for ReadyForQuery).
+pub fn msg_sync() -> Int {
+    83
+}
+
+/// `X` — Terminate (a clean disconnect).
+pub fn msg_terminate() -> Int {
+    88
+}
+
+/// `p` — the polymorphic password/SASL response message.
+///
+/// One byte serves cleartext passwords, MD5 responses, and every SASL
+/// exchange; the server disambiguates by what it asked for.
+pub fn msg_password() -> Int {
+    112
+}
+
+/// `C` — Close (extended query: drop a statement or portal).
+pub fn msg_close() -> Int {
+    67
+}
+
+// ----------------------------------------------------------------------------
+// Backend message type bytes — what the server sends.
+//
+// Named here (rather than in `pg::message`) so the whole protocol vocabulary
+// is one module, and a reader never has to guess which file a tag lives in.
+// ----------------------------------------------------------------------------
+
+/// `R` — AuthenticationRequest (the sub-kind is an Int32 in the payload).
+pub fn be_authentication() -> Int {
+    82
+}
+
+/// `S` — ParameterStatus (a server GUC and its value).
+pub fn be_parameter_status() -> Int {
+    83
+}
+
+/// `K` — BackendKeyData (the pid/secret used to cancel a query).
+pub fn be_backend_key_data() -> Int {
+    75
+}
+
+/// `Z` — ReadyForQuery (carries the transaction status byte).
+pub fn be_ready_for_query() -> Int {
+    90
+}
+
+/// `T` — RowDescription (the shape of the rows that follow).
+pub fn be_row_description() -> Int {
+    84
+}
+
+/// `D` — DataRow (one row of values).
+pub fn be_data_row() -> Int {
+    68
+}
+
+/// `C` — CommandComplete (the command tag, e.g. "SELECT 1").
+pub fn be_command_complete() -> Int {
+    67
+}
+
+/// `E` — ErrorResponse (a fatal error; the server will not run the command).
+pub fn be_error_response() -> Int {
+    69
+}
+
+/// `N` — NoticeResponse (informational; the command still proceeds).
+pub fn be_notice_response() -> Int {
+    78
+}
+
+/// `1` — ParseComplete.
+pub fn be_parse_complete() -> Int {
+    49
+}
+
+/// `2` — BindComplete.
+pub fn be_bind_complete() -> Int {
+    50
+}
+
+/// `3` — CloseComplete.
+pub fn be_close_complete() -> Int {
+    51
+}
+
+/// `n` — NoData (a statement that returns no rows).
+pub fn be_no_data() -> Int {
+    110
+}
+
+/// `I` — EmptyQueryResponse (an empty SQL string).
+pub fn be_empty_query() -> Int {
+    73
+}
+
+/// `s` — PortalSuspended (an Execute that hit its row limit).
+pub fn be_portal_suspended() -> Int {
+    115
+}
+
+/// `A` — NotificationResponse (LISTEN/NOTIFY).
+pub fn be_notification() -> Int {
+    65
+}
+
+/// `G` / `H` / `W` — the COPY-mode entries, which this adapter does not
+/// implement. Named so `pg::message` can report them by name rather than as a
+/// bare integer, which is the difference between an actionable error and a
+/// mystery.
+pub fn be_copy_in() -> Int {
+    71
+}
+
+/// `H` — CopyOutResponse.
+pub fn be_copy_out() -> Int {
+    72
+}
+
+// ----------------------------------------------------------------------------
+// Transaction status bytes, as reported by ReadyForQuery.
+// ----------------------------------------------------------------------------
+
+/// `I` — idle (not in a transaction block).
+pub fn tx_idle() -> Int {
+    73
+}
+
+/// `T` — inside a transaction block.
+pub fn tx_in_transaction() -> Int {
+    84
+}
+
+/// `E` — in a failed transaction block; everything until COMMIT/ROLLBACK is
+/// rejected.
+pub fn tx_failed() -> Int {
+    69
+}
+
+// ----------------------------------------------------------------------------
+// Authentication sub-kinds — the Int32 that follows an `R` message's header.
+// ----------------------------------------------------------------------------
+
+/// 0 — AuthenticationOk: the handshake succeeded, no secret required.
+pub fn auth_ok() -> Int {
+    0
+}
+
+/// 2 — KerberosV5. Not supported.
+pub fn auth_kerberos() -> Int {
+    2
+}
+
+/// 3 — CleartextPassword.
+pub fn auth_cleartext() -> Int {
+    3
+}
+
+/// 5 — MD5Password; the payload carries a 4-byte salt.
+pub fn auth_md5() -> Int {
+    5
+}
+
+/// 7 — GSSAPI. Not supported.
+pub fn auth_gss() -> Int {
+    7
+}
+
+/// 10 — SASL (SCRAM-SHA-256); the payload lists mechanism names.
+pub fn auth_sasl() -> Int {
+    10
+}
+
+/// 11 — SASLContinue (the server's first SCRAM message).
+pub fn auth_sasl_continue() -> Int {
+    11
+}
+
+/// 12 — SASLFinal (the server's signature verifier).
+pub fn auth_sasl_final() -> Int {
+    12
+}
+
+// ----------------------------------------------------------------------------
+// Message assembly.
+//
+// `begin`/`finish` are the one place the length prefix is computed, so no
+// encoder can get the "+4 includes itself" rule wrong independently.
+// ----------------------------------------------------------------------------
+
+/// Wrap `payload` in a type byte and its Int32 length, producing a complete
+/// message ready to write to a socket.
+///
+/// The encoded length is `len(payload) + 4` — the payload plus the length
+/// field itself, **not** counting the type byte. This is the framing rule the
+/// whole protocol depends on.
+///
+/// # Example
+/// ```tuo
+/// // let msg = pg::proto::finish(pg::proto::msg_query(), body);
+/// ```
+pub fn finish(take type_byte: Int, in payload: String) -> String {
+    var out = std::string::empty();
+    pg::bytes::put_byte(out, type_byte);
+    pg::bytes::put_i32(out, std::string::len(payload) + 4);
+    std::string::append(out, std::string::as_str(payload));
+    out
+}
+
+/// The **StartupMessage**: no type byte, an Int32 length, the protocol
+/// version, then NUL-terminated key/value pairs ended by a final NUL.
+///
+/// `user` is the only required parameter; `database` defaults to the user name
+/// server-side when empty, and this encoder omits it entirely in that case so
+/// the server applies its own default rather than being told to use "".
+///
+/// # Example
+/// ```tuo
+/// let m = pg::proto::startup("postgres", "app");
+/// ```
+pub fn startup(in user: Str, in database: Str) -> String {
+    var body = std::string::empty();
+    pg::bytes::put_i32(body, protocol_version());
+
+    pg::bytes::put_cstr(body, "user");
+    pg::bytes::put_cstr(body, user);
+
+    if std::str::len(database) > 0 {
+        pg::bytes::put_cstr(body, "database");
+        pg::bytes::put_cstr(body, database);
+    }
+
+    // Ask the server for text-format dates we can parse deterministically and
+    // announce ourselves, exactly as libpq does.
+    pg::bytes::put_cstr(body, "client_encoding");
+    pg::bytes::put_cstr(body, "UTF8");
+    pg::bytes::put_cstr(body, "application_name");
+    pg::bytes::put_cstr(body, "tuonelang");
+
+    // The terminating empty key.
+    std::string::push_byte(body, 0);
+
+    // Startup has no type byte: length then body.
+    var out = std::string::empty();
+    pg::bytes::put_i32(out, std::string::len(body) + 4);
+    std::string::append(out, std::string::as_str(body));
+    out
+}
+
+/// A **Query** message — the simple query protocol.
+///
+/// `sql` may contain several statements separated by `;`, which the server
+/// runs as an implicit transaction. Parameters are **not** supported here (the
+/// protocol has no place for them); use the extended protocol for those, which
+/// is also the only form that is safe against SQL injection.
+///
+/// # Example
+/// ```tuo
+/// let m = pg::proto::query("SELECT 1");
+/// ```
+pub fn query(in sql: Str) -> String {
+    var body = std::string::empty();
+    pg::bytes::put_cstr(body, sql);
+    finish(msg_query(), body)
+}
+
+/// A **Parse** message: give `sql` the prepared-statement name `name`.
+///
+/// An empty `name` is the *unnamed* statement, which the server replaces on
+/// each Parse and destroys at end of transaction — the right choice for
+/// one-shot parameterized queries.
+///
+/// Parameter types are left unspecified (a zero-length type list), which asks
+/// the server to infer them. That is what makes `$1` work without the client
+/// knowing the column's type in advance.
+///
+/// # Example
+/// ```tuo
+/// let m = pg::proto::parse("", "SELECT $1::int");
+/// ```
+pub fn parse(in name: Str, in sql: Str) -> String {
+    var body = std::string::empty();
+    pg::bytes::put_cstr(body, name);
+    pg::bytes::put_cstr(body, sql);
+    // Int16 count of parameter type OIDs: zero = infer them all.
+    pg::bytes::put_i16(body, 0);
+    finish(msg_parse(), body)
+}
+
+/// A **Describe** message for a prepared *statement* (`S`).
+///
+/// The reply is a `ParameterDescription` then a `RowDescription` (or `NoData`),
+/// which is how the adapter learns a result's column names and types before
+/// any row arrives.
+///
+/// # Example
+/// ```tuo
+/// let m = pg::proto::describe_statement("");
+/// ```
+pub fn describe_statement(in name: Str) -> String {
+    var body = std::string::empty();
+    pg::bytes::put_byte(body, 83); // 'S' — a statement, not a portal
+    pg::bytes::put_cstr(body, name);
+    finish(msg_describe(), body)
+}
+
+/// An **Execute** message: run portal `name`, returning at most `max_rows`
+/// rows (`0` means unlimited).
+///
+/// # Example
+/// ```tuo
+/// let m = pg::proto::execute("", 0);
+/// ```
+pub fn execute(in name: Str, take max_rows: Int) -> String {
+    var body = std::string::empty();
+    pg::bytes::put_cstr(body, name);
+    pg::bytes::put_i32(body, max_rows);
+    finish(msg_execute(), body)
+}
+
+/// A **Sync** message: end the extended-query pipeline.
+///
+/// Sync is what closes an implicit transaction and makes the server send
+/// `ReadyForQuery`. Omitting it is the classic extended-protocol hang, so the
+/// adapter always sends one.
+///
+/// # Example
+/// ```tuo
+/// let m = pg::proto::sync();
+/// ```
+pub fn sync() -> String {
+    let body = std::string::empty();
+    finish(msg_sync(), body)
+}
+
+/// A **Terminate** message: a courteous disconnect.
+///
+/// # Example
+/// ```tuo
+/// let m = pg::proto::terminate();
+/// ```
+pub fn terminate() -> String {
+    let body = std::string::empty();
+    finish(msg_terminate(), body)
+}
+
+/// A **PasswordMessage** carrying `secret` verbatim.
+///
+/// Used for `AuthenticationCleartextPassword`, and — once ADR-0019 Stage B
+/// lands `std::crypto::md5` — for the `md5...` digest string too, since both
+/// are the same `p` message with different contents.
+///
+/// # Example
+/// ```tuo
+/// let m = pg::proto::password("hunter2");
+/// ```
+pub fn password(in secret: Str) -> String {
+    var body = std::string::empty();
+    pg::bytes::put_cstr(body, secret);
+    finish(msg_password(), body)
+}
+
+/// A **SASLInitialResponse**: the mechanism name, then the client's first
+/// message with an Int32 length.
+///
+/// This is the SCRAM-SHA-256 entry point. It is encodable today — the framing
+/// needs no crypto — but the `client_first` content it carries must come from
+/// `pg::auth`, which needs ADR-0019 Stage B. Encoding it here means the moment
+/// crypto lands, only the payload changes and never the framing.
+///
+/// # Example
+/// ```tuo
+/// let m = pg::proto::sasl_initial("SCRAM-SHA-256", "n,,n=,r=nonce");
+/// ```
+pub fn sasl_initial(in mechanism: Str, in client_first: Str) -> String {
+    var body = std::string::empty();
+    pg::bytes::put_cstr(body, mechanism);
+    pg::bytes::put_i32(body, std::str::len(client_first));
+    pg::bytes::put_bytes(body, client_first);
+    finish(msg_password(), body)
+}
+
+/// A **SASLResponse**: a raw SCRAM continuation, no length prefix, no
+/// terminator — the message body *is* the payload.
+///
+/// # Example
+/// ```tuo
+/// let m = pg::proto::sasl_response("c=biws,r=nonce,p=sig");
+/// ```
+pub fn sasl_response(in payload: Str) -> String {
+    var body = std::string::empty();
+    pg::bytes::put_bytes(body, payload);
+    finish(msg_password(), body)
+}
+
+// ----------------------------------------------------------------------------
+// Spec helpers — every encoder is checked against the framing invariant.
+//
+// The invariant that matters for all of them: the Int32 at offset 1 equals the
+// total byte length minus the type byte. A message that violates it either
+// hangs the server (too long) or desynchronizes the stream (too short), and
+// both failures are silent on the client, which is exactly why they are
+// pinned here.
+// ----------------------------------------------------------------------------
+
+/// The type byte of an encoded message.
+pub fn type_of(in msg: String) -> Int {
+    std::string::byte_at(msg, 0)
+}
+
+/// The length field a typed message declares.
+pub fn declared_len(in msg: String) -> Int {
+    pg::bytes::be_i32(msg, 1)
+}
+
+/// Does a typed message's declared length match the bytes actually present?
+///
+/// `len(msg) - 1` because the type byte is excluded from the count.
+pub fn framing_ok(in msg: String) -> Bool {
+    declared_len(msg) == std::string::len(msg) - 1
+}
+
+/// Does the untyped startup packet's length field match its real size?
+pub fn startup_framing_ok(in user: Str, in database: Str) -> Bool {
+    let m = startup(user, database);
+    pg::bytes::be_i32(m, 0) == std::string::len(m)
+}
+
+/// The protocol version an encoded startup packet declares.
+pub fn startup_version(in user: Str, in database: Str) -> Int {
+    pg::bytes::be_i32(startup(user, database), 4)
+}
+
+spec startup {
+    then startup_framing_ok("postgres", "app");
+    then startup_framing_ok("shallowflaws", "deepflaws");
+    // The database is optional; both shapes must still be correctly framed.
+    then startup_framing_ok("postgres", "");
+    // The version the server checks before it will speak at all.
+    then startup_version("postgres", "app") == 196608;
+    then startup_version("postgres", "") == protocol_version();
+}
+
+spec query {
+    then framing_ok(query("SELECT 1"));
+    then framing_ok(query(""));
+    then type_of(query("SELECT 1")) == msg_query();
+    // 1 type + 4 len + 8 sql + 1 NUL = 14 bytes total; declared = 13.
+    then declared_len(query("SELECT 1")) == 13;
+    then std::string::len(query("SELECT 1")) == 14;
+}
+
+spec parse {
+    then framing_ok(parse("", "SELECT $1::int"));
+    then framing_ok(parse("stmt1", "SELECT 1"));
+    then type_of(parse("", "SELECT 1")) == msg_parse();
+}
+
+spec execute {
+    then framing_ok(execute("", 0));
+    then framing_ok(execute("portal", 100));
+    then type_of(execute("", 0)) == msg_execute();
+}
+
+spec describe_statement {
+    then framing_ok(describe_statement(""));
+    then type_of(describe_statement("")) == msg_describe();
+}
+
+spec sync {
+    then framing_ok(sync());
+    then type_of(sync()) == msg_sync();
+    // The minimal message: type byte plus a length of exactly 4.
+    then declared_len(sync()) == 4;
+    then std::string::len(sync()) == 5;
+}
+
+spec terminate {
+    then framing_ok(terminate());
+    then type_of(terminate()) == msg_terminate();
+    then declared_len(terminate()) == 4;
+}
+
+spec password {
+    then framing_ok(password("hunter2"));
+    then type_of(password("hunter2")) == msg_password();
+}
+
+spec sasl_initial {
+    then framing_ok(sasl_initial("SCRAM-SHA-256", "n,,n=,r=abc"));
+    then type_of(sasl_initial("SCRAM-SHA-256", "n,,n=,r=abc")) == msg_password();
+}
+
+spec sasl_response {
+    then framing_ok(sasl_response("c=biws,r=abc,p=xyz"));
+    then type_of(sasl_response("c=biws,r=abc,p=xyz")) == msg_password();
+}
+
+spec finish {
+    // The framing rule itself, stated once: an empty payload declares 4.
+    then declared_len(finish(msg_sync(), std::string::empty())) == 4;
+}

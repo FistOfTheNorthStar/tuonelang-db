@@ -1,0 +1,7 @@
+# Build output
+/target/
+tdg.lock
+
+# Editor / OS
+.DS_Store
+*.swp

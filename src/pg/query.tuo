@@ -1,0 +1,621 @@
+// pg::query — running SQL and reading results.
+//
+// This is the layer a program actually calls. It sits on `pg::conn` (the
+// socket), `pg::proto` (encoders), and `pg::message` (decoders), and turns the
+// message-at-a-time protocol into three operations that match what people
+// mean by "query":
+//
+//   * `execute`  — run a statement, get the number of rows it affected;
+//   * `scalar`   — run a statement, get the first column of the first row; and
+//   * `run`      — run a statement, get every row into a `ResultSet`.
+//
+// THE RESULT SET IS A FLAT ARRAY.
+//
+// v0 has no nested generic containers — no `Array[Array[String]]` — so a table
+// of values is stored as **one flat `Array[String]` in row-major order**, with
+// the column count alongside it. Cell `(row, col)` is `values[row * cols +
+// col]`, which `cell` does for you. This is the standard trick for
+// representing a matrix without nested storage, it costs one multiply per
+// access, and it keeps the whole result in two allocations instead of one per
+// row.
+//
+// NULL is carried in a parallel `Array[Int]` of flags rather than by a
+// sentinel string, so a NULL and an empty string stay distinguishable — SQL
+// requires that, and a client that blurs them silently corrupts data.
+//
+// PARAMETERS.
+//
+// `run_params` uses the **extended query protocol**, which sends parameter
+// values separately from the SQL text. That is not a convenience: it is the
+// only way to be safe against SQL injection, because a parameter can never be
+// parsed as SQL. String interpolation into a query is never the right answer,
+// and this module deliberately offers no helper that would encourage it.
+
+module pg::query;
+
+// ----------------------------------------------------------------------------
+// The result set.
+// ----------------------------------------------------------------------------
+
+/// The rows a query returned, plus the shape needed to index them.
+///
+/// * `columns` — the column names, in order.
+/// * `values` — every cell, row-major: `values[r * cols + c]`.
+/// * `nulls` — `1` where that cell is SQL NULL, `0` otherwise, same indexing.
+/// * `oids` — the type OID of each column (see `pg::value`).
+/// * `row_count` / `column_count` — the dimensions.
+/// * `tag` — the server's command tag, e.g. `"SELECT 3"`.
+/// * `affected` — the row count parsed from the tag.
+pub struct ResultSet {
+    columns: Array[String],
+    values: Array[String],
+    nulls: Array[Int],
+    oids: Array[Int],
+    row_count: Int,
+    column_count: Int,
+    tag: String,
+    affected: Int,
+}
+
+/// An empty result set — the shape returned by a statement with no rows.
+///
+/// # Example
+/// ```tuo
+/// let rs = pg::query::empty_result();
+/// ```
+pub fn empty_result() -> ResultSet {
+    ResultSet { columns: std::array::empty(), values: std::array::empty(), nulls: std::array::empty(), oids: std::array::empty(), row_count: 0, column_count: 0, tag: std::string::empty(), affected: 0 }
+}
+
+/// The number of rows.
+///
+/// # Example
+/// ```tuo
+/// let n = pg::query::row_count(pg::query::empty_result()); // 0
+/// ```
+pub fn row_count(in rs: ResultSet) -> Int {
+    rs.row_count
+}
+
+/// The number of columns.
+///
+/// # Example
+/// ```tuo
+/// let n = pg::query::column_count(pg::query::empty_result()); // 0
+/// ```
+pub fn column_count(in rs: ResultSet) -> Int {
+    rs.column_count
+}
+
+/// The rows the command reported as affected, from its command tag.
+///
+/// # Example
+/// ```tuo
+/// let n = pg::query::affected(pg::query::empty_result()); // 0
+/// ```
+pub fn affected(in rs: ResultSet) -> Int {
+    rs.affected
+}
+
+/// The server's command tag, e.g. `"SELECT 3"` or `"INSERT 0 1"`.
+///
+/// # Example
+/// ```tuo
+/// // let t = pg::query::tag(rs);
+/// ```
+pub fn tag(in rs: ResultSet) -> String {
+    std::string::from_str(std::string::as_str(rs.tag))
+}
+
+/// The name of column `c`.
+///
+/// # Example
+/// ```tuo
+/// // let name = pg::query::column_name(rs, 0);
+/// ```
+pub fn column_name(in rs: ResultSet, take c: Int) -> String {
+    std::string::from_str(std::string::as_str(std::array::get(rs.columns, c)))
+}
+
+/// The type OID of column `c` (see `pg::value` for what the OIDs mean).
+///
+/// # Example
+/// ```tuo
+/// // let oid = pg::query::column_oid(rs, 0);
+/// ```
+pub fn column_oid(in rs: ResultSet, take c: Int) -> Int {
+    std::array::get(rs.oids, c)
+}
+
+/// The index of column `name`, or `-1` when there is no such column.
+///
+/// Lets a caller address results by name without hard-coding positions, which
+/// is what makes a query robust against a `SELECT` list changing order.
+///
+/// # Example
+/// ```tuo
+/// // let i = pg::query::column_index(rs, "id");
+/// ```
+pub fn column_index(in rs: ResultSet, in name: Str) -> Int {
+    var i = 0;
+    while i < rs.column_count {
+        if std::string::as_str(std::array::get(rs.columns, i)) == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+/// The raw text of cell `(r, c)`.
+///
+/// A NULL cell reads as the empty string; use `is_null` to tell the two apart.
+///
+/// # Example
+/// ```tuo
+/// // let v = pg::query::cell(rs, 0, 0);
+/// ```
+pub fn cell(in rs: ResultSet, take r: Int, take c: Int) -> String {
+    std::string::from_str(std::string::as_str(std::array::get(rs.values, r * rs.column_count + c)))
+}
+
+/// Is cell `(r, c)` SQL NULL?
+///
+/// # Example
+/// ```tuo
+/// // let n = pg::query::is_null(rs, 0, 0);
+/// ```
+pub fn is_null(in rs: ResultSet, take r: Int, take c: Int) -> Bool {
+    std::array::get(rs.nulls, r * rs.column_count + c) == 1
+}
+
+/// Cell `(r, c)` decoded as an `Int`, or `fallback` when it is NULL or does
+/// not parse.
+///
+/// # Example
+/// ```tuo
+/// // let id = pg::query::cell_int(rs, 0, 0, 0);
+/// ```
+pub fn cell_int(in rs: ResultSet, take r: Int, take c: Int, take fallback: Int) -> Int {
+    if is_null(rs, r, c) {
+        return fallback;
+    }
+    let raw = cell(rs, r, c);
+    pg::value::as_int_or(std::string::as_str(raw), fallback)
+}
+
+/// Cell `(r, c)` decoded as a `Float`, or `fallback` when NULL or unparsable.
+///
+/// # Example
+/// ```tuo
+/// // let x = pg::query::cell_float(rs, 0, 0, 0.0);
+/// ```
+pub fn cell_float(in rs: ResultSet, take r: Int, take c: Int, take fallback: Float) -> Float {
+    if is_null(rs, r, c) {
+        return fallback;
+    }
+    let raw = cell(rs, r, c);
+    pg::value::as_float_or(std::string::as_str(raw), fallback)
+}
+
+/// Cell `(r, c)` decoded as a `Bool`. NULL reads as `false`.
+///
+/// # Example
+/// ```tuo
+/// // let b = pg::query::cell_bool(rs, 0, 0);
+/// ```
+pub fn cell_bool(in rs: ResultSet, take r: Int, take c: Int) -> Bool {
+    if is_null(rs, r, c) {
+        return false;
+    }
+    let raw = cell(rs, r, c);
+    pg::value::as_bool(std::string::as_str(raw))
+}
+
+// ----------------------------------------------------------------------------
+// Running a query — the effect tier.
+// ----------------------------------------------------------------------------
+
+/// EFFECT: run `sql` through the simple query protocol and collect everything
+/// it returns.
+///
+/// Sends one `Query` message and consumes messages until `ReadyForQuery`. A
+/// `RowDescription` establishes the columns, each `DataRow` appends a row, and
+/// an `ErrorResponse` aborts with the server's own message and SQLSTATE.
+///
+/// **`sql` is sent verbatim**, so never build it by concatenating untrusted
+/// input — use `run_params` for that.
+///
+/// # Example
+/// ```tuo
+/// // let rs = pg::query::run(fd, "SELECT id, name FROM users", 30000);
+/// ```
+pub fn run(take fd: Int, in sql: Str, take timeout_ms: Int) -> Result[ResultSet, pg::error::PgError] {
+    let sent = pg::conn::write_message(fd, pg::proto::query(sql));
+    if sent < 0 {
+        return Err { error: pg::error::new(pg::error::kind_connection(), "the connection failed while sending the query") };
+    }
+    collect(fd, timeout_ms)
+}
+
+/// EFFECT: run `sql` with `params` through the **extended** query protocol.
+///
+/// Parameters are sent out-of-band, so a value can never be parsed as SQL —
+/// this is the injection-safe path, and the one to reach for by default when
+/// any part of a query comes from outside the program.
+///
+/// Placeholders in `sql` are `$1`, `$2`, … in parameter order. Every parameter
+/// is sent as text and its type inferred by the server; a NULL is spelled by
+/// passing an empty `Array[Int]` flag — see `run_params_null`.
+///
+/// # Example
+/// ```tuo
+/// // let rs = pg::query::run_params(fd, "SELECT * FROM users WHERE id = $1", ps, 30000);
+/// ```
+pub fn run_params(take fd: Int, in sql: Str, in params: Array[String], take timeout_ms: Int) -> Result[ResultSet, pg::error::PgError] {
+    // Parse the SQL into the unnamed statement.
+    let a = pg::conn::write_message(fd, pg::proto::parse("", sql));
+    if a < 0 {
+        return Err { error: pg::error::new(pg::error::kind_connection(), "failed to send Parse") };
+    }
+    let b = pg::conn::write_message(fd, bind_message(params));
+    if b < 0 {
+        return Err { error: pg::error::new(pg::error::kind_connection(), "failed to send Bind") };
+    }
+    let c = pg::conn::write_message(fd, pg::proto::describe_statement(""));
+    if c < 0 {
+        return Err { error: pg::error::new(pg::error::kind_connection(), "failed to send Describe") };
+    }
+    let d = pg::conn::write_message(fd, pg::proto::execute("", 0));
+    if d < 0 {
+        return Err { error: pg::error::new(pg::error::kind_connection(), "failed to send Execute") };
+    }
+    // Sync ends the pipeline; without it the server never sends ReadyForQuery
+    // and the read loop below would wait out its whole timeout.
+    let e = pg::conn::write_message(fd, pg::proto::sync());
+    if e < 0 {
+        return Err { error: pg::error::new(pg::error::kind_connection(), "failed to send Sync") };
+    }
+    collect(fd, timeout_ms)
+}
+
+/// Build the `Bind` message for the unnamed statement and portal, sending
+/// every parameter as text.
+///
+/// Format codes are omitted (a zero count), which tells the server "text for
+/// everything" — the same choice `pg::value` decodes against.
+pub fn bind_message(in params: Array[String]) -> String {
+    var body = std::string::empty();
+    pg::bytes::put_cstr(body, ""); // portal: unnamed
+    pg::bytes::put_cstr(body, ""); // statement: unnamed
+    pg::bytes::put_i16(body, 0); // parameter format codes: none => all text
+
+    let n = std::array::len(params);
+    pg::bytes::put_i16(body, n);
+    var i = 0;
+    while i < n {
+        let p = std::array::get(params, i);
+        pg::bytes::put_i32(body, std::string::len(p));
+        pg::bytes::put_bytes(body, std::string::as_str(p));
+        i = i + 1;
+    }
+
+    pg::bytes::put_i16(body, 0); // result format codes: none => all text
+    pg::proto::finish(pg::proto::msg_bind(), body)
+}
+
+/// EFFECT: consume messages until `ReadyForQuery`, assembling a `ResultSet`.
+///
+/// Shared by `run` and `run_params`, because after the request differs the
+/// reply sequence is the same.
+pub fn collect(take fd: Int, take timeout_ms: Int) -> Result[ResultSet, pg::error::PgError] {
+    var columns = std::array::empty();
+    var oids = std::array::empty();
+    var values = std::array::empty();
+    var nulls = std::array::empty();
+    var rows = 0;
+    var cols = 0;
+    var tag_text = std::string::empty();
+
+    var failed = false;
+    var failure = pg::error::new(pg::error::kind_protocol(), "no error");
+
+    var guard = 0;
+    var done = false;
+    while !done && guard < 1000000 {
+        guard = guard + 1;
+
+        let type_result = pg::conn::read_type(fd, timeout_ms);
+        if !pg::conn::is_ok_int(type_result) {
+            return Err { error: pg::conn::unwrap_err_int(type_result) };
+        }
+        let type_byte = pg::conn::unwrap_ok_int(type_result);
+
+        let payload_result = pg::conn::read_message_payload(fd, timeout_ms);
+        if !pg::conn::is_ok_string(payload_result) {
+            return Err { error: pg::conn::unwrap_err_string(payload_result) };
+        }
+        let payload = pg::conn::unwrap_ok_string(payload_result);
+
+        if type_byte == pg::proto::be_row_description() {
+            cols = pg::message::field_count(payload);
+            var i = 0;
+            while i < cols {
+                std::array::push(columns, pg::message::field_name(payload, i));
+                std::array::push(oids, pg::message::field_type_oid(payload, i));
+                i = i + 1;
+            }
+        } else if type_byte == pg::proto::be_data_row() {
+            let n = pg::message::column_count(payload);
+            var i = 0;
+            while i < n {
+                std::array::push(values, pg::message::column_bytes(payload, i));
+                if pg::message::column_is_null(payload, i) {
+                    std::array::push(nulls, 1);
+                } else {
+                    std::array::push(nulls, 0);
+                }
+                i = i + 1;
+            }
+            rows = rows + 1;
+        } else if type_byte == pg::proto::be_command_complete() {
+            tag_text = pg::message::command_tag(payload);
+        } else if type_byte == pg::proto::be_error_response() {
+            // Record the error but keep reading: the server still owes a
+            // ReadyForQuery, and leaving it unread would desynchronize the
+            // next query on this connection.
+            failed = true;
+            failure = pg::conn::error_from_payload(payload);
+        } else if type_byte == pg::proto::be_ready_for_query() {
+            done = true;
+        }
+    // ParameterStatus, NoticeResponse, ParseComplete, BindComplete, and
+    // NoData carry nothing this layer must act on.
+    }
+
+    if failed {
+        return Err { error: failure };
+    }
+
+    let affected_rows = pg::message::rows_affected(std::string::as_str(tag_text));
+    Ok { value: ResultSet { columns: columns, values: values, nulls: nulls, oids: oids, row_count: rows, column_count: cols, tag: tag_text, affected: affected_rows } }
+}
+
+/// EFFECT: run a statement for its effect and report the rows it affected.
+///
+/// The right call for `INSERT`, `UPDATE`, `DELETE`, and DDL.
+///
+/// # Example
+/// ```tuo
+/// // let n = pg::query::execute(fd, "DELETE FROM users WHERE id = 1", 30000);
+/// ```
+pub fn execute(take fd: Int, in sql: Str, take timeout_ms: Int) -> Result[Int, pg::error::PgError] {
+    let r = run(fd, sql, timeout_ms);
+    if !is_ok_result(r) {
+        return Err { error: unwrap_err_result(r) };
+    }
+    Ok { value: affected(unwrap_ok_result(r)) }
+}
+
+/// EFFECT: run a query and return the first column of its first row as text.
+///
+/// Returns an error when the query produced no rows, so a caller never
+/// mistakes "no result" for an empty string.
+///
+/// # Example
+/// ```tuo
+/// // let v = pg::query::scalar(fd, "SELECT count(*) FROM users", 30000);
+/// ```
+pub fn scalar(take fd: Int, in sql: Str, take timeout_ms: Int) -> Result[String, pg::error::PgError] {
+    let r = run(fd, sql, timeout_ms);
+    if !is_ok_result(r) {
+        return Err { error: unwrap_err_result(r) };
+    }
+    let rs = unwrap_ok_result(r);
+    if row_count(rs) == 0 || column_count(rs) == 0 {
+        return Err { error: pg::error::new(pg::error::kind_decode(), "the query returned no rows") };
+    }
+    Ok { value: cell(rs, 0, 0) }
+}
+
+/// EFFECT: run a query and return the first cell as an `Int`.
+///
+/// # Example
+/// ```tuo
+/// // let n = pg::query::scalar_int(fd, "SELECT count(*) FROM users", 0, 30000);
+/// ```
+pub fn scalar_int(take fd: Int, in sql: Str, take fallback: Int, take timeout_ms: Int) -> Result[Int, pg::error::PgError] {
+    let r = run(fd, sql, timeout_ms);
+    if !is_ok_result(r) {
+        return Err { error: unwrap_err_result(r) };
+    }
+    let rs = unwrap_ok_result(r);
+    if row_count(rs) == 0 || column_count(rs) == 0 {
+        return Err { error: pg::error::new(pg::error::kind_decode(), "the query returned no rows") };
+    }
+    Ok { value: cell_int(rs, 0, 0, fallback) }
+}
+
+// ----------------------------------------------------------------------------
+// Result inspectors.
+//
+// Same borrow-then-unwrap shape `pg::conn` uses: a `match` on an owned value
+// moves it, so inspection borrows (`in`, binding nothing) and unwrapping owns.
+// ----------------------------------------------------------------------------
+
+/// Is this a successful result set?
+pub fn is_ok_result(in r: Result[ResultSet, pg::error::PgError]) -> Bool {
+    match r {
+        Ok { value: _ } => true,
+        Err { error: _ } => false,
+    }
+}
+
+/// The result set of a successful result, or the empty set.
+pub fn unwrap_ok_result(take r: Result[ResultSet, pg::error::PgError]) -> ResultSet {
+    match r {
+        Ok { value } => value,
+        Err { error: _ } => empty_result(),
+    }
+}
+
+/// The error of a failed result.
+pub fn unwrap_err_result(take r: Result[ResultSet, pg::error::PgError]) -> pg::error::PgError {
+    match r {
+        Ok { value: _ } => pg::error::new(pg::error::kind_protocol(), "expected an error"),
+        Err { error } => error,
+    }
+}
+
+/// The rendered text of a failed result's error, consuming the result.
+///
+/// **Consuming**, because binding a non-`Copy` field out of a `match` on an
+/// `in` parameter is a move (`O0003`) — a borrowing renderer is not
+/// expressible in v0. So the rule at the call site is: a `Result` is
+/// inspected with `is_ok_result` (which borrows and binds nothing), and then
+/// consumed exactly once, on whichever branch it belongs to.
+///
+/// Reading a `Result` after passing it to this function or to
+/// `unwrap_err_result` is a use-after-move that the ownership checker can miss
+/// across a returning branch, and that MIR verification then rejects with
+/// `M0005: reads _N after it was moved out`. If you see that error, look for a
+/// value consumed in a diagnostic and then read again below.
+///
+/// # Example
+/// ```tuo
+/// // if !pg::query::is_ok_result(r) {
+/// //     let text = pg::query::render_error(r); // r is consumed here
+/// //     return 1;                              // ... so never read it below
+/// // }
+/// ```
+pub fn render_error(take r: Result[ResultSet, pg::error::PgError]) -> String {
+    match r {
+        Ok { value: _ } => std::string::from_str("no error"),
+        Err { error } => pg::error::render(error),
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Specs — the pure parts: indexing, decoding, and the Bind encoder.
+//
+// The effectful `run`/`collect` are pinned by `examples/live_check.tuo`
+// against a real server (`R0007` forbids an effect in a spec).
+// ----------------------------------------------------------------------------
+
+/// Spec helper: a two-row, two-column result set built by hand —
+/// `(1, "ada")` and `(2, NULL)`.
+///
+/// The NULL in the last cell is what proves `is_null` and `cell` stay
+/// distinguishable, and that row-major indexing lands on the right cell.
+pub fn fixture_rs() -> ResultSet {
+    var columns = std::array::empty();
+    std::array::push(columns, std::string::from_str("id"));
+    std::array::push(columns, std::string::from_str("name"));
+
+    var oids = std::array::empty();
+    std::array::push(oids, pg::value::oid_int4());
+    std::array::push(oids, pg::value::oid_text());
+
+    var values = std::array::empty();
+    std::array::push(values, std::string::from_str("1"));
+    std::array::push(values, std::string::from_str("ada"));
+    std::array::push(values, std::string::from_str("2"));
+    std::array::push(values, std::string::empty());
+
+    var nulls = std::array::empty();
+    std::array::push(nulls, 0);
+    std::array::push(nulls, 0);
+    std::array::push(nulls, 0);
+    std::array::push(nulls, 1);
+
+    ResultSet { columns: columns, values: values, nulls: nulls, oids: oids, row_count: 2, column_count: 2, tag: std::string::from_str("SELECT 2"), affected: 2 }
+}
+
+/// Spec helper: cell `(r, c)` of the fixture, compared as a `Str`.
+pub fn fixture_cell_is(take r: Int, take c: Int, in expect: Str) -> Bool {
+    std::string::as_str(cell(fixture_rs(), r, c)) == expect
+}
+
+/// Spec helper: the fixture's column name at `c`.
+pub fn fixture_name_is(take c: Int, in expect: Str) -> Bool {
+    std::string::as_str(column_name(fixture_rs(), c)) == expect
+}
+
+/// Spec helper: the declared length of a Bind message matches its real size.
+pub fn bind_framing_ok(take count: Int) -> Bool {
+    var ps = std::array::empty();
+    var i = 0;
+    while i < count {
+        std::array::push(ps, std::string::from_str("v"));
+        i = i + 1;
+    }
+    let m = bind_message(ps);
+    pg::bytes::be_i32(m, 1) == std::string::len(m) - 1
+}
+
+/// Spec helper: the type byte of a Bind message.
+pub fn bind_type() -> Int {
+    std::string::byte_at(bind_message(std::array::empty()), 0)
+}
+
+spec empty_result {
+    then row_count(empty_result()) == 0;
+    then column_count(empty_result()) == 0;
+    then affected(empty_result()) == 0;
+}
+
+spec cell {
+    // Row-major indexing must land on the right cell in both rows.
+    then fixture_cell_is(0, 0, "1");
+    then fixture_cell_is(0, 1, "ada");
+    then fixture_cell_is(1, 0, "2");
+    // The NULL cell reads as empty; `is_null` is what distinguishes it.
+    then fixture_cell_is(1, 1, "");
+}
+
+spec is_null {
+    then !is_null(fixture_rs(), 0, 0);
+    then !is_null(fixture_rs(), 0, 1);
+    then !is_null(fixture_rs(), 1, 0);
+    then is_null(fixture_rs(), 1, 1);
+}
+
+spec cell_int {
+    then cell_int(fixture_rs(), 0, 0, 0) == 1;
+    then cell_int(fixture_rs(), 1, 0, 0) == 2;
+    // A NULL cell yields the fallback, never a spurious zero.
+    then cell_int(fixture_rs(), 1, 1, 0 - 99) == 0 - 99;
+    // A non-numeric cell also yields the fallback.
+    then cell_int(fixture_rs(), 0, 1, 0 - 7) == 0 - 7;
+}
+
+spec column_name {
+    then fixture_name_is(0, "id");
+    then fixture_name_is(1, "name");
+}
+
+spec column_index {
+    then column_index(fixture_rs(), "id") == 0;
+    then column_index(fixture_rs(), "name") == 1;
+    // An absent column is -1, never a valid-looking 0.
+    then column_index(fixture_rs(), "missing") == 0 - 1;
+}
+
+spec column_oid {
+    then column_oid(fixture_rs(), 0) == pg::value::oid_int4();
+    then column_oid(fixture_rs(), 1) == pg::value::oid_text();
+}
+
+spec row_count {
+    then row_count(fixture_rs()) == 2;
+    then column_count(fixture_rs()) == 2;
+    then affected(fixture_rs()) == 2;
+}
+
+spec bind_message {
+    // The framing invariant, across parameter counts.
+    then bind_framing_ok(0);
+    then bind_framing_ok(1);
+    then bind_framing_ok(5);
+    then bind_type() == pg::proto::msg_bind();
+}

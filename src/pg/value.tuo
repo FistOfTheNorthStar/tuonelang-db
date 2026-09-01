@@ -1,0 +1,526 @@
+// pg::value — PostgreSQL type OIDs and text-format value decoding.
+//
+// The adapter asks for **text format** for every column (format code 0), so a
+// value arrives as its human-readable rendering: `42`, `-1`, `t`, `3.5`,
+// `2026-09-01`. That choice is deliberate and worth stating, because binary
+// format would be faster:
+//
+//   * text format is what the *simple* query protocol always returns, so one
+//     decoder serves both protocols rather than two;
+//   * binary layouts are per-type, version-sensitive, and undocumented for
+//     several types, whereas the text rendering is stable and specified; and
+//   * decoding text needs no bitwise operations, which v0 lacks until
+//     ADR-0019 Stage A lands.
+//
+// Everything here is pure, so every decoder below is spec-checked against the
+// exact renderings a real server produces.
+//
+// NULL is **not** represented here. A NULL column has no bytes at all, so it
+// is answered by `pg::message::column_is_null` before any decoder runs —
+// keeping "absent" and "empty string" distinct, which SQL requires and which a
+// decoder returning a sentinel would blur.
+
+module pg::value;
+
+// ----------------------------------------------------------------------------
+// Type OIDs — the stable identifiers in `pg_type`.
+//
+// These are the values a `RowDescription` reports, and they do not change
+// between PostgreSQL versions for the built-in types.
+// ----------------------------------------------------------------------------
+
+/// `bool` — OID 16.
+pub fn oid_bool() -> Int {
+    16
+}
+
+/// `bytea` — OID 17.
+pub fn oid_bytea() -> Int {
+    17
+}
+
+/// `char` — OID 18.
+pub fn oid_char() -> Int {
+    18
+}
+
+/// `name` — OID 19.
+pub fn oid_name() -> Int {
+    19
+}
+
+/// `int8` (bigint) — OID 20.
+pub fn oid_int8() -> Int {
+    20
+}
+
+/// `int2` (smallint) — OID 21.
+pub fn oid_int2() -> Int {
+    21
+}
+
+/// `int4` (integer) — OID 23.
+pub fn oid_int4() -> Int {
+    23
+}
+
+/// `text` — OID 25.
+pub fn oid_text() -> Int {
+    25
+}
+
+/// `oid` — OID 26.
+pub fn oid_oid() -> Int {
+    26
+}
+
+/// `json` — OID 114.
+pub fn oid_json() -> Int {
+    114
+}
+
+/// `float4` (real) — OID 700.
+pub fn oid_float4() -> Int {
+    700
+}
+
+/// `float8` (double precision) — OID 701.
+pub fn oid_float8() -> Int {
+    701
+}
+
+/// `varchar` — OID 1043.
+pub fn oid_varchar() -> Int {
+    1043
+}
+
+/// `date` — OID 1082.
+pub fn oid_date() -> Int {
+    1082
+}
+
+/// `time` — OID 1083.
+pub fn oid_time() -> Int {
+    1083
+}
+
+/// `timestamp` — OID 1114.
+pub fn oid_timestamp() -> Int {
+    1114
+}
+
+/// `timestamptz` — OID 1184.
+pub fn oid_timestamptz() -> Int {
+    1184
+}
+
+/// `numeric` — OID 1700.
+pub fn oid_numeric() -> Int {
+    1700
+}
+
+/// `uuid` — OID 2950.
+pub fn oid_uuid() -> Int {
+    2950
+}
+
+/// `jsonb` — OID 3802.
+pub fn oid_jsonb() -> Int {
+    3802
+}
+
+// ----------------------------------------------------------------------------
+// OID classification — what shape a column's text rendering has.
+// ----------------------------------------------------------------------------
+
+/// Is this OID an integer type whose text form `as_int` decodes exactly?
+///
+/// # Example
+/// ```tuo
+/// let b = pg::value::is_integer(pg::value::oid_int4()); // true
+/// ```
+pub fn is_integer(take oid: Int) -> Bool {
+    oid == oid_int2() || oid == oid_int4() || oid == oid_int8() || oid == oid_oid()
+}
+
+/// Is this OID a floating-point or arbitrary-precision numeric type?
+///
+/// `numeric` is included because its *text* form is a decimal literal like
+/// `float8`'s; note that decoding it through `as_float` can lose precision
+/// that `numeric` was chosen to preserve, so `as_str` is the lossless choice.
+///
+/// # Example
+/// ```tuo
+/// let b = pg::value::is_float(pg::value::oid_float8()); // true
+/// ```
+pub fn is_float(take oid: Int) -> Bool {
+    oid == oid_float4() || oid == oid_float8() || oid == oid_numeric()
+}
+
+/// Is this OID a textual type that needs no decoding at all?
+///
+/// # Example
+/// ```tuo
+/// let b = pg::value::is_text(pg::value::oid_text()); // true
+/// ```
+pub fn is_text(take oid: Int) -> Bool {
+    oid == oid_text() || oid == oid_varchar() || oid == oid_name() || oid == oid_char() || oid == oid_uuid() || oid == oid_json() || oid == oid_jsonb()
+}
+
+/// Is this OID one of the date/time types? Their text renderings are ISO-8601
+/// when `DateStyle` is the default `ISO, MDY`, which the adapter does not
+/// change.
+///
+/// # Example
+/// ```tuo
+/// let b = pg::value::is_temporal(pg::value::oid_date()); // true
+/// ```
+pub fn is_temporal(take oid: Int) -> Bool {
+    oid == oid_date() || oid == oid_time() || oid == oid_timestamp() || oid == oid_timestamptz()
+}
+
+// ----------------------------------------------------------------------------
+// Decoders.
+// ----------------------------------------------------------------------------
+
+/// Decode a `bool` column: PostgreSQL renders true as `t` and false as `f`.
+///
+/// Anything else is false, which cannot occur from a conforming server.
+///
+/// # Example
+/// ```tuo
+/// let b = pg::value::as_bool("t"); // true
+/// ```
+pub fn as_bool(in raw: Str) -> Bool {
+    std::str::len(raw) == 1 && std::str::byte_at(raw, 0) == 116
+}
+
+/// Decode an integer column's text rendering.
+///
+/// Handles a leading `-` (and a leading `+`, which the server never emits but
+/// which costs nothing to accept). Returns `Err` for empty input or any
+/// non-digit byte, so a malformed value is a value the caller branches on
+/// rather than a silent zero.
+///
+/// **Overflow traps** rather than wrapping — tuonelang has no wraparound — so
+/// an `int8` beyond `Int`'s range aborts rather than returning a wrong number.
+/// Every value a PostgreSQL `int8` can hold fits in `Int` (both are 64-bit
+/// signed), so this is reachable only from a `numeric` misrouted here.
+///
+/// # Example
+/// ```tuo
+/// let n = pg::value::as_int("-42");
+/// ```
+pub fn as_int(in raw: Str) -> Result[Int, Str] {
+    let n = std::str::len(raw);
+    if n == 0 {
+        return Err { error: "empty integer value" };
+    }
+
+    var i = 0;
+    var negative = false;
+    let first = std::str::byte_at(raw, 0);
+    if first == 45 {
+        negative = true;
+        i = 1;
+    } else if first == 43 {
+        i = 1;
+    }
+    if i >= n {
+        return Err { error: "integer value has a sign but no digits" };
+    }
+
+    var total = 0;
+    while i < n {
+        let b = std::str::byte_at(raw, i);
+        if b < 48 || b > 57 {
+            return Err { error: "integer value has a non-digit byte" };
+        }
+        total = total * 10 + (b - 48);
+        i = i + 1;
+    }
+
+    if negative {
+        Ok { value: 0 - total }
+    } else {
+        Ok { value: total }
+    }
+}
+
+/// Decode an integer column, falling back to `fallback` when it does not parse.
+///
+/// The convenience form for the common case where a malformed value cannot
+/// happen and a `Result` would only add noise.
+///
+/// # Example
+/// ```tuo
+/// let n = pg::value::as_int_or("42", 0); // 42
+/// ```
+pub fn as_int_or(in raw: Str, take fallback: Int) -> Int {
+    match as_int(raw) {
+        Ok { value } => value,
+        Err { error } => fallback,
+    }
+}
+
+/// Decode a floating-point column's text rendering into a `Float`.
+///
+/// Accepts a sign, an integer part, an optional fractional part, and an
+/// optional `e`/`E` exponent — the full shape PostgreSQL emits for `float8`.
+/// The special renderings `NaN`, `Infinity`, and `-Infinity` are reported as
+/// `Err` rather than silently becoming a finite number; a caller that wants
+/// them can test `raw` directly.
+///
+/// # Example
+/// ```tuo
+/// let f = pg::value::as_float("3.5");
+/// ```
+pub fn as_float(in raw: Str) -> Result[Float, Str] {
+    let n = std::str::len(raw);
+    if n == 0 {
+        return Err { error: "empty float value" };
+    }
+
+    var i = 0;
+    var negative = false;
+    let first = std::str::byte_at(raw, 0);
+    if first == 45 {
+        negative = true;
+        i = 1;
+    } else if first == 43 {
+        i = 1;
+    }
+    if i >= n {
+        return Err { error: "float value has a sign but no digits" };
+    }
+
+    // Integer part: consume digits, stopping at the first byte that is not
+    // one. `scanning` is the loop's own exit flag — v0 has no `break`, so the
+    // condition carries it explicitly rather than through an index sentinel.
+    var whole = 0.0;
+    var saw_digit = false;
+    var scanning = true;
+    while scanning && i < n {
+        let b = std::str::byte_at(raw, i);
+        if b < 48 || b > 57 {
+            scanning = false;
+        } else {
+            whole = whole * 10.0 + ((b - 48) as Float);
+            saw_digit = true;
+            i = i + 1;
+        }
+    }
+
+    // Fractional part.
+    if i < n && std::str::byte_at(raw, i) == 46 {
+        i = i + 1;
+        var scale = 1.0;
+        scanning = true;
+        while scanning && i < n {
+            let b = std::str::byte_at(raw, i);
+            if b < 48 || b > 57 {
+                scanning = false;
+            } else {
+                scale = scale / 10.0;
+                whole = whole + ((b - 48) as Float) * scale;
+                saw_digit = true;
+                i = i + 1;
+            }
+        }
+    }
+
+    if !saw_digit {
+        return Err { error: "float value has no digits" };
+    }
+
+    // Exponent.
+    if i < n {
+        let e = std::str::byte_at(raw, i);
+        if e != 101 && e != 69 {
+            return Err { error: "float value has trailing bytes" };
+        }
+        i = i + 1;
+        if i >= n {
+            return Err { error: "float value has an empty exponent" };
+        }
+        var exp_negative = false;
+        let esign = std::str::byte_at(raw, i);
+        if esign == 45 {
+            exp_negative = true;
+            i = i + 1;
+        } else if esign == 43 {
+            i = i + 1;
+        }
+        if i >= n {
+            return Err { error: "float value has an empty exponent" };
+        }
+        var exp = 0;
+        while i < n {
+            let b = std::str::byte_at(raw, i);
+            if b < 48 || b > 57 {
+                return Err { error: "float value has a non-digit exponent" };
+            }
+            exp = exp * 10 + (b - 48);
+            i = i + 1;
+        }
+        var k = 0;
+        while k < exp {
+            if exp_negative {
+                whole = whole / 10.0;
+            } else {
+                whole = whole * 10.0;
+            }
+            k = k + 1;
+        }
+    }
+
+    if negative {
+        Ok { value: 0.0 - whole }
+    } else {
+        Ok { value: whole }
+    }
+}
+
+/// Decode a float column, falling back to `fallback` when it does not parse.
+///
+/// # Example
+/// ```tuo
+/// let f = pg::value::as_float_or("3.5", 0.0); // 3.5
+/// ```
+pub fn as_float_or(in raw: Str, take fallback: Float) -> Float {
+    match as_float(raw) {
+        Ok { value } => value,
+        Err { error } => fallback,
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Specs — pinned to renderings a real PostgreSQL 16 server emits.
+// ----------------------------------------------------------------------------
+
+/// Spec helper: `as_int` succeeded with exactly `expect`.
+pub fn int_is(in raw: Str, take expect: Int) -> Bool {
+    match as_int(raw) {
+        Ok { value } => value == expect,
+        Err { error } => false,
+    }
+}
+
+/// Spec helper: `as_int` rejected the input.
+pub fn int_rejects(in raw: Str) -> Bool {
+    match as_int(raw) {
+        Ok { value } => false,
+        Err { error } => true,
+    }
+}
+
+/// Spec helper: the absolute value of a `Float`.
+pub fn float_abs(take x: Float) -> Float {
+    if x < 0.0 {
+        0.0 - x
+    } else {
+        x
+    }
+}
+
+/// Spec helper: `as_float` succeeded within a tolerance.
+pub fn float_near(in raw: Str, take expect: Float) -> Bool {
+    match as_float(raw) {
+        Ok { value } => float_abs(value - expect) < 0.000001,
+        Err { error } => false,
+    }
+}
+
+/// Spec helper: `as_float` rejected the input.
+pub fn float_rejects(in raw: Str) -> Bool {
+    match as_float(raw) {
+        Ok { value } => false,
+        Err { error } => true,
+    }
+}
+
+spec as_bool {
+    then as_bool("t");
+    then !as_bool("f");
+    // Only the exact one-byte rendering is true; nothing else is.
+    then !as_bool("true");
+    then !as_bool("");
+    then !as_bool("T");
+}
+
+spec as_int {
+    then int_is("0", 0);
+    then int_is("1", 1);
+    then int_is("42", 42);
+    then int_is("-42", 0 - 42);
+    then int_is("+7", 7);
+    then int_is("1234567890", 1234567890);
+    // int8 extremes, which a PostgreSQL bigint really can hold.
+    then int_is("9223372036854775807", 9223372036854775807);
+    then int_is("-9223372036854775807", 0 - 9223372036854775807);
+    // Malformed input is an Err, never a silent zero.
+    then int_rejects("");
+    then int_rejects("-");
+    then int_rejects("+");
+    then int_rejects("abc");
+    then int_rejects("1.5");
+    then int_rejects("12a");
+    then int_rejects(" 1");
+}
+
+spec as_int_or {
+    then as_int_or("42", 0) == 42;
+    then as_int_or("bad", 7) == 7;
+    then as_int_or("", 0 - 1) == 0 - 1;
+}
+
+spec as_float {
+    then float_near("0", 0.0);
+    then float_near("1", 1.0);
+    then float_near("3.5", 3.5);
+    then float_near("-3.5", 0.0 - 3.5);
+    then float_near("0.125", 0.125);
+    then float_near("100", 100.0);
+    then float_near("1e2", 100.0);
+    then float_near("1.5e2", 150.0);
+    then float_near("15e-1", 1.5);
+    then float_rejects("");
+    then float_rejects("abc");
+    then float_rejects("1.2.3");
+    then float_rejects("1e");
+    // The special renderings are reported rather than silently finite.
+    then float_rejects("NaN");
+    then float_rejects("Infinity");
+}
+
+spec as_float_or {
+    then as_float_or("bad", 0.0) == 0.0;
+}
+
+spec is_integer {
+    then is_integer(oid_int2());
+    then is_integer(oid_int4());
+    then is_integer(oid_int8());
+    then !is_integer(oid_text());
+    then !is_integer(oid_float8());
+}
+
+spec is_text {
+    then is_text(oid_text());
+    then is_text(oid_varchar());
+    then is_text(oid_uuid());
+    then !is_text(oid_int4());
+}
+
+spec is_float {
+    then is_float(oid_float4());
+    then is_float(oid_float8());
+    then is_float(oid_numeric());
+    then !is_float(oid_int4());
+}
+
+spec is_temporal {
+    then is_temporal(oid_date());
+    then is_temporal(oid_timestamptz());
+    then !is_temporal(oid_text());
+}

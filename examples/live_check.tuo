@@ -1,0 +1,249 @@
+// live_check — the adapter's acceptance oracle, run against a real server.
+//
+// The pure tiers of this adapter carry 61 executable specs, but a spec cannot
+// touch a socket (`R0007`), so the effect tier — connecting, the handshake,
+// framing messages off a live stream — needs a different kind of proof. This
+// program is it: it connects to a real PostgreSQL server, runs real SQL, and
+// exits non-zero the moment anything disagrees with what the pure tiers say
+// should happen.
+//
+// It is deliberately written as a **cross-check**, not a smoke test. Each step
+// asserts a value the pure layer predicts, so a passing run means the wire
+// agrees with the model rather than merely that bytes moved.
+//
+// Run it (against the docker-compose Postgres in ../shallowflaws):
+//
+//     tuo run examples/live_check.tuo src/pg/*.tuo
+//
+// Exit codes — each names exactly one failed expectation:
+//
+//     0   every check passed
+//     10  could not connect or the handshake failed
+//     11  SELECT 1 did not return the single value 1
+//     12  arithmetic/NULL row did not decode as predicted
+//     13  column metadata (names, OIDs) disagreed
+//     14  a parameterized query did not round-trip its parameter
+//     15  a deliberate SQL error was not reported as a server error
+//     16  multi-row ordering or row counts were wrong
+//
+// The connection parameters match `shallowflaws/docker/docker-compose.yml`,
+// whose `pg_hba.conf` grants `trust` from 127.0.0.1 — which is what lets this
+// run today, before ADR-0019 lands the crypto that md5/SCRAM would need.
+
+module live_check;
+
+/// The server address. Numeric, because v0 has no DNS (ADR-0017).
+fn host() -> Str {
+    "127.0.0.1"
+}
+
+/// The database user.
+fn user() -> Str {
+    "shallowflaws"
+}
+
+/// The database name.
+fn database() -> Str {
+    "deepflaws"
+}
+
+/// The password. Unused under `trust`, and sent only if the server asks for
+/// cleartext.
+fn password() -> Str {
+    "half123"
+}
+
+/// A generous per-operation timeout: every wait in the adapter is bounded, so
+/// a server that goes away fails this program rather than hanging it.
+fn timeout_ms() -> Int {
+    5000
+}
+
+/// Report a step's outcome on stdout, so a failing run says which check broke.
+fn say(in label: Str) -> Int {
+    let _ = std::rt::write(1, label);
+    std::rt::write(1, "\n")
+}
+
+fn main() -> Int {
+    // --- Connect and complete the startup handshake ------------------------
+    let connected = pg::conn::connect(host(), pg::conn::default_port(), user(), database(), password(), timeout_ms());
+    if !pg::conn::is_ok_int(connected) {
+        let _ = std::rt::write(1, "FAIL connect: ");
+        let _ = std::rt::write_string(1, pg::error::render(pg::conn::unwrap_err_int(connected)));
+        let _ = std::rt::write(1, "\n");
+        return 10;
+    }
+    let fd = pg::conn::unwrap_ok_int(connected);
+    let _ = say("ok   connect + handshake");
+
+    // --- 1. The simplest possible query -----------------------------------
+    // Proves framing, RowDescription, DataRow, CommandComplete, and
+    // ReadyForQuery all agree end to end.
+    let r1 = pg::query::run(fd, "SELECT 1", timeout_ms());
+    if !pg::query::is_ok_result(r1) {
+        let _ = std::rt::write_string(1, pg::query::render_error(r1));
+        let _ = pg::conn::shutdown(fd);
+        return 11;
+    }
+    let rs1 = pg::query::unwrap_ok_result(r1);
+    if pg::query::row_count(rs1) != 1 || pg::query::column_count(rs1) != 1 || pg::query::cell_int(rs1, 0, 0, 0) != 1 {
+        let _ = say("FAIL SELECT 1");
+        let _ = pg::conn::shutdown(fd);
+        return 11;
+    }
+    let _ = say("ok   SELECT 1");
+
+    // --- 2. Types and NULL -------------------------------------------------
+    // A row mixing an int, a text, a bool, a float, and a NULL. This is the
+    // check that catches a framing bug after a NULL column, which is the
+    // classic wire-protocol defect.
+    let r2 = pg::query::run(fd, "SELECT 42, 'ada', true, 3.5, NULL::text", timeout_ms());
+    if !pg::query::is_ok_result(r2) {
+        let _ = std::rt::write_string(1, pg::query::render_error(r2));
+        let _ = pg::conn::shutdown(fd);
+        return 12;
+    }
+    let rs2 = pg::query::unwrap_ok_result(r2);
+    if pg::query::column_count(rs2) != 5 {
+        let _ = say("FAIL typed row: column count");
+        let _ = pg::conn::shutdown(fd);
+        return 12;
+    }
+    if pg::query::cell_int(rs2, 0, 0, 0) != 42 {
+        let _ = say("FAIL typed row: int");
+        let _ = pg::conn::shutdown(fd);
+        return 12;
+    }
+    if std::string::as_str(pg::query::cell(rs2, 0, 1)) != "ada" {
+        let _ = say("FAIL typed row: text");
+        let _ = pg::conn::shutdown(fd);
+        return 12;
+    }
+    if !pg::query::cell_bool(rs2, 0, 2) {
+        let _ = say("FAIL typed row: bool");
+        let _ = pg::conn::shutdown(fd);
+        return 12;
+    }
+    if pg::query::cell_float(rs2, 0, 3, 0.0) != 3.5 {
+        let _ = say("FAIL typed row: float");
+        let _ = pg::conn::shutdown(fd);
+        return 12;
+    }
+    // The NULL must be reported as NULL, and must not be confused with ''.
+    if !pg::query::is_null(rs2, 0, 4) {
+        let _ = say("FAIL typed row: NULL not detected");
+        let _ = pg::conn::shutdown(fd);
+        return 12;
+    }
+    let _ = say("ok   int / text / bool / float / NULL");
+
+    // --- 3. Column metadata ------------------------------------------------
+    // The names and type OIDs the server reports must match what `pg::value`
+    // claims they are.
+    let r3 = pg::query::run(fd, "SELECT 7 AS id, 'x' AS label", timeout_ms());
+    if !pg::query::is_ok_result(r3) {
+        let _ = pg::conn::shutdown(fd);
+        return 13;
+    }
+    let rs3 = pg::query::unwrap_ok_result(r3);
+    if pg::query::column_index(rs3, "id") != 0 || pg::query::column_index(rs3, "label") != 1 {
+        let _ = say("FAIL metadata: column names");
+        let _ = pg::conn::shutdown(fd);
+        return 13;
+    }
+    // A bare integer literal is int4; a bare quoted literal is unknown/text.
+    if !pg::value::is_integer(pg::query::column_oid(rs3, 0)) {
+        let _ = say("FAIL metadata: id is not an integer type");
+        let _ = pg::conn::shutdown(fd);
+        return 13;
+    }
+    if pg::query::column_index(rs3, "nope") != 0 - 1 {
+        let _ = say("FAIL metadata: absent column should be -1");
+        let _ = pg::conn::shutdown(fd);
+        return 13;
+    }
+    let _ = say("ok   column names and type OIDs");
+
+    // --- 4. The extended protocol, with a parameter ------------------------
+    // The injection-safe path: the value travels outside the SQL text and
+    // must come back unchanged.
+    var params = std::array::empty();
+    std::array::push(params, std::string::from_str("hello"));
+    let r4 = pg::query::run_params(fd, "SELECT $1", params, timeout_ms());
+    if !pg::query::is_ok_result(r4) {
+        let _ = std::rt::write_string(1, pg::query::render_error(r4));
+        let _ = pg::conn::shutdown(fd);
+        return 14;
+    }
+    let rs4 = pg::query::unwrap_ok_result(r4);
+    // Bind the cell before comparing it. A `String` temporary created inside a
+    // short-circuiting `||` is dropped on one arm and still read on the other,
+    // which lowers to MIR that fails verification (`M0005`); binding it first
+    // gives it one owner and one drop.
+    let echoed = pg::query::cell(rs4, 0, 0);
+    if pg::query::row_count(rs4) != 1 || std::string::as_str(echoed) != "hello" {
+        let _ = say("FAIL parameterized query round-trip");
+        let _ = pg::conn::shutdown(fd);
+        return 14;
+    }
+    let _ = say("ok   parameterized query ($1 round-trip)");
+
+    // --- 5. A real server error --------------------------------------------
+    // A deliberate syntax error must arrive as a typed server error carrying
+    // SQLSTATE 42601 — and the connection must remain usable afterwards,
+    // which is what draining to ReadyForQuery buys.
+    let r5 = pg::query::run(fd, "SELCT bad syntax", timeout_ms());
+    if pg::query::is_ok_result(r5) {
+        let _ = say("FAIL error: a syntax error was reported as success");
+        let _ = pg::conn::shutdown(fd);
+        return 15;
+    }
+    let e5 = pg::query::unwrap_err_result(r5);
+    if pg::error::kind(e5) != pg::error::kind_server() {
+        let _ = say("FAIL error: wrong error kind");
+        let _ = pg::conn::shutdown(fd);
+        return 15;
+    }
+    if !pg::error::is_sqlstate(e5, pg::error::sqlstate_syntax_error()) {
+        let _ = say("FAIL error: wrong SQLSTATE");
+        let _ = pg::conn::shutdown(fd);
+        return 15;
+    }
+    let _ = say("ok   syntax error -> SQLSTATE 42601");
+
+    // --- 6. The connection survived the error ------------------------------
+    // If the error path had left an unread message on the stream, this query
+    // would read it and desynchronize. That it succeeds proves the drain.
+    let r6 = pg::query::run(fd, "SELECT n FROM generate_series(1, 3) AS n ORDER BY n", timeout_ms());
+    if !pg::query::is_ok_result(r6) {
+        let _ = say("FAIL recovery: connection unusable after an error");
+        let _ = pg::conn::shutdown(fd);
+        return 16;
+    }
+    let rs6 = pg::query::unwrap_ok_result(r6);
+    if pg::query::row_count(rs6) != 3 {
+        let _ = say("FAIL multi-row: wrong row count");
+        let _ = pg::conn::shutdown(fd);
+        return 16;
+    }
+    if pg::query::cell_int(rs6, 0, 0, 0) != 1 || pg::query::cell_int(rs6, 1, 0, 0) != 2 || pg::query::cell_int(rs6, 2, 0, 0) != 3 {
+        let _ = say("FAIL multi-row: wrong values or order");
+        let _ = pg::conn::shutdown(fd);
+        return 16;
+    }
+    // The command tag must report the same count the rows do.
+    if pg::query::affected(rs6) != 3 {
+        let _ = say("FAIL multi-row: command tag disagrees with row count");
+        let _ = pg::conn::shutdown(fd);
+        return 16;
+    }
+    let _ = say("ok   multi-row ordering + command tag");
+    let _ = say("ok   connection reusable after a server error");
+
+    // --- Done --------------------------------------------------------------
+    let _ = pg::conn::shutdown(fd);
+    let _ = say("");
+    let _ = say("all live checks passed");
+    0
+}

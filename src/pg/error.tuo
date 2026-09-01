@@ -1,0 +1,301 @@
+// pg::error — a typed error vocabulary for the adapter.
+//
+// v0 has no traits, so there is no error *interface* to implement. The honest
+// model — and the one `std::core` itself uses — is a concrete value: here, an
+// integer **kind** plus a human-readable message. Every fallible entry point in
+// the adapter returns `Result[T, PgError]`, so a caller branches on a value
+// rather than catching anything.
+//
+// WHY A KIND AND NOT JUST A STRING.
+//
+// A string is enough to *print* and useless to *act on*. Retrying a
+// connection, reporting a bad password, and surfacing a SQL syntax error are
+// three different behaviors, and a caller must be able to tell them apart
+// without matching on English text. So the kind is the branch and the message
+// is the explanation, with the server's own SQLSTATE preserved whenever the
+// error came from the server at all.
+
+module pg::error;
+
+// ----------------------------------------------------------------------------
+// Error kinds.
+// ----------------------------------------------------------------------------
+
+/// The socket could not be opened, or it failed mid-conversation.
+pub fn kind_connection() -> Int {
+    1
+}
+
+/// The peer did not answer within the configured timeout.
+pub fn kind_timeout() -> Int {
+    2
+}
+
+/// The server demanded an authentication method the adapter cannot perform.
+pub fn kind_auth() -> Int {
+    3
+}
+
+/// The server reported an `ErrorResponse` — a real SQL error.
+pub fn kind_server() -> Int {
+    4
+}
+
+/// The bytes on the wire did not match the protocol.
+pub fn kind_protocol() -> Int {
+    5
+}
+
+/// A value could not be decoded into the requested type.
+pub fn kind_decode() -> Int {
+    6
+}
+
+/// The caller asked for something the adapter does not implement (COPY, TLS).
+pub fn kind_unsupported() -> Int {
+    7
+}
+
+// ----------------------------------------------------------------------------
+// The error value.
+// ----------------------------------------------------------------------------
+
+/// One adapter error: a `kind_*` tag, a message, and the server's SQLSTATE
+/// when the error came from the server (empty otherwise).
+///
+/// `sqlstate` is kept as a separate field rather than folded into the message
+/// because it is the part a program matches on — `23505` is a unique-violation
+/// no matter how the message is worded or localized.
+pub struct PgError {
+    kind: Int,
+    message: String,
+    sqlstate: String,
+}
+
+/// A new error of `kind` with `message` and no SQLSTATE.
+///
+/// # Example
+/// ```tuo
+/// let e = pg::error::new(pg::error::kind_connection(), "connect refused");
+/// ```
+pub fn new(take kind: Int, in message: Str) -> PgError {
+    PgError { kind: kind, message: std::string::from_str(message), sqlstate: std::string::empty() }
+}
+
+/// A server error carrying its SQLSTATE.
+///
+/// # Example
+/// ```tuo
+/// let e = pg::error::server("syntax error", "42601");
+/// ```
+pub fn server(in message: Str, in sqlstate: Str) -> PgError {
+    PgError { kind: kind_server(), message: std::string::from_str(message), sqlstate: std::string::from_str(sqlstate) }
+}
+
+/// The error's kind tag.
+///
+/// # Example
+/// ```tuo
+/// // let k = pg::error::kind(e);
+/// ```
+pub fn kind(in e: PgError) -> Int {
+    e.kind
+}
+
+/// The error's message.
+///
+/// # Example
+/// ```tuo
+/// // let m = pg::error::message(e);
+/// ```
+pub fn message(in e: PgError) -> String {
+    std::string::from_str(std::string::as_str(e.message))
+}
+
+/// The error's SQLSTATE, or the empty string when it did not come from the
+/// server.
+///
+/// # Example
+/// ```tuo
+/// // let s = pg::error::sqlstate(e);
+/// ```
+pub fn sqlstate(in e: PgError) -> String {
+    std::string::from_str(std::string::as_str(e.sqlstate))
+}
+
+/// A short human name for a kind, for rendering.
+///
+/// # Example
+/// ```tuo
+/// let n = pg::error::kind_name(pg::error::kind_auth()); // "auth"
+/// ```
+pub fn kind_name(take k: Int) -> Str {
+    if k == kind_connection() {
+        "connection"
+    } else if k == kind_timeout() {
+        "timeout"
+    } else if k == kind_auth() {
+        "auth"
+    } else if k == kind_server() {
+        "server"
+    } else if k == kind_protocol() {
+        "protocol"
+    } else if k == kind_decode() {
+        "decode"
+    } else if k == kind_unsupported() {
+        "unsupported"
+    } else {
+        "unknown"
+    }
+}
+
+/// Render an error as `"kind: message"`, appending ` (SQLSTATE)` when present.
+///
+/// # Example
+/// ```tuo
+/// // let text = pg::error::render(e);
+/// ```
+pub fn render(in e: PgError) -> String {
+    var out = std::string::empty();
+    std::string::append(out, kind_name(e.kind));
+    std::string::append(out, ": ");
+    std::string::append(out, std::string::as_str(e.message));
+    if std::string::len(e.sqlstate) > 0 {
+        std::string::append(out, " (SQLSTATE ");
+        std::string::append(out, std::string::as_str(e.sqlstate));
+        std::string::append(out, ")");
+    }
+    out
+}
+
+// ----------------------------------------------------------------------------
+// SQLSTATE helpers — the classes worth branching on.
+//
+// A SQLSTATE is five characters: a two-character class and a three-character
+// subclass. Matching the class is how a program says "any unique violation"
+// without listing every code.
+// ----------------------------------------------------------------------------
+
+/// Does this error carry exactly `code` as its SQLSTATE?
+///
+/// # Example
+/// ```tuo
+/// // let dup = pg::error::is_sqlstate(e, "23505");
+/// ```
+pub fn is_sqlstate(in e: PgError, in code: Str) -> Bool {
+    std::string::as_str(e.sqlstate) == code
+}
+
+/// `23505` — unique_violation, the code behind a duplicate-key insert.
+pub fn sqlstate_unique_violation() -> Str {
+    "23505"
+}
+
+/// `23503` — foreign_key_violation.
+pub fn sqlstate_foreign_key_violation() -> Str {
+    "23503"
+}
+
+/// `23502` — not_null_violation.
+pub fn sqlstate_not_null_violation() -> Str {
+    "23502"
+}
+
+/// `42601` — syntax_error.
+pub fn sqlstate_syntax_error() -> Str {
+    "42601"
+}
+
+/// `42P01` — undefined_table.
+pub fn sqlstate_undefined_table() -> Str {
+    "42P01"
+}
+
+/// `28P01` — invalid_password.
+pub fn sqlstate_invalid_password() -> Str {
+    "28P01"
+}
+
+/// `40001` — serialization_failure, the retryable one.
+pub fn sqlstate_serialization_failure() -> Str {
+    "40001"
+}
+
+/// Is this error worth retrying as-is? True for serialization failures and
+/// deadlocks, which are the two the server explicitly invites a retry on.
+///
+/// # Example
+/// ```tuo
+/// // if pg::error::is_retryable(e) { .. }
+/// ```
+pub fn is_retryable(in e: PgError) -> Bool {
+    is_sqlstate(e, sqlstate_serialization_failure()) || is_sqlstate(e, "40P01")
+}
+
+// ----------------------------------------------------------------------------
+// Specs.
+// ----------------------------------------------------------------------------
+
+/// Spec helper: the rendering of an error, as a comparable `Str`.
+pub fn render_is(take k: Int, in msg: Str, in expect: Str) -> Bool {
+    std::string::as_str(render(new(k, msg))) == expect
+}
+
+/// Spec helper: the rendering of a server error.
+pub fn render_server_is(in msg: Str, in state: Str, in expect: Str) -> Bool {
+    std::string::as_str(render(server(msg, state))) == expect
+}
+
+/// Spec helper: round-trip a kind through construction.
+pub fn kind_of(take k: Int) -> Int {
+    kind(new(k, "x"))
+}
+
+/// Spec helper: is a constructed server error matched by its SQLSTATE?
+pub fn server_matches(in state: Str, in probe: Str) -> Bool {
+    is_sqlstate(server("m", state), probe)
+}
+
+/// Spec helper: is a constructed server error retryable?
+pub fn server_retryable(in state: Str) -> Bool {
+    is_retryable(server("m", state))
+}
+
+spec kind_name {
+    then kind_name(kind_connection()) == "connection";
+    then kind_name(kind_timeout()) == "timeout";
+    then kind_name(kind_auth()) == "auth";
+    then kind_name(kind_server()) == "server";
+    then kind_name(kind_protocol()) == "protocol";
+    then kind_name(kind_decode()) == "decode";
+    then kind_name(kind_unsupported()) == "unsupported";
+    then kind_name(999) == "unknown";
+}
+
+spec kind_of {
+    then kind_of(kind_auth()) == kind_auth();
+    then kind_of(kind_server()) == kind_server();
+}
+
+spec render {
+    then render_is(kind_connection(), "connection refused", "connection: connection refused");
+    then render_is(kind_timeout(), "no reply in 5000ms", "timeout: no reply in 5000ms");
+    // A server error appends its SQLSTATE, which is the part a program matches.
+    then render_server_is("syntax error at or near \"SELCT\"", "42601", "server: syntax error at or near \"SELCT\" (SQLSTATE 42601)");
+}
+
+spec is_sqlstate {
+    then server_matches("23505", "23505");
+    then server_matches("23505", sqlstate_unique_violation());
+    then !server_matches("23505", "23503");
+    // A non-server error carries no SQLSTATE and matches nothing.
+    then !is_sqlstate(new(kind_connection(), "x"), "23505");
+}
+
+spec is_retryable {
+    then server_retryable("40001");
+    then server_retryable("40P01");
+    then !server_retryable("23505");
+    then !server_retryable("42601");
+    then !is_retryable(new(kind_connection(), "x"));
+}

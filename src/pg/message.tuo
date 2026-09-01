@@ -1,0 +1,578 @@
+// pg::message — decoding backend messages, and the field accessors over them.
+//
+// A backend message arrives as a type byte plus a payload (`pg::conn` does the
+// reading; this module does the interpreting). Everything here is **pure**: a
+// decoded message is just its type byte and its payload bytes, so every
+// accessor is a spec-checked function over a `String` rather than an effect.
+// That split is what lets the whole decoder be proven without a server.
+//
+// WHY ACCESSORS AND NOT A DECODED STRUCT.
+//
+// The obvious design — decode each message into its own struct — is not
+// available in v0: there are no sum types over heterogeneous payloads without
+// an enum per shape, no `Box` to make an enum hold a growable payload, and no
+// generics to abstract the result. So the honest model is: keep the payload as
+// bytes, and expose one accessor per field, each of which states which message
+// type it is valid on. This is also the faster model — a `DataRow` is walked
+// once, in place, with no intermediate allocation per column.
+//
+// Every accessor below documents the message it reads and traps
+// `IndexOutOfBounds` if handed a payload of the wrong type, which is a loud
+// failure rather than a silently wrong value.
+
+module pg::message;
+
+// ----------------------------------------------------------------------------
+// AuthenticationRequest (`R`).
+// ----------------------------------------------------------------------------
+
+/// The authentication sub-kind: the Int32 at the start of an `R` payload.
+///
+/// Compare against `pg::proto::auth_ok()`, `auth_md5()`, `auth_sasl()`, and
+/// friends. This is the branch the whole handshake turns on.
+///
+/// # Example
+/// ```tuo
+/// // let kind = pg::message::auth_kind(payload);
+/// ```
+pub fn auth_kind(in payload: String) -> Int {
+    pg::bytes::be_i32(payload, 0)
+}
+
+/// The 4-byte salt from an `AuthenticationMD5Password` payload, as an
+/// `Array[Int]` of four bytes.
+///
+/// Valid only when `auth_kind` is `pg::proto::auth_md5()`. The salt follows
+/// the Int32 kind, so it occupies bytes 4..8.
+///
+/// # Example
+/// ```tuo
+/// // let salt = pg::message::auth_md5_salt(payload);
+/// ```
+pub fn auth_md5_salt(in payload: String) -> Array[Int] {
+    var salt = std::array::empty();
+    std::array::push(salt, std::string::byte_at(payload, 4));
+    std::array::push(salt, std::string::byte_at(payload, 5));
+    std::array::push(salt, std::string::byte_at(payload, 6));
+    std::array::push(salt, std::string::byte_at(payload, 7));
+    salt
+}
+
+/// The SASL payload that follows the Int32 kind — the mechanism list for
+/// `AuthenticationSASL`, or the server's SCRAM message for `SASLContinue` /
+/// `SASLFinal`.
+///
+/// # Example
+/// ```tuo
+/// // let body = pg::message::auth_sasl_body(payload);
+/// ```
+pub fn auth_sasl_body(in payload: String) -> String {
+    std::string::slice(payload, 4, std::string::len(payload))
+}
+
+// ----------------------------------------------------------------------------
+// ReadyForQuery (`Z`) and ParameterStatus (`S`).
+// ----------------------------------------------------------------------------
+
+/// The transaction status byte from a `ReadyForQuery` payload: `I` idle, `T`
+/// in a transaction, `E` in a failed transaction.
+///
+/// # Example
+/// ```tuo
+/// // let st = pg::message::tx_status(payload);
+/// ```
+pub fn tx_status(in payload: String) -> Int {
+    std::string::byte_at(payload, 0)
+}
+
+/// The parameter name from a `ParameterStatus` payload (two C strings).
+///
+/// # Example
+/// ```tuo
+/// // let name = pg::message::param_name(payload);
+/// ```
+pub fn param_name(in payload: String) -> String {
+    pg::bytes::cstr_at(payload, 0)
+}
+
+/// The parameter value from a `ParameterStatus` payload.
+///
+/// # Example
+/// ```tuo
+/// // let value = pg::message::param_value(payload);
+/// ```
+pub fn param_value(in payload: String) -> String {
+    pg::bytes::cstr_at(payload, pg::bytes::cstr_end(payload, 0))
+}
+
+// ----------------------------------------------------------------------------
+// CommandComplete (`C`).
+// ----------------------------------------------------------------------------
+
+/// The command tag from a `CommandComplete` payload — `"SELECT 1"`,
+/// `"INSERT 0 3"`, `"UPDATE 2"`, `"DELETE 0"`.
+///
+/// # Example
+/// ```tuo
+/// // let tag = pg::message::command_tag(payload);
+/// ```
+pub fn command_tag(in payload: String) -> String {
+    pg::bytes::cstr_at(payload, 0)
+}
+
+/// Is byte `b` an ASCII digit?
+///
+/// Defined locally rather than taken from `std::str`, because that module is
+/// stdlib *source* consumed by the compiler, not a builtin a user package can
+/// call. The adapter depends only on the real builtin surface
+/// (`std::str::len`/`byte_at`/`slice`, `std::string::*`, `std::array::*`), so
+/// it needs no vendoring and no stdlib coupling.
+///
+/// # Example
+/// ```tuo
+/// let d = pg::message::is_digit(53); // true, '5'
+/// ```
+pub fn is_digit(take b: Int) -> Bool {
+    b >= 48 && b <= 57
+}
+
+/// The affected-row count parsed out of a command tag.
+///
+/// The count is the **last** whitespace-separated field of the tag, which is
+/// what makes one rule work across all four shapes: `INSERT` carries an oid
+/// before its count (`"INSERT 0 3"` → 3), while `UPDATE`/`DELETE`/`SELECT`
+/// carry only the count. Returns `0` for a tag with no trailing number, such
+/// as `"BEGIN"` or `"CREATE TABLE"`.
+///
+/// # Example
+/// ```tuo
+/// let n = pg::message::rows_affected("INSERT 0 3"); // 3
+/// ```
+pub fn rows_affected(in tag: Str) -> Int {
+    let n = std::str::len(tag);
+    if n == 0 {
+        return 0;
+    }
+    // Walk back over the trailing digits.
+    let end = n;
+    var start = n;
+    while start > 0 && is_digit(std::str::byte_at(tag, start - 1)) {
+        start = start - 1;
+    }
+    if start == end {
+        return 0;
+    }
+    // A count must be preceded by a space, else it is part of a word
+    // (e.g. the "2" in a table named "t2" that CREATE TABLE echoes).
+    if start > 0 && std::str::byte_at(tag, start - 1) != 32 {
+        return 0;
+    }
+    // Accumulate the digits directly; the run is known to be all digits and
+    // a command tag's count always fits an Int.
+    var total = 0;
+    var i = start;
+    while i < end {
+        total = total * 10 + (std::str::byte_at(tag, i) - 48);
+        i = i + 1;
+    }
+    total
+}
+
+// ----------------------------------------------------------------------------
+// ErrorResponse (`E`) and NoticeResponse (`N`).
+//
+// The payload is a run of fields, each a one-byte code then a C string, ended
+// by a zero byte. The codes that matter (PostgreSQL 16 §55.8):
+//   S severity   V severity (non-localized)   C SQLSTATE   M message
+//   D detail     H hint                       P position   F file
+//   L line       R routine
+// ----------------------------------------------------------------------------
+
+/// Field code `S` — the localized severity (`ERROR`, `FATAL`, `PANIC`).
+pub fn field_severity() -> Int {
+    83
+}
+
+/// Field code `C` — the five-character SQLSTATE.
+pub fn field_sqlstate() -> Int {
+    67
+}
+
+/// Field code `M` — the primary human-readable message.
+pub fn field_message() -> Int {
+    77
+}
+
+/// Field code `D` — optional detail.
+pub fn field_detail() -> Int {
+    68
+}
+
+/// Field code `H` — optional hint.
+pub fn field_hint() -> Int {
+    72
+}
+
+/// Field code `P` — the 1-based character position of a syntax error.
+pub fn field_position() -> Int {
+    80
+}
+
+/// The value of field `code` in an `ErrorResponse`/`NoticeResponse` payload,
+/// or the empty string when the field is absent.
+///
+/// This is the one walker for every field, so a caller asks for what it wants
+/// by code rather than the module guessing which fields matter.
+///
+/// # Example
+/// ```tuo
+/// // let msg = pg::message::error_field(payload, pg::message::field_message());
+/// ```
+pub fn error_field(in payload: String, take code: Int) -> String {
+    let stop = std::string::len(payload);
+    var i = 0;
+    while i < stop {
+        let c = std::string::byte_at(payload, i);
+        if c == 0 {
+            // The terminating zero byte: no more fields.
+            return std::string::empty();
+        }
+        let value_at = i + 1;
+        if c == code {
+            return pg::bytes::cstr_at(payload, value_at);
+        }
+        i = pg::bytes::cstr_end(payload, value_at);
+    }
+    std::string::empty()
+}
+
+// ----------------------------------------------------------------------------
+// RowDescription (`T`).
+//
+// Int16 field count, then per field: name C string, Int32 table oid, Int16
+// column attribute number, Int32 type oid, Int16 type size, Int32 type
+// modifier, Int16 format code. That is 18 fixed bytes after each name.
+// ----------------------------------------------------------------------------
+
+/// The number of columns a `RowDescription` describes.
+///
+/// # Example
+/// ```tuo
+/// // let n = pg::message::field_count(payload);
+/// ```
+pub fn field_count(in payload: String) -> Int {
+    pg::bytes::be_i16(payload, 0)
+}
+
+/// The fixed-width tail after each column name in a `RowDescription`.
+pub fn field_tail_width() -> Int {
+    18
+}
+
+/// The byte offset of column `index`'s name within a `RowDescription` payload.
+///
+/// Columns are variable-width (the name is a C string), so reaching column `i`
+/// means walking the preceding ones — there is no index table in the protocol.
+///
+/// # Example
+/// ```tuo
+/// // let at = pg::message::field_offset(payload, 2);
+/// ```
+pub fn field_offset(in payload: String, take index: Int) -> Int {
+    var at = 2;
+    var i = 0;
+    while i < index {
+        at = pg::bytes::cstr_end(payload, at) + field_tail_width();
+        i = i + 1;
+    }
+    at
+}
+
+/// The name of column `index` in a `RowDescription`.
+///
+/// # Example
+/// ```tuo
+/// // let name = pg::message::field_name(payload, 0);
+/// ```
+pub fn field_name(in payload: String, take index: Int) -> String {
+    pg::bytes::cstr_at(payload, field_offset(payload, index))
+}
+
+/// The **type OID** of column `index` — the key to decoding its values.
+///
+/// Lives 6 bytes past the end of the name (after the Int32 table oid and Int16
+/// attribute number). See `pg::value` for what the OIDs mean.
+///
+/// # Example
+/// ```tuo
+/// // let oid = pg::message::field_type_oid(payload, 0);
+/// ```
+pub fn field_type_oid(in payload: String, take index: Int) -> Int {
+    let name_end = pg::bytes::cstr_end(payload, field_offset(payload, index));
+    pg::bytes::be_u32(payload, name_end + 6)
+}
+
+/// The format code of column `index`: `0` text, `1` binary.
+///
+/// The adapter always requests text format, so this is `0` in practice; it is
+/// exposed so a caller can assert that rather than assume it.
+///
+/// # Example
+/// ```tuo
+/// // let fmt = pg::message::field_format(payload, 0);
+/// ```
+pub fn field_format(in payload: String, take index: Int) -> Int {
+    let name_end = pg::bytes::cstr_end(payload, field_offset(payload, index));
+    pg::bytes::be_i16(payload, name_end + 16)
+}
+
+// ----------------------------------------------------------------------------
+// DataRow (`D`).
+//
+// Int16 column count, then per column: Int32 length (-1 = NULL) then that many
+// bytes. NULL is the case a naive decoder gets wrong, because -1 must not be
+// read as a length.
+// ----------------------------------------------------------------------------
+
+/// The number of columns in a `DataRow`.
+///
+/// # Example
+/// ```tuo
+/// // let n = pg::message::column_count(payload);
+/// ```
+pub fn column_count(in payload: String) -> Int {
+    pg::bytes::be_i16(payload, 0)
+}
+
+/// The byte offset of column `index`'s **length field** in a `DataRow`.
+///
+/// # Example
+/// ```tuo
+/// // let at = pg::message::column_offset(payload, 1);
+/// ```
+pub fn column_offset(in payload: String, take index: Int) -> Int {
+    var at = 2;
+    var i = 0;
+    while i < index {
+        let len = pg::bytes::be_i32(payload, at);
+        if len < 0 {
+            // A NULL column occupies only its length field.
+            at = at + 4;
+        } else {
+            at = at + 4 + len;
+        }
+        i = i + 1;
+    }
+    at
+}
+
+/// Is column `index` SQL NULL?
+///
+/// NULL is signalled by a length of `-1`, which is why `pg::bytes::be_i32`
+/// sign-corrects: read unsigned, this would be 4294967295 and every later
+/// column would be misframed.
+///
+/// # Example
+/// ```tuo
+/// // let null = pg::message::column_is_null(payload, 0);
+/// ```
+pub fn column_is_null(in payload: String, take index: Int) -> Bool {
+    pg::bytes::be_i32(payload, column_offset(payload, index)) < 0
+}
+
+/// The raw bytes of column `index`, or the empty string when it is NULL.
+///
+/// NULL and the empty string are **different values** in SQL; use
+/// `column_is_null` to tell them apart, exactly as every serious client does.
+///
+/// # Example
+/// ```tuo
+/// // let raw = pg::message::column_bytes(payload, 0);
+/// ```
+pub fn column_bytes(in payload: String, take index: Int) -> String {
+    let at = column_offset(payload, index);
+    let len = pg::bytes::be_i32(payload, at);
+    if len < 0 {
+        return std::string::empty();
+    }
+    std::string::slice(payload, at + 4, at + 4 + len)
+}
+
+// ----------------------------------------------------------------------------
+// Specs.
+//
+// Each one builds the exact bytes a server sends, then reads them back — so
+// the decoders are proven against the wire format, not against the encoders'
+// idea of it. The DataRow fixtures below are byte-identical in shape to the
+// `D` message captured from a live PostgreSQL 16 server.
+// ----------------------------------------------------------------------------
+
+/// Fixture: a `DataRow` payload with three columns — "hi", NULL, "42".
+///
+/// The NULL in the middle is deliberate: it proves `column_offset` keeps
+/// framing across a `-1` length, which is where a naive decoder desynchronizes.
+pub fn fixture_row() -> String {
+    var p = std::string::empty();
+    pg::bytes::put_i16(p, 3);
+    pg::bytes::put_i32(p, 2);
+    pg::bytes::put_bytes(p, "hi");
+    pg::bytes::put_i32(p, 0 - 1); // SQL NULL
+    pg::bytes::put_i32(p, 2);
+    pg::bytes::put_bytes(p, "42");
+    p
+}
+
+/// Fixture: a `RowDescription` for two columns, `id` (int4, oid 23) and
+/// `name` (text, oid 25).
+pub fn fixture_desc() -> String {
+    var p = std::string::empty();
+    pg::bytes::put_i16(p, 2);
+
+    pg::bytes::put_cstr(p, "id");
+    pg::bytes::put_i32(p, 0); // table oid
+    pg::bytes::put_i16(p, 0); // attribute number
+    pg::bytes::put_i32(p, 23); // type oid: int4
+    pg::bytes::put_i16(p, 4); // type size
+    pg::bytes::put_i32(p, 0 - 1); // type modifier
+    pg::bytes::put_i16(p, 0); // format: text
+
+    pg::bytes::put_cstr(p, "name");
+    pg::bytes::put_i32(p, 0);
+    pg::bytes::put_i16(p, 0);
+    pg::bytes::put_i32(p, 25); // type oid: text
+    pg::bytes::put_i16(p, 0 - 1);
+    pg::bytes::put_i32(p, 0 - 1);
+    pg::bytes::put_i16(p, 0);
+    p
+}
+
+/// Fixture: an `ErrorResponse` for a real syntax error.
+pub fn fixture_error() -> String {
+    var p = std::string::empty();
+    pg::bytes::put_byte(p, field_severity());
+    pg::bytes::put_cstr(p, "ERROR");
+    pg::bytes::put_byte(p, field_sqlstate());
+    pg::bytes::put_cstr(p, "42601");
+    pg::bytes::put_byte(p, field_message());
+    pg::bytes::put_cstr(p, "syntax error at or near \"SELCT\"");
+    pg::bytes::put_byte(p, field_position());
+    pg::bytes::put_cstr(p, "1");
+    std::string::push_byte(p, 0); // terminator
+    p
+}
+
+/// Spec helper: column `i` of the fixture row, as a `Str` comparison.
+pub fn fixture_col_is(take i: Int, in expect: Str) -> Bool {
+    std::string::as_str(column_bytes(fixture_row(), i)) == expect
+}
+
+/// Spec helper: field `i`'s name in the fixture description.
+pub fn fixture_name_is(take i: Int, in expect: Str) -> Bool {
+    std::string::as_str(field_name(fixture_desc(), i)) == expect
+}
+
+/// Spec helper: an error field of the fixture, compared as a `Str`.
+pub fn fixture_err_is(take code: Int, in expect: Str) -> Bool {
+    std::string::as_str(error_field(fixture_error(), code)) == expect
+}
+
+spec column_count {
+    then column_count(fixture_row()) == 3;
+}
+
+spec column_bytes {
+    then fixture_col_is(0, "hi");
+    // The NULL column reads as empty — and `column_is_null` is how you know
+    // it is NULL rather than ''.
+    then fixture_col_is(1, "");
+    // The column *after* the NULL still frames correctly. This is the
+    // assertion that catches a sign-handling regression in `be_i32`.
+    then fixture_col_is(2, "42");
+}
+
+spec column_is_null {
+    then !column_is_null(fixture_row(), 0);
+    then column_is_null(fixture_row(), 1);
+    then !column_is_null(fixture_row(), 2);
+}
+
+spec field_count {
+    then field_count(fixture_desc()) == 2;
+}
+
+spec field_name {
+    then fixture_name_is(0, "id");
+    then fixture_name_is(1, "name");
+}
+
+spec field_type_oid {
+    then field_type_oid(fixture_desc(), 0) == 23;
+    then field_type_oid(fixture_desc(), 1) == 25;
+}
+
+spec field_format {
+    then field_format(fixture_desc(), 0) == 0;
+    then field_format(fixture_desc(), 1) == 0;
+}
+
+spec error_field {
+    then fixture_err_is(field_severity(), "ERROR");
+    then fixture_err_is(field_sqlstate(), "42601");
+    then fixture_err_is(field_message(), "syntax error at or near \"SELCT\"");
+    then fixture_err_is(field_position(), "1");
+    // An absent field is empty, never a trap and never a wrong field's value.
+    then fixture_err_is(field_hint(), "");
+    then fixture_err_is(field_detail(), "");
+}
+
+spec rows_affected {
+    then rows_affected("SELECT 1") == 1;
+    then rows_affected("SELECT 0") == 0;
+    then rows_affected("UPDATE 2") == 2;
+    then rows_affected("DELETE 7") == 7;
+    // INSERT carries an oid before the count; the count is still the last field.
+    then rows_affected("INSERT 0 3") == 3;
+    then rows_affected("INSERT 0 0") == 0;
+    // Tags with no count.
+    then rows_affected("BEGIN") == 0;
+    then rows_affected("COMMIT") == 0;
+    then rows_affected("CREATE TABLE") == 0;
+    then rows_affected("") == 0;
+    then rows_affected("SELECT 1234") == 1234;
+}
+
+spec tx_status {
+    then fixture_tx_is_idle();
+}
+
+/// Spec helper: a `ReadyForQuery` payload reporting idle.
+pub fn fixture_tx_is_idle() -> Bool {
+    var p = std::string::empty();
+    pg::bytes::put_byte(p, pg::proto::tx_idle());
+    tx_status(p) == pg::proto::tx_idle()
+}
+
+spec auth_kind {
+    then fixture_auth_kind_ok();
+    then fixture_auth_kind_md5();
+}
+
+/// Spec helper: an `AuthenticationOk` payload decodes to kind 0.
+pub fn fixture_auth_kind_ok() -> Bool {
+    var p = std::string::empty();
+    pg::bytes::put_i32(p, pg::proto::auth_ok());
+    auth_kind(p) == pg::proto::auth_ok()
+}
+
+/// Spec helper: an `AuthenticationMD5Password` payload decodes to kind 5 and
+/// yields its four salt bytes.
+pub fn fixture_auth_kind_md5() -> Bool {
+    var p = std::string::empty();
+    pg::bytes::put_i32(p, pg::proto::auth_md5());
+    pg::bytes::put_byte(p, 1);
+    pg::bytes::put_byte(p, 2);
+    pg::bytes::put_byte(p, 3);
+    pg::bytes::put_byte(p, 255);
+    let salt = auth_md5_salt(p);
+    auth_kind(p) == pg::proto::auth_md5() && std::array::len(salt) == 4 && std::array::get(salt, 0) == 1 && std::array::get(salt, 3) == 255
+}
