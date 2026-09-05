@@ -1,4 +1,4 @@
-# tuonelang-postgresql
+# tuonelang-db
 
 A PostgreSQL client for [tuonelang](https://github.com/FistOfTheNorthStar/tuonelang),
 written **in tuonelang** against the v0 runnable core.

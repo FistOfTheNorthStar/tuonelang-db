@@ -1,4 +1,4 @@
-# tuonelang-postgresql — a brief for code-generating models
+# tuonelang-db — a brief for code-generating models
 
 Paste this into context before asking a model to write tuonelang that talks to
 PostgreSQL. It states the **real** API surface, the v0 language constraints

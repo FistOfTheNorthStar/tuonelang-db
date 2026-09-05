@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run-tests.sh — the whole validation suite for tuonelang-postgresql.
+# run-tests.sh — the whole validation suite for tuonelang-db.
 #
 #   ./run-tests.sh            specs + formatting (no server needed)
 #   ./run-tests.sh --live     also run the live oracles against a real server
