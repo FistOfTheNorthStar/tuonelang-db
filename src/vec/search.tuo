@@ -1,0 +1,530 @@
+// vec::search — exact k-nearest-neighbour search over a `vec::store::Store`.
+//
+// The search is **exact**: every live row is scored, and the k best are
+// returned in rank order. There is no approximate index here, and that is a
+// deliberate scoping decision rather than an omission — see the header of
+// `vec::index` for the argument, and for the coarse-quantization path that
+// narrows the candidate set when a corpus outgrows a full scan.
+//
+// TOP-K WITHOUT A SORT.
+//
+// Scoring N rows and sorting them is O(N log N) and allocates a result per row.
+// This module instead keeps a bounded array of the k best seen so far, inserted
+// in order: each candidate costs one comparison against the running worst, and
+// only a candidate that beats it pays the O(k) insertion. For the usual case of
+// k << N that is O(N + k^2) with a single k-sized allocation, and — more
+// importantly for a database — the memory it uses does not grow with the corpus.
+//
+// The k best are held in the same flat-parallel-array shape as everything else
+// in this library: one `Array[Int]` of rows and one `Array[Float]` of scores,
+// index-aligned, ordered best-first.
+
+module vec::search;
+
+// ----------------------------------------------------------------------------
+// The result value.
+// ----------------------------------------------------------------------------
+
+/// The k best rows of a search, ordered best-first.
+///
+/// `rows[i]` is a row index into the `Store` that was searched, and `scores[i]`
+/// is its score under that store's metric — a similarity for cosine and dot
+/// (higher is better), a squared distance for L2 (lower is better).
+pub struct Hits {
+    metric: Int,
+    rows: Array[Int],
+    scores: Array[Float],
+}
+
+/// An empty result under `metric`.
+///
+/// # Example
+/// ```tuo
+/// let h = vec::search::no_hits(vec::metric::metric_cosine());
+/// ```
+pub fn no_hits(take metric: Int) -> Hits {
+    Hits { metric: metric, rows: std::array::empty(), scores: std::array::empty() }
+}
+
+/// How many hits the search returned.
+///
+/// # Example
+/// ```tuo
+/// let n = vec::search::hit_count(vec::search::no_hits(1)); // 0
+/// ```
+pub fn hit_count(in h: Hits) -> Int {
+    std::array::len(h.rows)
+}
+
+/// The store row of hit `i`, or `-1` when `i` is out of range.
+///
+/// # Example
+/// ```tuo
+/// // let row = vec::search::hit_row(hits, 0);
+/// ```
+pub fn hit_row(in h: Hits, take i: Int) -> Int {
+    if i < 0 || i >= std::array::len(h.rows) {
+        0 - 1
+    } else {
+        std::array::get(h.rows, i)
+    }
+}
+
+/// The score of hit `i`, or the metric's worst score when `i` is out of range.
+///
+/// # Example
+/// ```tuo
+/// // let s = vec::search::hit_score(hits, 0);
+/// ```
+pub fn hit_score(in h: Hits, take i: Int) -> Float {
+    if i < 0 || i >= std::array::len(h.scores) {
+        vec::metric::worst_score(h.metric)
+    } else {
+        std::array::get(h.scores, i)
+    }
+}
+
+/// The metric these hits were ranked under.
+///
+/// # Example
+/// ```tuo
+/// // let m = vec::search::hit_metric(hits);
+/// ```
+pub fn hit_metric(in h: Hits) -> Int {
+    h.metric
+}
+
+/// Hit `i`'s score expressed as a **distance**, where lower always means
+/// closer, whatever the metric.
+///
+/// Cosine and dot similarities are negated; an L2 squared distance has its
+/// square root taken, so the number is a true Euclidean distance. This is the
+/// form to show a user or feed to a threshold that should not care which
+/// metric produced it.
+///
+/// # Example
+/// ```tuo
+/// // let d = vec::search::hit_distance(hits, 0);
+/// ```
+pub fn hit_distance(in h: Hits, take i: Int) -> Float {
+    let s = hit_score(h, i);
+    if h.metric == vec::metric::metric_l2() {
+        db::math::sqrt(s)
+    } else {
+        0.0 - s
+    }
+}
+
+// ----------------------------------------------------------------------------
+// The bounded top-k insertion.
+// ----------------------------------------------------------------------------
+
+/// Offer `(row, score)` to a bounded best-first list, keeping at most `k`.
+///
+/// Returns nothing; `rows` and `scores` are updated in place and stay
+/// index-aligned and ordered best-first. This is the inner loop's only
+/// mutation, and it is the one place ranking order is established.
+///
+/// # Example
+/// ```tuo
+/// // vec::search::offer(rows, scores, 3, 0.9, 5, vec::metric::metric_cosine());
+/// ```
+pub fn offer(mut rows: Array[Int], mut scores: Array[Float], take row: Int, take score: Float, take k: Int, take metric: Int) {
+    let n = std::array::len(scores);
+    // `k <= 0` first: with an empty list, `n >= k` would be true and the
+    // `full` branch below would read `scores[-1]` and trap. The guard has to
+    // come before the comparison, not after it.
+    //
+    // A NaN score is refused outright. NaN compares false to everything, so
+    // once admitted it can never be displaced — it becomes an absorbing
+    // barrier that permanently outranks every real row, and at `k = 1` it
+    // evicts the genuine best answer entirely. Refusing it keeps the list
+    // totally ordered, which is what the rest of this module assumes.
+    let wanted = k > 0 && !db::math::is_nan(score);
+    // A candidate that cannot beat the running worst is rejected in one
+    // comparison, which is the common case once the list is full.
+    let full = wanted && n >= k;
+    let admissible = if full {
+        vec::metric::is_better(score, std::array::get(scores, n - 1), metric)
+    } else {
+        true
+    };
+    if admissible && wanted {
+        // Find the insertion point: the first slot this score beats.
+        var at = 0;
+        var scanning = true;
+        while scanning && at < n {
+            if vec::metric::is_better(score, std::array::get(scores, at), metric) {
+                scanning = false;
+            } else {
+                at = at + 1;
+            }
+        }
+        // Grow by one (unless already at k), then shift the tail right.
+        if !full {
+            std::array::push(rows, 0);
+            std::array::push(scores, 0.0);
+        }
+        let last = std::array::len(scores) - 1;
+        var i = last;
+        while i > at {
+            std::array::set(rows, i, std::array::get(rows, i - 1));
+            std::array::set(scores, i, std::array::get(scores, i - 1));
+            i = i - 1;
+        }
+        std::array::set(rows, at, row);
+        std::array::set(scores, at, score);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Search.
+// ----------------------------------------------------------------------------
+
+/// The `k` rows of `s` closest to `query`, ranked under the store's metric.
+///
+/// `query` must be `dim` long; a wrong length yields no hits rather than a
+/// partial scan. When the store's metric is cosine the query is normalized
+/// first, which is what makes the per-row kernel a bare dot product.
+///
+/// # Example
+/// ```tuo
+/// // let hits = vec::search::search(store, q, 5);
+/// ```
+pub fn search(in s: vec::store::Store, take query: Array[Float], take k: Int) -> Hits {
+    let dim = vec::store::dim(s);
+    let metric = vec::store::metric(s);
+    var q = query;
+    var rows = std::array::empty();
+    var scores = std::array::empty();
+    if std::array::len(q) == dim && k > 0 {
+        if metric == vec::metric::metric_cosine() {
+            vec::metric::normalize_at(q, 0, dim);
+        }
+        var row = 0;
+        let n = vec::store::count(s);
+        while row < n {
+            if vec::store::is_live(s, row) {
+                let score = score_row(s, q, row, dim, metric);
+                offer(rows, scores, row, score, k, metric);
+            }
+            row = row + 1;
+        }
+    }
+    Hits { metric: metric, rows: rows, scores: scores }
+}
+
+/// Score one row of `s` against an already-prepared query.
+///
+/// Split out of `search` so the scan body is one call, and so a spec can pin
+/// the scoring of a single row independently of the ranking around it.
+///
+/// # Example
+/// ```tuo
+/// // let s = vec::search::score_row(store, q, 0, 3, 1);
+/// ```
+pub fn score_row(in s: vec::store::Store, in q: Array[Float], take row: Int, take dim: Int, take metric: Int) -> Float {
+    // Delegated to the store so the flat block is never copied out of it; see
+    // `vec::store::score_row_at`. `dim` is redundant with the store's own and
+    // is kept in the signature so a caller that already has it in hand reads
+    // naturally.
+    vec::store::score_row_at(s, row, q, metric)
+}
+
+/// Search, then keep only the hits at least as good as `threshold`.
+///
+/// The threshold is read in the metric's own orientation, so it is a *minimum*
+/// similarity for cosine and dot and a *maximum* squared distance for L2.
+///
+/// # Example
+/// ```tuo
+/// // let hits = vec::search::search_threshold(store, q, 10, 0.8);
+/// ```
+pub fn search_threshold(in s: vec::store::Store, take query: Array[Float], take k: Int, take threshold: Float) -> Hits {
+    let metric = vec::store::metric(s);
+    let h = search(s, query, k);
+    var rows = std::array::empty();
+    var scores = std::array::empty();
+    var i = 0;
+    let n = hit_count(h);
+    while i < n {
+        let score = hit_score(h, i);
+        // `is_better` is strict, so admit equality explicitly: a hit exactly at
+        // the threshold passes it.
+        if vec::metric::is_better(score, threshold, metric) || score == threshold {
+            std::array::push(rows, hit_row(h, i));
+            std::array::push(scores, score);
+        }
+        i = i + 1;
+    }
+    Hits { metric: metric, rows: rows, scores: scores }
+}
+
+// ----------------------------------------------------------------------------
+// Spec helpers.
+// ----------------------------------------------------------------------------
+
+/// Spec helper: a 2-D vector.
+pub fn q2(take a: Float, take b: Float) -> Array[Float] {
+    var xs = std::array::empty();
+    std::array::push(xs, a);
+    std::array::push(xs, b);
+    xs
+}
+
+/// Spec helper: four unit-ish 2-D rows in a cosine store, at 0, 90, 45 and 180
+/// degrees, so ranking by angle is obvious by inspection.
+pub fn fixture() -> vec::store::Store {
+    var s = vec::store::empty(2, vec::metric::metric_cosine());
+    let _ = vec::store::add(s, q2(1.0, 0.0), "east", "");
+    let _ = vec::store::add(s, q2(0.0, 1.0), "north", "");
+    let _ = vec::store::add(s, q2(1.0, 1.0), "northeast", "");
+    let _ = vec::store::add(s, q2(0.0 - 1.0, 0.0), "west", "");
+    s
+}
+
+/// Spec helper: the same four rows under L2, where magnitude matters.
+pub fn fixture_l2() -> vec::store::Store {
+    var s = vec::store::empty(2, vec::metric::metric_l2());
+    let _ = vec::store::add(s, q2(0.0, 0.0), "origin", "");
+    let _ = vec::store::add(s, q2(1.0, 0.0), "near", "");
+    let _ = vec::store::add(s, q2(10.0, 0.0), "far", "");
+    s
+}
+
+/// Spec helper: the id of hit `i` when searching the cosine fixture due east.
+pub fn east_hit_id(take k: Int, take i: Int, in expect: Str) -> Bool {
+    let s = fixture();
+    let h = search(s, q2(1.0, 0.0), k);
+    let id = vec::store::id_at(s, hit_row(h, i));
+    std::string::as_str(id) == expect
+}
+
+/// Spec helper: the number of hits searching the cosine fixture due east.
+pub fn east_hit_count(take k: Int) -> Int {
+    hit_count(search(fixture(), q2(1.0, 0.0), k))
+}
+
+/// Spec helper: the score of hit `i` searching due east.
+pub fn east_hit_score(take k: Int, take i: Int) -> Float {
+    hit_score(search(fixture(), q2(1.0, 0.0), k), i)
+}
+
+/// Spec helper: are the scores of a due-east search non-increasing?
+///
+/// This is the ranking invariant itself rather than a hard-coded order, so it
+/// holds whatever the fixture contains.
+pub fn east_is_ranked(take k: Int) -> Bool {
+    let h = search(fixture(), q2(1.0, 0.0), k);
+    var ok = true;
+    var i = 1;
+    let n = hit_count(h);
+    while i < n {
+        if vec::metric::is_better(hit_score(h, i), hit_score(h, i - 1), hit_metric(h)) {
+            ok = false;
+        }
+        i = i + 1;
+    }
+    ok
+}
+
+/// Spec helper: the id of hit `i` of an L2 search from the origin.
+pub fn l2_hit_id(take i: Int, in expect: Str) -> Bool {
+    let s = fixture_l2();
+    let h = search(s, q2(0.0, 0.0), 3);
+    let id = vec::store::id_at(s, hit_row(h, i));
+    std::string::as_str(id) == expect
+}
+
+/// Spec helper: are an L2 search's scores non-decreasing (closest first)?
+pub fn l2_is_ranked() -> Bool {
+    let h = search(fixture_l2(), q2(0.0, 0.0), 3);
+    var ok = true;
+    var i = 1;
+    let n = hit_count(h);
+    while i < n {
+        if hit_score(h, i) < hit_score(h, i - 1) {
+            ok = false;
+        }
+        i = i + 1;
+    }
+    ok
+}
+
+/// Spec helper: hits from a search whose query is the wrong length.
+pub fn wrong_length_hits() -> Int {
+    var q = std::array::empty();
+    std::array::push(q, 1.0);
+    hit_count(search(fixture(), q, 3))
+}
+
+/// Spec helper: hit count after removing the row a query would rank first.
+pub fn hits_skip_removed() -> Bool {
+    var s = fixture();
+    let _ = vec::store::remove_id(s, "east");
+    let h = search(s, q2(1.0, 0.0), 4);
+    // Three rows survive, and the removed one must not appear.
+    var absent = true;
+    var i = 0;
+    while i < hit_count(h) {
+        let id = vec::store::id_at(s, hit_row(h, i));
+        if std::string::as_str(id) == "east" {
+            absent = false;
+        }
+        i = i + 1;
+    }
+    absent && hit_count(h) == 3
+}
+
+/// Spec helper: the number of hits above a cosine threshold.
+pub fn threshold_count(take threshold: Float) -> Int {
+    hit_count(search_threshold(fixture(), q2(1.0, 0.0), 4, threshold))
+}
+
+/// Spec helper: the distance of the best due-east hit.
+pub fn east_best_distance() -> Float {
+    hit_distance(search(fixture(), q2(1.0, 0.0), 1), 0)
+}
+
+spec no_hits {
+    then hit_count(no_hits(vec::metric::metric_cosine())) == 0;
+    then hit_row(no_hits(vec::metric::metric_cosine()), 0) == 0 - 1;
+}
+
+spec search {
+    // Due east: "east" is exact, "northeast" is 45 degrees off, "north" is
+    // orthogonal, "west" is opposite. That is the order.
+    then east_hit_id(4, 0, "east");
+    then east_hit_id(4, 1, "northeast");
+    then east_hit_id(4, 2, "north");
+    then east_hit_id(4, 3, "west");
+    // An exact direction match scores 1.0 under cosine.
+    then db::math::near(east_hit_score(4, 0), 1.0);
+    // 45 degrees is cos(45) = 0.7071...
+    then db::math::near(east_hit_score(4, 1), 0.7071067811865475);
+    then db::math::near(east_hit_score(4, 2), 0.0);
+    then db::math::near(east_hit_score(4, 3), 0.0 - 1.0);
+}
+
+spec "k bounds the number of hits" {
+    then east_hit_count(1) == 1;
+    then east_hit_count(2) == 2;
+    then east_hit_count(4) == 4;
+    // k beyond the corpus yields the whole corpus, not padding.
+    then east_hit_count(99) == 4;
+    then east_hit_count(0) == 0;
+    // Truncating to k keeps the *best* k, not the first k encountered.
+    then east_hit_id(1, 0, "east");
+    then east_hit_id(2, 1, "northeast");
+}
+
+spec "hits come back in rank order" {
+    then east_is_ranked(4);
+    then east_is_ranked(2);
+    then l2_is_ranked();
+}
+
+spec "l2 ranks by distance, closest first" {
+    then l2_hit_id(0, "origin");
+    then l2_hit_id(1, "near");
+    then l2_hit_id(2, "far");
+}
+
+spec "a malformed query returns no hits" {
+    then wrong_length_hits() == 0;
+}
+
+spec "search skips removed rows" {
+    then hits_skip_removed();
+}
+
+spec search_threshold {
+    // Above 0.9 only the exact match survives; above 0.5 the 45-degree one too.
+    then threshold_count(0.9) == 1;
+    then threshold_count(0.5) == 2;
+    then threshold_count(0.0 - 2.0) == 4;
+    // A hit exactly at the threshold is admitted.
+    then threshold_count(1.0) == 1;
+}
+
+spec hit_distance {
+    // A perfect cosine match is distance 0 once negated... but cosine 1.0
+    // negates to -1.0, which is the correct "lower is closer" ordering.
+    then db::math::near(east_best_distance(), 0.0 - 1.0);
+}
+
+/// Spec helper: `offer` with a non-positive `k` adds nothing and does not trap.
+///
+/// With an empty list, `n >= k` holds for `k <= 0`, so the "is it better than
+/// the running worst" branch would read `scores[-1]`.
+pub fn offer_with_k(take k: Int) -> Int {
+    var rows = std::array::empty();
+    var scores = std::array::empty();
+    offer(rows, scores, 0, 0.9, k, vec::metric::metric_cosine());
+    std::array::len(rows)
+}
+
+/// Spec helper: `offer` keeps exactly `k` when offered more than `k`.
+pub fn offer_keeps_k(take k: Int) -> Int {
+    var rows = std::array::empty();
+    var scores = std::array::empty();
+    var i = 0;
+    while i < 10 {
+        offer(rows, scores, i, (i as Float) / 10.0, k, vec::metric::metric_cosine());
+        i = i + 1;
+    }
+    std::array::len(rows)
+}
+
+/// Spec helper: the best row after offering ten ascending scores.
+pub fn offer_best_row() -> Int {
+    var rows = std::array::empty();
+    var scores = std::array::empty();
+    var i = 0;
+    while i < 10 {
+        offer(rows, scores, i, (i as Float) / 10.0, 3, vec::metric::metric_cosine());
+        i = i + 1;
+    }
+    std::array::get(rows, 0)
+}
+
+spec offer {
+    // A non-positive k is a no-op, not an out-of-bounds read.
+    then offer_with_k(0) == 0;
+    then offer_with_k(0 - 1) == 0;
+    // k bounds the list however many candidates are offered.
+    then offer_keeps_k(1) == 1;
+    then offer_keeps_k(3) == 3;
+    then offer_keeps_k(99) == 10;
+    // The highest cosine score wins, so row 9 (score 0.9) ranks first.
+    then offer_best_row() == 9;
+}
+
+/// Spec helper: offering a NaN score must leave the list untouched.
+pub fn offer_nan_len() -> Int {
+    var rows = std::array::empty();
+    var scores = std::array::empty();
+    offer(rows, scores, 0, 0.0 / 0.0, 3, vec::metric::metric_cosine());
+    std::array::len(rows)
+}
+
+/// Spec helper: a NaN offered first must not block a real score afterwards.
+pub fn offer_nan_then_real() -> Int {
+    var rows = std::array::empty();
+    var scores = std::array::empty();
+    offer(rows, scores, 0, 0.0 / 0.0, 1, vec::metric::metric_cosine());
+    offer(rows, scores, 1, 0.99, 1, vec::metric::metric_cosine());
+    if std::array::len(rows) == 0 {
+        0 - 1
+    } else {
+        std::array::get(rows, 0)
+    }
+}
+
+spec "offer refuses a NaN score" {
+    // NaN compares false to everything, so an admitted NaN can never be
+    // displaced: it becomes an absorbing barrier that outranks every real row,
+    // and at k=1 it evicts the genuine best answer entirely.
+    then offer_nan_len() == 0;
+    then offer_nan_then_real() == 1;
+}

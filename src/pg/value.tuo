@@ -9,8 +9,10 @@
 //     decoder serves both protocols rather than two;
 //   * binary layouts are per-type, version-sensitive, and undocumented for
 //     several types, whereas the text rendering is stable and specified; and
-//   * decoding text needs no bitwise operations, which v0 lacks until
-//     ADR-0019 Stage A lands.
+//   * decoding text needs no bitwise operations at all. (This was once the
+//     decisive reason: v0 had no bitwise operators. ADR-0019 Stage A has
+//     since landed them, so it is now a convenience rather than a constraint
+//     — the two reasons above are what keep the choice correct.)
 //
 // Everything here is pure, so every decoder below is spec-checked against the
 // exact renderings a real server produces.

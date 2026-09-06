@@ -26,64 +26,64 @@ fn main() -> Int {
     if !pg::conn::is_ok_int(opened) {
         return 70;
     }
-    let db = pg::conn::unwrap_ok_int(opened);
+    let dbh = pg::conn::unwrap_ok_int(opened);
 
-    let _ = pg::query::execute(db, "CREATE TEMP TABLE u (id int PRIMARY KEY, name text)", 30000);
+    let _ = pg::query::execute(dbh, "CREATE TEMP TABLE u (id int PRIMARY KEY, name text)", 30000);
 
     // GUIDE §5 — transaction
-    let _ = pg::query::execute(db, "BEGIN", 30000);
+    let _ = pg::query::execute(dbh, "BEGIN", 30000);
     var params = std::array::empty();
     std::array::push(params, std::string::from_str("ada"));
-    let r = pg::query::run_params(db, "INSERT INTO u (id, name) VALUES (1, $1)", params, 30000);
+    let r = pg::query::run_params(dbh, "INSERT INTO u (id, name) VALUES (1, $1)", params, 30000);
     if !pg::query::is_ok_result(r) {
-        let _ = pg::query::execute(db, "ROLLBACK", 30000);
-        let _ = pg::conn::shutdown(db);
+        let _ = pg::query::execute(dbh, "ROLLBACK", 30000);
+        let _ = pg::conn::shutdown(dbh);
         return 71;
     }
     let _ = pg::query::unwrap_ok_result(r);
-    let _ = pg::query::execute(db, "COMMIT", 30000);
+    let _ = pg::query::execute(dbh, "COMMIT", 30000);
 
     // GUIDE §4 — a real unique violation, matched by SQLSTATE 23505
-    let bad = pg::query::run(db, "INSERT INTO u (id, name) VALUES (1, 'dup')", 30000);
+    let bad = pg::query::run(dbh, "INSERT INTO u (id, name) VALUES (1, 'dup')", 30000);
     var dup_detected = false;
     if !pg::query::is_ok_result(bad) {
         let e = pg::query::unwrap_err_result(bad);
-        if pg::error::kind(e) == pg::error::kind_server() && pg::error::is_sqlstate(e, pg::error::sqlstate_unique_violation()) {
+        if db::error::kind(e) == db::error::kind_server() && db::error::is_sqlstate(e, db::error::sqlstate_unique_violation()) {
             dup_detected = true;
         }
     } else {
         let _ = pg::query::unwrap_ok_result(bad);
     }
     if !dup_detected {
-        let _ = pg::conn::shutdown(db);
+        let _ = pg::conn::shutdown(dbh);
         return 72;
     }
 
     // GUIDE §6 — OID classification (connection still usable after the error)
-    let sel = pg::query::run(db, "SELECT id, name FROM u", 30000);
+    let sel = pg::query::run(dbh, "SELECT id, name FROM u", 30000);
     if !pg::query::is_ok_result(sel) {
-        let _ = pg::conn::shutdown(db);
+        let _ = pg::conn::shutdown(dbh);
         return 73;
     }
     let rows = pg::query::unwrap_ok_result(sel);
     if !pg::value::is_integer(pg::query::column_oid(rows, 0)) {
-        let _ = pg::conn::shutdown(db);
+        let _ = pg::conn::shutdown(dbh);
         return 74;
     }
     if !pg::value::is_text(pg::query::column_oid(rows, 1)) {
-        let _ = pg::conn::shutdown(db);
+        let _ = pg::conn::shutdown(dbh);
         return 75;
     }
 
     // GUIDE §2 — scalar_int
-    let total = pg::query::scalar_int(db, "SELECT count(*) FROM u", 0, 30000);
+    let total = pg::query::scalar_int(dbh, "SELECT count(*) FROM u", 0, 30000);
     if !pg::conn::is_ok_int(total) {
-        let _ = pg::conn::shutdown(db);
+        let _ = pg::conn::shutdown(dbh);
         return 76;
     }
     let n = pg::conn::unwrap_ok_int(total);
 
-    let _ = pg::conn::shutdown(db);
+    let _ = pg::conn::shutdown(dbh);
     if n == 1 {
         0
     } else {

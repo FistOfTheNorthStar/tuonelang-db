@@ -1,0 +1,378 @@
+// db::math — the floating-point primitives tuonelang v0 does not ship.
+//
+// This is part of the backend-neutral `core` feature. Nothing here is specific
+// to vectors, let alone to a backend: it is the arithmetic any numeric code in
+// this repository would otherwise have to re-derive.
+//
+// WHY THIS MODULE EXISTS AT ALL.
+//
+// There is no `std::math` reachable from a user package — `std::math::sqrt`
+// resolves to `R0002: no 'math' in 'std'`. The builtin surface is exactly
+// `std::str`, `std::string`, `std::array`, `std::map`, `std::rt`. So a
+// Euclidean norm, which is one `sqrt` away from a dot product, is not
+// expressible until someone writes the `sqrt`.
+//
+// Rather than avoid the square root (cosine similarity *can* be reordered to
+// compare squared magnitudes, at the cost of a metric nobody recognizes), this
+// module computes it honestly and proves it against known roots. The method is
+// Newton-Raphson on f(g) = g^2 - x, which doubles its correct digits every
+// iteration and reaches the precision of an IEEE double in well under the
+// iteration budget below.
+//
+// Float arithmetic in v0 is IEEE-754 and **never traps** (§5 of the language
+// reference): `0.0 / 0.0` is NaN rather than an abort. That is what makes the
+// guard on `x <= 0.0` a policy choice rather than a safety requirement — but
+// it is still a policy worth having, because a NaN that escapes into an index
+// silently poisons every comparison it later takes part in.
+
+module db::math;
+
+// ----------------------------------------------------------------------------
+// Tuning.
+// ----------------------------------------------------------------------------
+
+/// Newton-Raphson iterations used by `sqrt`.
+///
+/// Convergence is quadratic, so 24 rounds is far past the point where a double
+/// stops changing for every input this library sees; it is a fixed count rather
+/// than a residual test so that the cost of a `sqrt` is constant and a spec can
+/// pin the result exactly.
+pub fn sqrt_iterations() -> Int {
+    24
+}
+
+/// The tolerance `near` uses when comparing two floats.
+pub fn epsilon() -> Float {
+    0.000001
+}
+
+// ----------------------------------------------------------------------------
+// Primitives.
+// ----------------------------------------------------------------------------
+
+/// The absolute value of `x`.
+///
+/// # Example
+/// ```tuo
+/// let a = db::math::abs_f(0.0 - 2.5); // 2.5
+/// ```
+pub fn abs_f(take x: Float) -> Float {
+    if x < 0.0 {
+        0.0 - x
+    } else {
+        x
+    }
+}
+
+/// The smaller of two floats.
+///
+/// # Example
+/// ```tuo
+/// let a = db::math::min_f(1.0, 2.0); // 1.0
+/// ```
+pub fn min_f(take a: Float, take b: Float) -> Float {
+    if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+/// The larger of two floats.
+///
+/// # Example
+/// ```tuo
+/// let a = db::math::max_f(1.0, 2.0); // 2.0
+/// ```
+pub fn max_f(take a: Float, take b: Float) -> Float {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+/// Is `x` a NaN?
+///
+/// IEEE-754 defines NaN as the only value that is not equal to itself, and v0
+/// compares floats by that same standard — so this needs no bit inspection.
+///
+/// # Example
+/// ```tuo
+/// let bad = db::math::is_nan(0.0 / 0.0); // true
+/// ```
+pub fn is_nan(take x: Float) -> Bool {
+    x != x
+}
+
+/// Is `x` an infinity?
+///
+/// IEEE-754 arithmetic never traps, so an overflow produces an infinity that
+/// then propagates silently. This is how code detects one without a bit test:
+/// an infinity is unchanged by halving, and no finite value is.
+///
+/// # Example
+/// ```tuo
+/// let big = db::math::is_infinite(1.0 / 0.0); // true
+/// ```
+pub fn is_infinite(take x: Float) -> Bool {
+    !is_nan(x) && x == x * 0.5 && x != 0.0
+}
+
+/// Is `x` a finite number — neither NaN nor an infinity?
+///
+/// # Example
+/// ```tuo
+/// let ok = db::math::is_finite(1.0); // true
+/// ```
+pub fn is_finite(take x: Float) -> Bool {
+    !is_nan(x) && !is_infinite(x)
+}
+
+/// Are two floats within `epsilon` of each other?
+///
+/// # Example
+/// ```tuo
+/// let same = db::math::near(1.0, 1.0000001); // true
+/// ```
+pub fn near(take a: Float, take b: Float) -> Bool {
+    abs_f(a - b) < epsilon()
+}
+
+/// Are two floats within an explicit `tolerance` of each other?
+///
+/// # Example
+/// ```tuo
+/// let same = db::math::near_by(1.0, 1.01, 0.1); // true
+/// ```
+pub fn near_by(take a: Float, take b: Float, take tolerance: Float) -> Bool {
+    abs_f(a - b) < tolerance
+}
+
+/// The non-negative square root of `x`, by Newton-Raphson.
+///
+/// Returns `0.0` for every `x <= 0.0` and for NaN, so the result is always a
+/// usable magnitude rather than a value that poisons later comparisons.
+///
+/// # Example
+/// ```tuo
+/// let r = db::math::sqrt(9.0); // 3.0
+/// ```
+pub fn sqrt(take x: Float) -> Float {
+    if is_nan(x) {
+        0.0
+    } else if x <= 0.0 {
+        0.0
+    } else if is_infinite(x) {
+        // sqrt(inf) is inf. It must be answered *before* any scaling loop,
+        // because `inf / 4.0` is still `inf` — a scaling step never brings it
+        // down, and recursing on it exhausts the call stack and aborts the
+        // process. A finite vector reaches this: `norm_squared_at` squares its
+        // components, and [1e200, 1e200] overflows to inf before `sqrt` is
+        // ever called.
+        x
+    } else {
+        // Seed *near* the root rather than at `x`. Newton halves the distance
+        // to the root in a ratio sense each step, so a seed of `x` needs
+        // roughly log2(exponent of x) steps just to reach the right order of
+        // magnitude — at 1e16 that exhausted the whole iteration budget and
+        // returned a number 6x too large, and at 1e20 it never converged.
+        //
+        // `newton_seed` lands within a factor of two of the root, from which
+        // the quadratic convergence below reaches full double precision in a
+        // handful of steps.
+        var guess = newton_seed(x);
+        var i = 0;
+        while i < sqrt_iterations() {
+            guess = 0.5 * (guess + x / guess);
+            i = i + 1;
+        }
+        guess
+    }
+}
+
+/// The upper bound of the directly-iterated range; above it `sqrt` halves the
+/// exponent by recursion.
+pub fn huge() -> Float {
+    1000000.0
+}
+
+/// The lower bound of the directly-iterated range.
+pub fn tiny() -> Float {
+    0.000001
+}
+
+/// A starting guess within a small factor of `sqrt(x)`, for `x` in
+/// `[tiny(), huge()]`.
+///
+/// Found by bisecting the exponent: repeatedly quartering `x` while doubling
+/// the guess walks the seed to the right order of magnitude in a few steps,
+/// which is what Newton needs to converge in its fixed budget.
+///
+/// # Example
+/// ```tuo
+/// // let g = db::math::newton_seed(1000000.0);
+/// ```
+pub fn newton_seed(take x: Float) -> Float {
+    var scaled = x;
+    var factor = 1.0;
+    // Bring `scaled` down into [1, 4), doubling the factor for each quartering.
+    // The loops are iterative rather than recursive so that no input — however
+    // extreme — can exhaust the call stack, and each is bounded because a
+    // finite double's exponent is finite.
+    while scaled >= 4.0 {
+        scaled = scaled / 4.0;
+        factor = factor * 2.0;
+    }
+    // And up into [1, 4) from below, halving the factor for each quadrupling.
+    // `scaled > 0.0` keeps a value that underflows to zero from spinning here.
+    while scaled < 1.0 && scaled > 0.0 {
+        scaled = scaled * 4.0;
+        factor = factor * 0.5;
+    }
+    // sqrt of anything in [1, 4) is in [1, 2); 1.5 is within 25% either way.
+    1.5 * factor
+}
+
+// ----------------------------------------------------------------------------
+// Spec helpers.
+//
+// A spec cannot bind a local, so each property that needs one gets a named
+// helper here.
+// ----------------------------------------------------------------------------
+
+/// Spec helper: is `sqrt(x)` within `epsilon` of `expect`?
+pub fn sqrt_is(take x: Float, take expect: Float) -> Bool {
+    near(sqrt(x), expect)
+}
+
+/// Spec helper: does `sqrt(x)` square back to `x`?
+///
+/// This is the property that does not depend on a table of known roots — it
+/// checks the *definition* rather than an arithmetic coincidence.
+pub fn sqrt_squares_back(take x: Float) -> Bool {
+    // Purely relative. An `+ epsilon()` floor here would make the assertion
+    // vacuous for small `x` — a 1e-6 absolute slack passes trivially at
+    // x = 1e-14 no matter how wrong the root is, which is exactly how a badly
+    // broken `sqrt` once satisfied this spec.
+    sqrt_relative_ok(x)
+}
+
+spec "sqrt: known roots" {
+    then sqrt_is(0.0, 0.0);
+    then sqrt_is(1.0, 1.0);
+    then sqrt_is(4.0, 2.0);
+    then sqrt_is(9.0, 3.0);
+    then sqrt_is(16.0, 4.0);
+    then sqrt_is(2.0, 1.4142135623730951);
+    then sqrt_is(0.25, 0.5);
+}
+
+/// Spec helper: does `sqrt(x)` square back to `x` to within a *relative*
+/// tolerance?
+///
+/// The absolute-tolerance helper above cannot say anything useful at 1e300, so
+/// this is the one that pins the wide range — and it is the property that
+/// caught a seed which returned a 6x-too-large root at 1e16 and diverged
+/// entirely at 1e20.
+pub fn sqrt_relative_ok(take x: Float) -> Bool {
+    let r = sqrt(x);
+    if r <= 0.0 {
+        false
+    } else {
+        abs_f(r * r - x) <= abs_f(x) * 0.000000001
+    }
+}
+
+spec "sqrt: correct across the whole double range" {
+    then sqrt_relative_ok(1.0e-300);
+    then sqrt_relative_ok(1.0e-100);
+    then sqrt_relative_ok(1.0e-20);
+    then sqrt_relative_ok(0.000001);
+    then sqrt_relative_ok(0.5);
+    then sqrt_relative_ok(2.0);
+    then sqrt_relative_ok(999999.0);
+    then sqrt_relative_ok(1000001.0);
+    then sqrt_relative_ok(1.0e8);
+    then sqrt_relative_ok(1.0e16);
+    then sqrt_relative_ok(1.0e20);
+    then sqrt_relative_ok(1.0e50);
+    then sqrt_relative_ok(1.0e100);
+    then sqrt_relative_ok(1.0e300);
+    then sqrt_relative_ok(12345.6789);
+    // The values that used to be wrong, pinned exactly.
+    then near(sqrt(1.0e16), 100000000.0);
+    then near_by(sqrt(1.0e20), 10000000000.0, 1.0);
+}
+
+spec "sqrt: squares back to its input" {
+    // The defining property, now checked *relatively* so it says something at
+    // every magnitude rather than passing trivially for small inputs.
+    then sqrt_squares_back(2.0);
+    then sqrt_squares_back(3.0);
+    then sqrt_squares_back(0.5);
+    then sqrt_squares_back(1000000.0);
+    then sqrt_squares_back(0.000001);
+    then sqrt_squares_back(12345.678);
+    // The magnitudes an absolute tolerance used to wave through.
+    then sqrt_squares_back(0.00000000000001);
+    then sqrt_squares_back(0.000000000000001);
+    then sqrt_squares_back(1.0e-30);
+}
+
+spec "sqrt: degenerate inputs are clamped" {
+    // A negative input is clamped rather than returned as NaN, so a magnitude
+    // is always a magnitude.
+    then sqrt_is(0.0 - 1.0, 0.0);
+    then sqrt_is(0.0 - 1000.0, 0.0);
+    then !is_nan(sqrt(0.0 - 1.0));
+}
+
+spec "abs, min and max" {
+    then abs_f(2.5) == 2.5;
+    then abs_f(0.0 - 2.5) == 2.5;
+    then abs_f(0.0) == 0.0;
+    then min_f(1.0, 2.0) == 1.0;
+    then min_f(2.0, 1.0) == 1.0;
+    then max_f(1.0, 2.0) == 2.0;
+    then max_f(2.0, 1.0) == 2.0;
+}
+
+spec near {
+    then near(1.0, 1.0);
+    then near(1.0, 1.0000001);
+    then !near(1.0, 1.1);
+    then near_by(1.0, 1.01, 0.1);
+    then !near_by(1.0, 1.01, 0.001);
+}
+
+spec is_nan {
+    then !is_nan(0.0);
+    then !is_nan(1.0);
+    then is_nan(0.0 / 0.0);
+}
+
+/// Spec helper: `sqrt` of an infinity, which must terminate.
+pub fn sqrt_of_infinity() -> Float {
+    sqrt(1.0 / 0.0)
+}
+
+spec is_infinite {
+    then is_infinite(1.0 / 0.0);
+    then is_infinite(0.0 - 1.0 / 0.0);
+    then !is_infinite(0.0);
+    then !is_infinite(1.0e300);
+    then !is_infinite(0.0 / 0.0);
+    then is_finite(1.0);
+    then is_finite(0.0);
+    then !is_finite(1.0 / 0.0);
+    then !is_finite(0.0 / 0.0);
+}
+
+spec "sqrt: an infinity terminates instead of recursing" {
+    // `inf / 4.0` is still `inf`, so a scaling branch that recursed on it
+    // never terminated and exhausted the call stack — reachable from a finite
+    // vector, because squaring 1e200 components overflows before sqrt is
+    // called at all.
+    then is_infinite(sqrt_of_infinity());
+}

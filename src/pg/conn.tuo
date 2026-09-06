@@ -4,7 +4,7 @@
 // so — by the same rule `tuo-stdlib` follows — none of it can appear in a spec
 // (`R0007`); it is pinned instead by the live integration program in
 // `examples/live_check.tuo`, which runs against a real server. The pure tiers
-// (`pg::bytes`, `pg::proto`, `pg::message`, `pg::value`, `pg::auth`) carry the
+// (`db::bytes`, `pg::proto`, `pg::message`, `pg::value`, `pg::auth`) carry the
 // specs, and they carry the logic worth proving.
 //
 // A CONNECTION IS AN INT.
@@ -88,20 +88,20 @@ pub fn is_open(take outcome: Int) -> Bool {
 /// ```tuo
 /// // let c = pg::conn::open("127.0.0.1", 5432, 5000);
 /// ```
-pub fn open(in host: Str, take port: Int, take timeout_ms: Int) -> Result[Int, pg::error::PgError] {
+pub fn open(in host: Str, take port: Int, take timeout_ms: Int) -> Result[Int, db::error::PgError] {
     let fd = std::rt::connect_timeout(host, port, timeout_ms);
     if fd == timeout_sentinel() {
         var m = std::string::empty();
         std::string::append(m, "timed out connecting to ");
         std::string::append(m, host);
-        return Err { error: pg::error::new(pg::error::kind_timeout(), std::string::as_str(m)) };
+        return Err { error: db::error::new(db::error::kind_timeout(), std::string::as_str(m)) };
     }
     if fd < 0 {
         var m = std::string::empty();
         std::string::append(m, "could not connect to ");
         std::string::append(m, host);
         std::string::append(m, " (is the server running and reachable?)");
-        return Err { error: pg::error::new(pg::error::kind_connection(), std::string::as_str(m)) };
+        return Err { error: db::error::new(db::error::kind_connection(), std::string::as_str(m)) };
     }
     Ok { value: fd }
 }
@@ -151,10 +151,10 @@ pub fn write_message(take fd: Int, in msg: String) -> Int {
 /// ```tuo
 /// // let r = pg::conn::send(fd, pg::proto::sync());
 /// ```
-pub fn send(take fd: Int, in msg: String) -> Result[Int, pg::error::PgError] {
+pub fn send(take fd: Int, in msg: String) -> Result[Int, db::error::PgError] {
     let n = write_message(fd, msg);
     if n < 0 {
-        return Err { error: pg::error::new(pg::error::kind_connection(), "the connection failed while sending (the server may have closed it)") };
+        return Err { error: db::error::new(db::error::kind_connection(), "the connection failed while sending (the server may have closed it)") };
     }
     Ok { value: n }
 }
@@ -177,19 +177,19 @@ pub fn send(take fd: Int, in msg: String) -> Result[Int, pg::error::PgError] {
 /// ```tuo
 /// // let r = pg::conn::read_exact(fd, 5, 30000);
 /// ```
-pub fn read_exact(take fd: Int, take count: Int, take timeout_ms: Int) -> Result[String, pg::error::PgError] {
+pub fn read_exact(take fd: Int, take count: Int, take timeout_ms: Int) -> Result[String, db::error::PgError] {
     var out = std::string::empty();
     var i = 0;
     while i < count {
         let b = std::rt::read_byte_timeout(fd, timeout_ms);
         if b == timeout_sentinel() {
-            return Err { error: pg::error::new(pg::error::kind_timeout(), "timed out waiting for the server to send more data") };
+            return Err { error: db::error::new(db::error::kind_timeout(), "timed out waiting for the server to send more data") };
         }
         if b == eof_sentinel() {
-            return Err { error: pg::error::new(pg::error::kind_connection(), "the server closed the connection mid-message") };
+            return Err { error: db::error::new(db::error::kind_connection(), "the server closed the connection mid-message") };
         }
         if b < 0 {
-            return Err { error: pg::error::new(pg::error::kind_connection(), "the connection failed while receiving") };
+            return Err { error: db::error::new(db::error::kind_connection(), "the connection failed while receiving") };
         }
         std::string::push_byte(out, b);
         i = i + 1;
@@ -210,7 +210,7 @@ pub fn read_exact(take fd: Int, take count: Int, take timeout_ms: Int) -> Result
 /// ```tuo
 /// // let t = pg::conn::read_type(fd, 30000);
 /// ```
-pub fn read_type(take fd: Int, take timeout_ms: Int) -> Result[Int, pg::error::PgError] {
+pub fn read_type(take fd: Int, take timeout_ms: Int) -> Result[Int, db::error::PgError] {
     match read_exact(fd, 1, timeout_ms) {
         Ok { value } => Ok { value: std::string::byte_at(value, 0) },
         Err { error } => Err { error: error },
@@ -231,9 +231,9 @@ pub fn read_type(take fd: Int, take timeout_ms: Int) -> Result[Int, pg::error::P
 /// ```tuo
 /// // let p = pg::conn::read_message_payload(fd, 30000);
 /// ```
-pub fn read_message_payload(take fd: Int, take timeout_ms: Int) -> Result[String, pg::error::PgError] {
+pub fn read_message_payload(take fd: Int, take timeout_ms: Int) -> Result[String, db::error::PgError] {
     match read_exact(fd, 4, timeout_ms) {
-        Ok { value } => read_body_of_length(fd, pg::bytes::be_i32(value, 0), timeout_ms),
+        Ok { value } => read_body_of_length(fd, db::bytes::be_i32(value, 0), timeout_ms),
         Err { error } => Err { error: error },
     }
 }
@@ -247,9 +247,9 @@ pub fn read_message_payload(take fd: Int, take timeout_ms: Int) -> Result[String
 ///
 /// A length below 4 would claim the message is shorter than its own header, so
 /// it is a protocol violation rather than a read count.
-pub fn read_body_of_length(take fd: Int, take len: Int, take timeout_ms: Int) -> Result[String, pg::error::PgError] {
+pub fn read_body_of_length(take fd: Int, take len: Int, take timeout_ms: Int) -> Result[String, db::error::PgError] {
     if len < 4 {
-        return Err { error: pg::error::new(pg::error::kind_protocol(), "the server declared a message length below the 4-byte minimum") };
+        return Err { error: db::error::new(db::error::kind_protocol(), "the server declared a message length below the 4-byte minimum") };
     }
     read_exact(fd, len - 4, timeout_ms)
 }
@@ -273,10 +273,10 @@ pub fn read_body_of_length(take fd: Int, take len: Int, take timeout_ms: Int) ->
 /// ```tuo
 /// // let r = pg::conn::handshake(fd, "postgres", "app", "", 30000);
 /// ```
-pub fn handshake(take fd: Int, in user: Str, in database: Str, in password: Str, take timeout_ms: Int) -> Result[Int, pg::error::PgError] {
+pub fn handshake(take fd: Int, in user: Str, in database: Str, in password: Str, take timeout_ms: Int) -> Result[Int, db::error::PgError] {
     let sent = write_message(fd, pg::proto::startup(user, database));
     if sent < 0 {
-        return Err { error: pg::error::new(pg::error::kind_connection(), "the connection failed while sending the startup packet") };
+        return Err { error: db::error::new(db::error::kind_connection(), "the connection failed while sending the startup packet") };
     }
 
     // Bound the exchange so a misbehaving peer cannot spin this loop forever.
@@ -314,7 +314,7 @@ pub fn handshake(take fd: Int, in user: Str, in database: Str, in password: Str,
     // they carry useful information but nothing the handshake must act on.
     }
 
-    Err { error: pg::error::new(pg::error::kind_protocol(), "the server sent too many messages without completing the handshake") }
+    Err { error: db::error::new(db::error::kind_protocol(), "the server sent too many messages without completing the handshake") }
 }
 
 /// EFFECT: answer one `AuthenticationRequest`. Returns `0` when the exchange
@@ -353,7 +353,7 @@ pub fn respond_to_auth(take fd: Int, in payload: String, in password: Str) -> In
 /// Is this `Result[Int, PgError]` an `Ok`? Borrows rather than consumes, so
 /// the caller can inspect a result and still unwrap it afterwards — a `match`
 /// on an owned value moves it (`O0001`).
-pub fn is_ok_int(in r: Result[Int, pg::error::PgError]) -> Bool {
+pub fn is_ok_int(in r: Result[Int, db::error::PgError]) -> Bool {
     match r {
         Ok { value: _ } => true,
         Err { error: _ } => false,
@@ -361,7 +361,7 @@ pub fn is_ok_int(in r: Result[Int, pg::error::PgError]) -> Bool {
 }
 
 /// The value of a successful `Result[Int, PgError]`, or `-1`.
-pub fn unwrap_ok_int(in r: Result[Int, pg::error::PgError]) -> Int {
+pub fn unwrap_ok_int(in r: Result[Int, db::error::PgError]) -> Int {
     match r {
         // `Int` is Copy, so reading it out of a borrow is a copy, not a move.
         Ok { value } => value,
@@ -370,7 +370,7 @@ pub fn unwrap_ok_int(in r: Result[Int, pg::error::PgError]) -> Int {
 }
 
 /// Is this `Result[String, PgError]` an `Ok`?
-pub fn is_ok_string(in r: Result[String, pg::error::PgError]) -> Bool {
+pub fn is_ok_string(in r: Result[String, db::error::PgError]) -> Bool {
     match r {
         Ok { value: _ } => true,
         Err { error: _ } => false,
@@ -379,23 +379,23 @@ pub fn is_ok_string(in r: Result[String, pg::error::PgError]) -> Bool {
 
 /// The error of a failed `Result[Int, PgError]`, or a protocol error when it
 /// was actually `Ok` (which the callers above never do).
-pub fn unwrap_err_int(take r: Result[Int, pg::error::PgError]) -> pg::error::PgError {
+pub fn unwrap_err_int(take r: Result[Int, db::error::PgError]) -> db::error::PgError {
     match r {
-        Ok { value: _ } => pg::error::new(pg::error::kind_protocol(), "expected an error"),
+        Ok { value: _ } => db::error::new(db::error::kind_protocol(), "expected an error"),
         Err { error } => error,
     }
 }
 
 /// The error of a failed `Result[String, PgError]`.
-pub fn unwrap_err_string(take r: Result[String, pg::error::PgError]) -> pg::error::PgError {
+pub fn unwrap_err_string(take r: Result[String, db::error::PgError]) -> db::error::PgError {
     match r {
-        Ok { value: _ } => pg::error::new(pg::error::kind_protocol(), "expected an error"),
+        Ok { value: _ } => db::error::new(db::error::kind_protocol(), "expected an error"),
         Err { error } => error,
     }
 }
 
 /// The value of a successful `Result[String, PgError]`, or the empty string.
-pub fn unwrap_ok_string(take r: Result[String, pg::error::PgError]) -> String {
+pub fn unwrap_ok_string(take r: Result[String, db::error::PgError]) -> String {
     match r {
         Ok { value } => value,
         Err { error: _ } => std::string::empty(),
@@ -409,7 +409,7 @@ pub fn unwrap_ok_string(take r: Result[String, pg::error::PgError]) -> String {
 /// ```tuo
 /// // let r = pg::conn::connect("127.0.0.1", 5432, "postgres", "app", "", 30000);
 /// ```
-pub fn connect(in host: Str, take port: Int, in user: Str, in database: Str, in password: Str, take timeout_ms: Int) -> Result[Int, pg::error::PgError] {
+pub fn connect(in host: Str, take port: Int, in user: Str, in database: Str, in password: Str, take timeout_ms: Int) -> Result[Int, db::error::PgError] {
     let opened = open(host, port, timeout_ms);
     if !is_ok_int(opened) {
         return Err { error: unwrap_err_int(opened) };
@@ -439,10 +439,10 @@ pub fn connect(in host: Str, take port: Int, in user: Str, in database: Str, in 
 /// ```tuo
 /// // let e = pg::conn::error_from_payload(payload);
 /// ```
-pub fn error_from_payload(in payload: String) -> pg::error::PgError {
+pub fn error_from_payload(in payload: String) -> db::error::PgError {
     let msg = pg::message::error_field(payload, pg::message::field_message());
     let state = pg::message::error_field(payload, pg::message::field_sqlstate());
-    pg::error::server(std::string::as_str(msg), std::string::as_str(state))
+    db::error::server(std::string::as_str(msg), std::string::as_str(state))
 }
 
 // ----------------------------------------------------------------------------
@@ -452,17 +452,17 @@ pub fn error_from_payload(in payload: String) -> pg::error::PgError {
 
 /// Spec helper: the kind of the error built from a fixture ErrorResponse.
 pub fn fixture_error_kind() -> Int {
-    pg::error::kind(error_from_payload(pg::message::fixture_error()))
+    db::error::kind(error_from_payload(pg::message::fixture_error()))
 }
 
 /// Spec helper: the SQLSTATE carried through from a fixture ErrorResponse.
 pub fn fixture_error_sqlstate_is(in expect: Str) -> Bool {
-    std::string::as_str(pg::error::sqlstate(error_from_payload(pg::message::fixture_error()))) == expect
+    std::string::as_str(db::error::sqlstate(error_from_payload(pg::message::fixture_error()))) == expect
 }
 
 /// Spec helper: the message carried through from a fixture ErrorResponse.
 pub fn fixture_error_message_is(in expect: Str) -> Bool {
-    std::string::as_str(pg::error::message(error_from_payload(pg::message::fixture_error()))) == expect
+    std::string::as_str(db::error::message(error_from_payload(pg::message::fixture_error()))) == expect
 }
 
 spec is_open {
@@ -475,7 +475,7 @@ spec is_open {
 spec error_from_payload {
     // A server error keeps its kind, its SQLSTATE, and its text — the three
     // things a caller needs to act, match, and report.
-    then fixture_error_kind() == pg::error::kind_server();
+    then fixture_error_kind() == db::error::kind_server();
     then fixture_error_sqlstate_is("42601");
     then fixture_error_message_is("syntax error at or near \"SELCT\"");
 }

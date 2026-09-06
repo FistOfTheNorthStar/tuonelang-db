@@ -1,20 +1,28 @@
-// pg::bytes — the byte-order layer the PostgreSQL wire protocol is framed in.
+// db::bytes — the byte-order layer database wire protocols are framed in.
 //
-// Every PostgreSQL message is length-prefixed with a big-endian Int32, and
-// every field inside one — a parameter length in `Bind`, a column length in
-// `DataRow`, an object id in `RowDescription` — is big-endian too. So this is
-// the single most-used module in the adapter, and the one whose correctness
-// everything else rests on.
+// This is part of the backend-neutral `core` feature: nothing here is specific
+// to any one database. Big-endian framing is how most database wire protocols
+// are built, so this module is the seam a second backend is written against.
+//
+// PostgreSQL, the backend that exists today, is the worked example: every
+// message is length-prefixed with a big-endian Int32, and every field inside
+// one — a parameter length in `Bind`, a column length in `DataRow`, an object
+// id in `RowDescription` — is big-endian too. So this is the single most-used
+// module in the adapter, and the one whose correctness everything else rests
+// on.
 //
 // WHY ARITHMETIC AND NOT SHIFTS.
 //
-// tuonelang v0 has no bitwise operators (grammar.ebnf states it, and the
-// lexer's `TokenKind::Pipe` doc repeats it). ADR-0019 Stage A adds `<<`/`>>`/
-// `&`/`|`/`^`/`~` and a `std::bits` module with exactly these operations
-// (`be_u32`, `be_u16`, and their decoders). Until that lands, the encoders
-// below are written with `*`, `/`, and `%`, which are exactly equivalent
-// **provided every byte is in 0..=255 and no intermediate overflows** — the
-// two conditions this module enforces rather than assumes:
+// These encoders were written before tuonelang had bitwise operators, with
+// `*`, `/`, and `%` standing in for shifts and masks. **ADR-0019 Stage A has
+// since landed** `<<`/`>>`/`&`/`|`/`^`/`~`, so shifts are available now; the
+// `std::bits` helpers the ADR also promises (`be_u32`, `be_u16`, and their
+// decoders) are Stage B and still resolve to `R0002: no 'bits' in 'std'`.
+//
+// The arithmetic below is left in place deliberately: it is exactly equivalent
+// to the shift form **provided every byte is in 0..=255 and no intermediate
+// overflows**, and those are the two conditions this module enforces rather
+// than assumes:
 //
 //   * every decoder is fed bytes from `std::string::byte_at`, which the
 //     compiler guarantees is `0..=255`; and
@@ -22,13 +30,14 @@
 //     in `be_i32`, so the multiply-add never carries into a sign bit the way
 //     ADR-0019 warns an unguarded `*`-based decoder does.
 //
-// MIGRATION. When ADR-0019 Stage A lands, the bodies here become one-liners
-// over `std::bits` while every signature and every spec below stays as-is —
-// that is the point of routing all byte-order work through this one module
-// instead of open-coding `b0 * 16777216 + ...` at each call site, which is
-// the correctness trap the ADR calls out by name.
+// MIGRATION. The bodies here can become one-liners — over the Stage A shifts
+// today, or over `std::bits` once Stage B lands — while every signature and
+// every spec below stays as-is. That is the point of routing all byte-order
+// work through this one module instead of open-coding `b0 * 16777216 + ...`
+// at each call site, which is the correctness trap the ADR calls out by name.
+// The specs are what make that rewrite safe to attempt.
 
-module pg::bytes;
+module db::bytes;
 
 // ----------------------------------------------------------------------------
 // Constants — the powers of two the big-endian codec needs.
@@ -76,7 +85,7 @@ pub fn int32_sign_bit() -> Int {
 /// # Example
 /// ```tuo
 /// var buf = std::string::empty();
-/// pg::bytes::put_i32(buf, 196608); // the 3.0 protocol version
+/// db::bytes::put_i32(buf, 196608); // the 3.0 protocol version
 /// ```
 pub fn put_i32(mut buf: String, take v: Int) {
     // Fold a negative into its unsigned two's-complement image first, so the
@@ -97,7 +106,7 @@ pub fn put_i32(mut buf: String, take v: Int) {
 /// # Example
 /// ```tuo
 /// var buf = std::string::empty();
-/// pg::bytes::put_i16(buf, 1);
+/// db::bytes::put_i16(buf, 1);
 /// ```
 pub fn put_i16(mut buf: String, take v: Int) {
     var n = v;
@@ -113,7 +122,7 @@ pub fn put_i16(mut buf: String, take v: Int) {
 /// # Example
 /// ```tuo
 /// var buf = std::string::empty();
-/// pg::bytes::put_byte(buf, 83); // 'S'
+/// db::bytes::put_byte(buf, 83); // 'S'
 /// ```
 pub fn put_byte(mut buf: String, take b: Int) {
     std::string::push_byte(buf, b);
@@ -128,7 +137,7 @@ pub fn put_byte(mut buf: String, take b: Int) {
 /// # Example
 /// ```tuo
 /// var buf = std::string::empty();
-/// pg::bytes::put_cstr(buf, "SELECT 1");
+/// db::bytes::put_cstr(buf, "SELECT 1");
 /// ```
 pub fn put_cstr(mut buf: String, in s: Str) {
     std::string::append(buf, s);
@@ -140,7 +149,7 @@ pub fn put_cstr(mut buf: String, in s: Str) {
 /// # Example
 /// ```tuo
 /// var buf = std::string::empty();
-/// pg::bytes::put_bytes(buf, "raw");
+/// db::bytes::put_bytes(buf, "raw");
 /// ```
 pub fn put_bytes(mut buf: String, in s: Str) {
     std::string::append(buf, s);
@@ -161,7 +170,7 @@ pub fn put_bytes(mut buf: String, in s: Str) {
 ///
 /// # Example
 /// ```tuo
-/// // let n = pg::bytes::be_i32(buf, 0);
+/// // let n = db::bytes::be_i32(buf, 0);
 /// ```
 pub fn be_i32(in buf: String, take at: Int) -> Int {
     let n = be_u32(buf, at);
@@ -180,7 +189,7 @@ pub fn be_i32(in buf: String, take at: Int) -> Int {
 ///
 /// # Example
 /// ```tuo
-/// // let oid = pg::bytes::be_u32(buf, 6);
+/// // let oid = db::bytes::be_u32(buf, 6);
 /// ```
 pub fn be_u32(in buf: String, take at: Int) -> Int {
     let b0 = std::string::byte_at(buf, at);
@@ -194,7 +203,7 @@ pub fn be_u32(in buf: String, take at: Int) -> Int {
 ///
 /// # Example
 /// ```tuo
-/// // let cols = pg::bytes::be_i16(buf, 5);
+/// // let cols = db::bytes::be_i16(buf, 5);
 /// ```
 pub fn be_i16(in buf: String, take at: Int) -> Int {
     let hi = std::string::byte_at(buf, at);
@@ -215,7 +224,7 @@ pub fn be_i16(in buf: String, take at: Int) -> Int {
 ///
 /// # Example
 /// ```tuo
-/// // let name = pg::bytes::cstr_at(buf, 5);
+/// // let name = db::bytes::cstr_at(buf, 5);
 /// ```
 pub fn cstr_at(in buf: String, take at: Int) -> String {
     let stop = std::string::len(buf);
@@ -237,7 +246,7 @@ pub fn cstr_at(in buf: String, take at: Int) -> String {
 ///
 /// # Example
 /// ```tuo
-/// // let next = pg::bytes::cstr_end(buf, 5);
+/// // let next = db::bytes::cstr_end(buf, 5);
 /// ```
 pub fn cstr_end(in buf: String, take at: Int) -> Int {
     let stop = std::string::len(buf);

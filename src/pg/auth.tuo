@@ -8,16 +8,19 @@
 //
 // THE CRYPTO BOUNDARY — the one thing to understand here.
 //
-// Two of the three realistic methods need hashing that tuonelang v0 cannot
-// express, because v0 has no bitwise operators:
+// Two of the three realistic methods need hashing this adapter does not yet
+// implement:
 //
 //   * `AuthenticationMD5Password` needs `md5(md5(password + user) + salt)`;
 //   * SASL/`SCRAM-SHA-256` needs SHA-256, HMAC-SHA-256, and PBKDF2.
 //
-// SHA-256 is not merely *slow* to write without `^`, `>>`, and `&` — it is
-// impossible, because it is *defined* in those terms. ADR-0019 exists to close
-// exactly this gap: Stage A adds the six operators, Stage B adds `std::crypto`
-// with `md5`, `sha256`, `hmac_sha256`, `pbkdf2_sha256`, and `base64_*`.
+// This was once a *language* limit: SHA-256 is defined in terms of `^`, `>>`,
+// and `&`, and v0 had none of them. **ADR-0019 Stage A has since landed**, so
+// all six bitwise operators work and the hashes are expressible today. Stage B
+// has not: `std::crypto` (`md5`, `sha256`, `hmac_sha256`, `pbkdf2_sha256`,
+// `base64_*`) still resolves to `R0002: no 'crypto' in 'std'`. So what remains
+// is implementation work — write the digests over the new operators, or wait
+// for the stdlib — not an impossibility.
 //
 // So this module is written as a **seam**, not a stub:
 //
@@ -155,7 +158,7 @@ pub fn method_name(take auth_kind: Int) -> Str {
 /// ```tuo
 /// // let e = pg::auth::unsupported_error(5);
 /// ```
-pub fn unsupported_error(take auth_kind: Int) -> pg::error::PgError {
+pub fn unsupported_error(take auth_kind: Int) -> db::error::PgError {
     let p = plan(auth_kind);
     var m = std::string::empty();
     std::string::append(m, "server requested ");
@@ -163,16 +166,17 @@ pub fn unsupported_error(take auth_kind: Int) -> pg::error::PgError {
     std::string::append(m, " authentication, which this adapter cannot perform: ");
 
     if needs_crypto(p) {
-        std::string::append(m, "it needs hashing that tuonelang v0 has no bitwise operators for. ");
-        std::string::append(m, "ADR-0019 adds them plus std::crypto; until then, either use ");
-        std::string::append(m, "trust or password authentication for this host in pg_hba.conf, ");
+        std::string::append(m, "it needs hashing that this adapter does not yet implement. ");
+        std::string::append(m, "ADR-0019 Stage A landed the bitwise operators, but std::crypto ");
+        std::string::append(m, "(Stage B) is not available yet; until then, either use trust or ");
+        std::string::append(m, "password authentication for this host in pg_hba.conf, ");
         std::string::append(m, "or connect over a channel that has already authenticated.");
     } else {
         std::string::append(m, "the method is not implemented. Configure the server to offer ");
         std::string::append(m, "scram-sha-256, password, or trust for this host in pg_hba.conf.");
     }
 
-    pg::error::new(pg::error::kind_auth(), std::string::as_str(m))
+    db::error::new(db::error::kind_auth(), std::string::as_str(m))
 }
 
 // ----------------------------------------------------------------------------
@@ -198,11 +202,11 @@ pub fn unsupported_error(take auth_kind: Int) -> pg::error::PgError {
 /// ```tuo
 /// // let r = pg::auth::md5_response("secret", "postgres", salt);
 /// ```
-pub fn md5_response(in password: Str, in user: Str, in salt: Array[Int]) -> Result[String, pg::error::PgError] {
+pub fn md5_response(in password: Str, in user: Str, in salt: Array[Int]) -> Result[String, db::error::PgError] {
     var m = std::string::empty();
-    std::string::append(m, "md5 authentication needs std::crypto::md5 (ADR-0019 Stage B); ");
+    std::string::append(m, "md5 authentication needs an MD5 implementation (std::crypto, ADR-0019 Stage B); ");
     std::string::append(m, "use trust or password authentication for this host meanwhile");
-    Err { error: pg::error::new(pg::error::kind_auth(), std::string::as_str(m)) }
+    Err { error: db::error::new(db::error::kind_auth(), std::string::as_str(m)) }
 }
 
 /// The SCRAM-SHA-256 `client-first-message` — `"n,,n=,r=" + nonce`.
@@ -217,11 +221,11 @@ pub fn md5_response(in password: Str, in user: Str, in salt: Array[Int]) -> Resu
 /// ```tuo
 /// // let r = pg::auth::scram_client_first("nonce");
 /// ```
-pub fn scram_client_first(in nonce: Str) -> Result[String, pg::error::PgError] {
+pub fn scram_client_first(in nonce: Str) -> Result[String, db::error::PgError] {
     var m = std::string::empty();
-    std::string::append(m, "SCRAM-SHA-256 needs std::crypto (sha256/hmac/pbkdf2, ADR-0019 ");
+    std::string::append(m, "SCRAM-SHA-256 needs sha256/hmac/pbkdf2 (std::crypto, ADR-0019 ");
     std::string::append(m, "Stage B); use trust or password authentication for this host meanwhile");
-    Err { error: pg::error::new(pg::error::kind_auth(), std::string::as_str(m)) }
+    Err { error: db::error::new(db::error::kind_auth(), std::string::as_str(m)) }
 }
 
 // ----------------------------------------------------------------------------
@@ -237,7 +241,7 @@ pub fn md5_blocked() -> Bool {
     std::array::push(salt, 4);
     match md5_response("secret", "postgres", salt) {
         Ok { value } => false,
-        Err { error } => pg::error::kind(error) == pg::error::kind_auth(),
+        Err { error } => db::error::kind(error) == db::error::kind_auth(),
     }
 }
 
@@ -245,13 +249,13 @@ pub fn md5_blocked() -> Bool {
 pub fn scram_blocked() -> Bool {
     match scram_client_first("nonce") {
         Ok { value } => false,
-        Err { error } => pg::error::kind(error) == pg::error::kind_auth(),
+        Err { error } => db::error::kind(error) == db::error::kind_auth(),
     }
 }
 
 /// Spec helper: the kind of the error for an unsupported method.
 pub fn unsupported_kind(take auth_kind: Int) -> Int {
-    pg::error::kind(unsupported_error(auth_kind))
+    db::error::kind(unsupported_error(auth_kind))
 }
 
 spec plan {
@@ -299,9 +303,9 @@ spec method_name {
 }
 
 spec unsupported_error {
-    then unsupported_kind(pg::proto::auth_md5()) == pg::error::kind_auth();
-    then unsupported_kind(pg::proto::auth_sasl()) == pg::error::kind_auth();
-    then unsupported_kind(pg::proto::auth_kerberos()) == pg::error::kind_auth();
+    then unsupported_kind(pg::proto::auth_md5()) == db::error::kind_auth();
+    then unsupported_kind(pg::proto::auth_sasl()) == db::error::kind_auth();
+    then unsupported_kind(pg::proto::auth_kerberos()) == db::error::kind_auth();
 }
 
 spec md5_response {

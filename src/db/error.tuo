@@ -1,4 +1,10 @@
-// pg::error — a typed error vocabulary for the adapter.
+// db::error — a typed error vocabulary shared by every backend.
+//
+// This is part of the backend-neutral `core` feature. The kinds below are the
+// ones any database client needs (connection, timeout, auth, server, protocol,
+// decode, unsupported), and SQLSTATE is an ISO SQL standard rather than a
+// PostgreSQL invention — so the whole vocabulary carries over to a second
+// backend unchanged.
 //
 // v0 has no traits, so there is no error *interface* to implement. The honest
 // model — and the one `std::core` itself uses — is a concrete value: here, an
@@ -15,7 +21,7 @@
 // is the explanation, with the server's own SQLSTATE preserved whenever the
 // error came from the server at all.
 
-module pg::error;
+module db::error;
 
 // ----------------------------------------------------------------------------
 // Error kinds.
@@ -76,7 +82,7 @@ pub struct PgError {
 ///
 /// # Example
 /// ```tuo
-/// let e = pg::error::new(pg::error::kind_connection(), "connect refused");
+/// let e = db::error::new(db::error::kind_connection(), "connect refused");
 /// ```
 pub fn new(take kind: Int, in message: Str) -> PgError {
     PgError { kind: kind, message: std::string::from_str(message), sqlstate: std::string::empty() }
@@ -86,7 +92,7 @@ pub fn new(take kind: Int, in message: Str) -> PgError {
 ///
 /// # Example
 /// ```tuo
-/// let e = pg::error::server("syntax error", "42601");
+/// let e = db::error::server("syntax error", "42601");
 /// ```
 pub fn server(in message: Str, in sqlstate: Str) -> PgError {
     PgError { kind: kind_server(), message: std::string::from_str(message), sqlstate: std::string::from_str(sqlstate) }
@@ -96,7 +102,7 @@ pub fn server(in message: Str, in sqlstate: Str) -> PgError {
 ///
 /// # Example
 /// ```tuo
-/// // let k = pg::error::kind(e);
+/// // let k = db::error::kind(e);
 /// ```
 pub fn kind(in e: PgError) -> Int {
     e.kind
@@ -106,7 +112,7 @@ pub fn kind(in e: PgError) -> Int {
 ///
 /// # Example
 /// ```tuo
-/// // let m = pg::error::message(e);
+/// // let m = db::error::message(e);
 /// ```
 pub fn message(in e: PgError) -> String {
     std::string::from_str(std::string::as_str(e.message))
@@ -117,7 +123,7 @@ pub fn message(in e: PgError) -> String {
 ///
 /// # Example
 /// ```tuo
-/// // let s = pg::error::sqlstate(e);
+/// // let s = db::error::sqlstate(e);
 /// ```
 pub fn sqlstate(in e: PgError) -> String {
     std::string::from_str(std::string::as_str(e.sqlstate))
@@ -127,7 +133,7 @@ pub fn sqlstate(in e: PgError) -> String {
 ///
 /// # Example
 /// ```tuo
-/// let n = pg::error::kind_name(pg::error::kind_auth()); // "auth"
+/// let n = db::error::kind_name(db::error::kind_auth()); // "auth"
 /// ```
 pub fn kind_name(take k: Int) -> Str {
     if k == kind_connection() {
@@ -153,7 +159,7 @@ pub fn kind_name(take k: Int) -> Str {
 ///
 /// # Example
 /// ```tuo
-/// // let text = pg::error::render(e);
+/// // let text = db::error::render(e);
 /// ```
 pub fn render(in e: PgError) -> String {
     var out = std::string::empty();
@@ -180,7 +186,7 @@ pub fn render(in e: PgError) -> String {
 ///
 /// # Example
 /// ```tuo
-/// // let dup = pg::error::is_sqlstate(e, "23505");
+/// // let dup = db::error::is_sqlstate(e, "23505");
 /// ```
 pub fn is_sqlstate(in e: PgError, in code: Str) -> Bool {
     std::string::as_str(e.sqlstate) == code
@@ -226,7 +232,7 @@ pub fn sqlstate_serialization_failure() -> Str {
 ///
 /// # Example
 /// ```tuo
-/// // if pg::error::is_retryable(e) { .. }
+/// // if db::error::is_retryable(e) { .. }
 /// ```
 pub fn is_retryable(in e: PgError) -> Bool {
     is_sqlstate(e, sqlstate_serialization_failure()) || is_sqlstate(e, "40P01")

@@ -51,7 +51,7 @@ fn main() -> Int {
 
 ## 2. THE RESULT PATTERN — get this right and most errors disappear
 
-Every fallible call returns `Result[T, pg::error::PgError]`. v0 has **no `?`
+Every fallible call returns `Result[T, db::error::PgError]`. v0 has **no `?`
 operator**, and a `match` on an owned value **moves it**. So the one correct
 shape is always:
 
@@ -79,7 +79,7 @@ codegen stage. If you see that error, look for a `Result` (or any `String` /
 | `Result[ResultSet, PgError]` | `pg::query::is_ok_result` | `pg::query::unwrap_ok_result` | `pg::query::unwrap_err_result` |
 
 `pg::query::render_error(r)` consumes `r` and gives you the printable text —
-use it instead of `pg::error::render(unwrap_err_result(r))`, which reads better
+use it instead of `db::error::render(unwrap_err_result(r))`, which reads better
 but is the same single consumption.
 
 ---
@@ -90,10 +90,10 @@ but is the same single consumption.
 
 ```tuo
 fn connect(in host: Str, take port: Int, in user: Str, in database: Str,
-           in password: Str, take timeout_ms: Int) -> Result[Int, pg::error::PgError]
-fn open(in host: Str, take port: Int, take timeout_ms: Int) -> Result[Int, pg::error::PgError]
+           in password: Str, take timeout_ms: Int) -> Result[Int, db::error::PgError]
+fn open(in host: Str, take port: Int, take timeout_ms: Int) -> Result[Int, db::error::PgError]
 fn handshake(take fd: Int, in user: Str, in database: Str, in password: Str,
-             take timeout_ms: Int) -> Result[Int, pg::error::PgError]
+             take timeout_ms: Int) -> Result[Int, db::error::PgError]
 fn shutdown(take fd: Int) -> Int      // Terminate + close. Prefer this.
 fn close(take fd: Int) -> Int
 fn is_open(take outcome: Int) -> Bool
@@ -143,7 +143,7 @@ Indices are **0-based**, `(row, column)`. A NULL cell reads as `""` from
 `cell`, so **check `is_null` first** whenever NULL and `''` mean different
 things.
 
-### Errors — `pg::error`
+### Errors — `db::error`
 
 ```tuo
 fn kind(in e: PgError) -> Int
@@ -261,8 +261,13 @@ expression; move multi-step logic into a named function.
 **`mut` is declared, never written at the call site.**
 `std::string::push_byte(buf, 0)` — not `push_byte(mut buf, 0)`.
 
-**No compound assignment, no bitwise operators, no `const` items.**
-Write `x = x + 1`. Integer overflow **traps**; it does not wrap.
+**No compound assignment, no `const` items.** Write `x = x + 1`.
+Integer overflow **traps**; it does not wrap.
+
+**Bitwise operators DO exist** (ADR-0019 Stage A): `|`, `^`, `&`, `<<`, `>>`,
+and `~` all work on `Int`. Mask to 32 bits with `& 4294967295`; there is no
+integer literal `0x` form and no `std::bits`, so build a rotate by hand as
+`((x << 7) | (x >> 25)) & mask`.
 
 **`Str` vs `String`.** `Str` is a borrowed view (literals, slices); `String` is
 an owned heap buffer. Convert with `std::string::from_str(s)` and
@@ -304,9 +309,9 @@ defer conn.close()                       let _ = pg::conn::shutdown(db);
 ## 8. AUTHENTICATION — what will and will not work
 
 `trust` and `password` (cleartext) work. **`md5` and `scram-sha-256` do not**,
-because tuonelang v0 has no bitwise operators, so SHA-256 and MD5 are not
-merely unimplemented but inexpressible. ADR-0019 (Stage A: operators, Stage B:
-`std::crypto`) closes this.
+because this adapter does not implement MD5 or SHA-256. ADR-0019 Stage A has
+landed the bitwise operators, so the hashes are expressible now; Stage B
+(`std::crypto`) has not, so nothing supplies them ready-made yet.
 
 The adapter returns a typed `kind_auth` error naming the fix rather than
 failing obscurely. To connect today, put this in `pg_hba.conf`:
@@ -376,5 +381,11 @@ fn main() -> Int {
 Run it with:
 
 ```bash
-tuo run report.tuo src/pg/*.tuo
+tuo run report.tuo src/db/*.tuo src/pg/*.tuo
 ```
+
+Both source directories are needed: the library is split into a
+backend-neutral core (`src/db/` — `db::bytes`, `db::error`) and the PostgreSQL
+adapter (`src/pg/` — everything else), and a program that queries needs both.
+`./build.sh --postgresql --command run --entry report.tuo` selects the same set
+by feature rather than by glob.
