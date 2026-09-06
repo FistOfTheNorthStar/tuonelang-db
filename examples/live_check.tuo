@@ -70,7 +70,7 @@ fn main() -> Int {
     let connected = pg::conn::connect(host(), pg::conn::default_port(), user(), database(), password(), timeout_ms());
     if !pg::conn::is_ok_int(connected) {
         let _ = std::rt::write(1, "FAIL connect: ");
-        let _ = std::rt::write_string(1, pg::error::render(pg::conn::unwrap_err_int(connected)));
+        let _ = std::rt::write_string(1, db::error::render(pg::conn::unwrap_err_int(connected)));
         let _ = std::rt::write(1, "\n");
         return 10;
     }
@@ -200,12 +200,12 @@ fn main() -> Int {
         return 15;
     }
     let e5 = pg::query::unwrap_err_result(r5);
-    if pg::error::kind(e5) != pg::error::kind_server() {
+    if db::error::kind(e5) != db::error::kind_server() {
         let _ = say("FAIL error: wrong error kind");
         let _ = pg::conn::shutdown(fd);
         return 15;
     }
-    if !pg::error::is_sqlstate(e5, pg::error::sqlstate_syntax_error()) {
+    if !db::error::is_sqlstate(e5, db::error::sqlstate_syntax_error()) {
         let _ = say("FAIL error: wrong SQLSTATE");
         let _ = pg::conn::shutdown(fd);
         return 15;

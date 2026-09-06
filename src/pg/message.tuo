@@ -36,7 +36,7 @@ module pg::message;
 /// // let kind = pg::message::auth_kind(payload);
 /// ```
 pub fn auth_kind(in payload: String) -> Int {
-    pg::bytes::be_i32(payload, 0)
+    db::bytes::be_i32(payload, 0)
 }
 
 /// The 4-byte salt from an `AuthenticationMD5Password` payload, as an
@@ -92,7 +92,7 @@ pub fn tx_status(in payload: String) -> Int {
 /// // let name = pg::message::param_name(payload);
 /// ```
 pub fn param_name(in payload: String) -> String {
-    pg::bytes::cstr_at(payload, 0)
+    db::bytes::cstr_at(payload, 0)
 }
 
 /// The parameter value from a `ParameterStatus` payload.
@@ -102,7 +102,7 @@ pub fn param_name(in payload: String) -> String {
 /// // let value = pg::message::param_value(payload);
 /// ```
 pub fn param_value(in payload: String) -> String {
-    pg::bytes::cstr_at(payload, pg::bytes::cstr_end(payload, 0))
+    db::bytes::cstr_at(payload, db::bytes::cstr_end(payload, 0))
 }
 
 // ----------------------------------------------------------------------------
@@ -117,7 +117,7 @@ pub fn param_value(in payload: String) -> String {
 /// // let tag = pg::message::command_tag(payload);
 /// ```
 pub fn command_tag(in payload: String) -> String {
-    pg::bytes::cstr_at(payload, 0)
+    db::bytes::cstr_at(payload, 0)
 }
 
 /// Is byte `b` an ASCII digit?
@@ -239,9 +239,9 @@ pub fn error_field(in payload: String, take code: Int) -> String {
         }
         let value_at = i + 1;
         if c == code {
-            return pg::bytes::cstr_at(payload, value_at);
+            return db::bytes::cstr_at(payload, value_at);
         }
-        i = pg::bytes::cstr_end(payload, value_at);
+        i = db::bytes::cstr_end(payload, value_at);
     }
     std::string::empty()
 }
@@ -261,7 +261,7 @@ pub fn error_field(in payload: String, take code: Int) -> String {
 /// // let n = pg::message::field_count(payload);
 /// ```
 pub fn field_count(in payload: String) -> Int {
-    pg::bytes::be_i16(payload, 0)
+    db::bytes::be_i16(payload, 0)
 }
 
 /// The fixed-width tail after each column name in a `RowDescription`.
@@ -282,7 +282,7 @@ pub fn field_offset(in payload: String, take index: Int) -> Int {
     var at = 2;
     var i = 0;
     while i < index {
-        at = pg::bytes::cstr_end(payload, at) + field_tail_width();
+        at = db::bytes::cstr_end(payload, at) + field_tail_width();
         i = i + 1;
     }
     at
@@ -295,7 +295,7 @@ pub fn field_offset(in payload: String, take index: Int) -> Int {
 /// // let name = pg::message::field_name(payload, 0);
 /// ```
 pub fn field_name(in payload: String, take index: Int) -> String {
-    pg::bytes::cstr_at(payload, field_offset(payload, index))
+    db::bytes::cstr_at(payload, field_offset(payload, index))
 }
 
 /// The **type OID** of column `index` — the key to decoding its values.
@@ -308,8 +308,8 @@ pub fn field_name(in payload: String, take index: Int) -> String {
 /// // let oid = pg::message::field_type_oid(payload, 0);
 /// ```
 pub fn field_type_oid(in payload: String, take index: Int) -> Int {
-    let name_end = pg::bytes::cstr_end(payload, field_offset(payload, index));
-    pg::bytes::be_u32(payload, name_end + 6)
+    let name_end = db::bytes::cstr_end(payload, field_offset(payload, index));
+    db::bytes::be_u32(payload, name_end + 6)
 }
 
 /// The format code of column `index`: `0` text, `1` binary.
@@ -322,8 +322,8 @@ pub fn field_type_oid(in payload: String, take index: Int) -> Int {
 /// // let fmt = pg::message::field_format(payload, 0);
 /// ```
 pub fn field_format(in payload: String, take index: Int) -> Int {
-    let name_end = pg::bytes::cstr_end(payload, field_offset(payload, index));
-    pg::bytes::be_i16(payload, name_end + 16)
+    let name_end = db::bytes::cstr_end(payload, field_offset(payload, index));
+    db::bytes::be_i16(payload, name_end + 16)
 }
 
 // ----------------------------------------------------------------------------
@@ -341,7 +341,7 @@ pub fn field_format(in payload: String, take index: Int) -> Int {
 /// // let n = pg::message::column_count(payload);
 /// ```
 pub fn column_count(in payload: String) -> Int {
-    pg::bytes::be_i16(payload, 0)
+    db::bytes::be_i16(payload, 0)
 }
 
 /// The byte offset of column `index`'s **length field** in a `DataRow`.
@@ -354,7 +354,7 @@ pub fn column_offset(in payload: String, take index: Int) -> Int {
     var at = 2;
     var i = 0;
     while i < index {
-        let len = pg::bytes::be_i32(payload, at);
+        let len = db::bytes::be_i32(payload, at);
         if len < 0 {
             // A NULL column occupies only its length field.
             at = at + 4;
@@ -368,7 +368,7 @@ pub fn column_offset(in payload: String, take index: Int) -> Int {
 
 /// Is column `index` SQL NULL?
 ///
-/// NULL is signalled by a length of `-1`, which is why `pg::bytes::be_i32`
+/// NULL is signalled by a length of `-1`, which is why `db::bytes::be_i32`
 /// sign-corrects: read unsigned, this would be 4294967295 and every later
 /// column would be misframed.
 ///
@@ -377,7 +377,7 @@ pub fn column_offset(in payload: String, take index: Int) -> Int {
 /// // let null = pg::message::column_is_null(payload, 0);
 /// ```
 pub fn column_is_null(in payload: String, take index: Int) -> Bool {
-    pg::bytes::be_i32(payload, column_offset(payload, index)) < 0
+    db::bytes::be_i32(payload, column_offset(payload, index)) < 0
 }
 
 /// The raw bytes of column `index`, or the empty string when it is NULL.
@@ -391,7 +391,7 @@ pub fn column_is_null(in payload: String, take index: Int) -> Bool {
 /// ```
 pub fn column_bytes(in payload: String, take index: Int) -> String {
     let at = column_offset(payload, index);
-    let len = pg::bytes::be_i32(payload, at);
+    let len = db::bytes::be_i32(payload, at);
     if len < 0 {
         return std::string::empty();
     }
@@ -413,12 +413,12 @@ pub fn column_bytes(in payload: String, take index: Int) -> String {
 /// framing across a `-1` length, which is where a naive decoder desynchronizes.
 pub fn fixture_row() -> String {
     var p = std::string::empty();
-    pg::bytes::put_i16(p, 3);
-    pg::bytes::put_i32(p, 2);
-    pg::bytes::put_bytes(p, "hi");
-    pg::bytes::put_i32(p, 0 - 1); // SQL NULL
-    pg::bytes::put_i32(p, 2);
-    pg::bytes::put_bytes(p, "42");
+    db::bytes::put_i16(p, 3);
+    db::bytes::put_i32(p, 2);
+    db::bytes::put_bytes(p, "hi");
+    db::bytes::put_i32(p, 0 - 1); // SQL NULL
+    db::bytes::put_i32(p, 2);
+    db::bytes::put_bytes(p, "42");
     p
 }
 
@@ -426,37 +426,37 @@ pub fn fixture_row() -> String {
 /// `name` (text, oid 25).
 pub fn fixture_desc() -> String {
     var p = std::string::empty();
-    pg::bytes::put_i16(p, 2);
+    db::bytes::put_i16(p, 2);
 
-    pg::bytes::put_cstr(p, "id");
-    pg::bytes::put_i32(p, 0); // table oid
-    pg::bytes::put_i16(p, 0); // attribute number
-    pg::bytes::put_i32(p, 23); // type oid: int4
-    pg::bytes::put_i16(p, 4); // type size
-    pg::bytes::put_i32(p, 0 - 1); // type modifier
-    pg::bytes::put_i16(p, 0); // format: text
+    db::bytes::put_cstr(p, "id");
+    db::bytes::put_i32(p, 0); // table oid
+    db::bytes::put_i16(p, 0); // attribute number
+    db::bytes::put_i32(p, 23); // type oid: int4
+    db::bytes::put_i16(p, 4); // type size
+    db::bytes::put_i32(p, 0 - 1); // type modifier
+    db::bytes::put_i16(p, 0); // format: text
 
-    pg::bytes::put_cstr(p, "name");
-    pg::bytes::put_i32(p, 0);
-    pg::bytes::put_i16(p, 0);
-    pg::bytes::put_i32(p, 25); // type oid: text
-    pg::bytes::put_i16(p, 0 - 1);
-    pg::bytes::put_i32(p, 0 - 1);
-    pg::bytes::put_i16(p, 0);
+    db::bytes::put_cstr(p, "name");
+    db::bytes::put_i32(p, 0);
+    db::bytes::put_i16(p, 0);
+    db::bytes::put_i32(p, 25); // type oid: text
+    db::bytes::put_i16(p, 0 - 1);
+    db::bytes::put_i32(p, 0 - 1);
+    db::bytes::put_i16(p, 0);
     p
 }
 
 /// Fixture: an `ErrorResponse` for a real syntax error.
 pub fn fixture_error() -> String {
     var p = std::string::empty();
-    pg::bytes::put_byte(p, field_severity());
-    pg::bytes::put_cstr(p, "ERROR");
-    pg::bytes::put_byte(p, field_sqlstate());
-    pg::bytes::put_cstr(p, "42601");
-    pg::bytes::put_byte(p, field_message());
-    pg::bytes::put_cstr(p, "syntax error at or near \"SELCT\"");
-    pg::bytes::put_byte(p, field_position());
-    pg::bytes::put_cstr(p, "1");
+    db::bytes::put_byte(p, field_severity());
+    db::bytes::put_cstr(p, "ERROR");
+    db::bytes::put_byte(p, field_sqlstate());
+    db::bytes::put_cstr(p, "42601");
+    db::bytes::put_byte(p, field_message());
+    db::bytes::put_cstr(p, "syntax error at or near \"SELCT\"");
+    db::bytes::put_byte(p, field_position());
+    db::bytes::put_cstr(p, "1");
     std::string::push_byte(p, 0); // terminator
     p
 }
@@ -548,7 +548,7 @@ spec tx_status {
 /// Spec helper: a `ReadyForQuery` payload reporting idle.
 pub fn fixture_tx_is_idle() -> Bool {
     var p = std::string::empty();
-    pg::bytes::put_byte(p, pg::proto::tx_idle());
+    db::bytes::put_byte(p, pg::proto::tx_idle());
     tx_status(p) == pg::proto::tx_idle()
 }
 
@@ -560,7 +560,7 @@ spec auth_kind {
 /// Spec helper: an `AuthenticationOk` payload decodes to kind 0.
 pub fn fixture_auth_kind_ok() -> Bool {
     var p = std::string::empty();
-    pg::bytes::put_i32(p, pg::proto::auth_ok());
+    db::bytes::put_i32(p, pg::proto::auth_ok());
     auth_kind(p) == pg::proto::auth_ok()
 }
 
@@ -568,11 +568,11 @@ pub fn fixture_auth_kind_ok() -> Bool {
 /// yields its four salt bytes.
 pub fn fixture_auth_kind_md5() -> Bool {
     var p = std::string::empty();
-    pg::bytes::put_i32(p, pg::proto::auth_md5());
-    pg::bytes::put_byte(p, 1);
-    pg::bytes::put_byte(p, 2);
-    pg::bytes::put_byte(p, 3);
-    pg::bytes::put_byte(p, 255);
+    db::bytes::put_i32(p, pg::proto::auth_md5());
+    db::bytes::put_byte(p, 1);
+    db::bytes::put_byte(p, 2);
+    db::bytes::put_byte(p, 3);
+    db::bytes::put_byte(p, 255);
     let salt = auth_md5_salt(p);
     auth_kind(p) == pg::proto::auth_md5() && std::array::len(salt) == 4 && std::array::get(salt, 0) == 1 && std::array::get(salt, 3) == 255
 }

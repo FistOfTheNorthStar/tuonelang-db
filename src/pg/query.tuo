@@ -230,10 +230,10 @@ pub fn cell_bool(in rs: ResultSet, take r: Int, take c: Int) -> Bool {
 /// ```tuo
 /// // let rs = pg::query::run(fd, "SELECT id, name FROM users", 30000);
 /// ```
-pub fn run(take fd: Int, in sql: Str, take timeout_ms: Int) -> Result[ResultSet, pg::error::PgError] {
+pub fn run(take fd: Int, in sql: Str, take timeout_ms: Int) -> Result[ResultSet, db::error::PgError] {
     let sent = pg::conn::write_message(fd, pg::proto::query(sql));
     if sent < 0 {
-        return Err { error: pg::error::new(pg::error::kind_connection(), "the connection failed while sending the query") };
+        return Err { error: db::error::new(db::error::kind_connection(), "the connection failed while sending the query") };
     }
     collect(fd, timeout_ms)
 }
@@ -252,29 +252,29 @@ pub fn run(take fd: Int, in sql: Str, take timeout_ms: Int) -> Result[ResultSet,
 /// ```tuo
 /// // let rs = pg::query::run_params(fd, "SELECT * FROM users WHERE id = $1", ps, 30000);
 /// ```
-pub fn run_params(take fd: Int, in sql: Str, in params: Array[String], take timeout_ms: Int) -> Result[ResultSet, pg::error::PgError] {
+pub fn run_params(take fd: Int, in sql: Str, in params: Array[String], take timeout_ms: Int) -> Result[ResultSet, db::error::PgError] {
     // Parse the SQL into the unnamed statement.
     let a = pg::conn::write_message(fd, pg::proto::parse("", sql));
     if a < 0 {
-        return Err { error: pg::error::new(pg::error::kind_connection(), "failed to send Parse") };
+        return Err { error: db::error::new(db::error::kind_connection(), "failed to send Parse") };
     }
     let b = pg::conn::write_message(fd, bind_message(params));
     if b < 0 {
-        return Err { error: pg::error::new(pg::error::kind_connection(), "failed to send Bind") };
+        return Err { error: db::error::new(db::error::kind_connection(), "failed to send Bind") };
     }
     let c = pg::conn::write_message(fd, pg::proto::describe_statement(""));
     if c < 0 {
-        return Err { error: pg::error::new(pg::error::kind_connection(), "failed to send Describe") };
+        return Err { error: db::error::new(db::error::kind_connection(), "failed to send Describe") };
     }
     let d = pg::conn::write_message(fd, pg::proto::execute("", 0));
     if d < 0 {
-        return Err { error: pg::error::new(pg::error::kind_connection(), "failed to send Execute") };
+        return Err { error: db::error::new(db::error::kind_connection(), "failed to send Execute") };
     }
     // Sync ends the pipeline; without it the server never sends ReadyForQuery
     // and the read loop below would wait out its whole timeout.
     let e = pg::conn::write_message(fd, pg::proto::sync());
     if e < 0 {
-        return Err { error: pg::error::new(pg::error::kind_connection(), "failed to send Sync") };
+        return Err { error: db::error::new(db::error::kind_connection(), "failed to send Sync") };
     }
     collect(fd, timeout_ms)
 }
@@ -286,21 +286,21 @@ pub fn run_params(take fd: Int, in sql: Str, in params: Array[String], take time
 /// everything" — the same choice `pg::value` decodes against.
 pub fn bind_message(in params: Array[String]) -> String {
     var body = std::string::empty();
-    pg::bytes::put_cstr(body, ""); // portal: unnamed
-    pg::bytes::put_cstr(body, ""); // statement: unnamed
-    pg::bytes::put_i16(body, 0); // parameter format codes: none => all text
+    db::bytes::put_cstr(body, ""); // portal: unnamed
+    db::bytes::put_cstr(body, ""); // statement: unnamed
+    db::bytes::put_i16(body, 0); // parameter format codes: none => all text
 
     let n = std::array::len(params);
-    pg::bytes::put_i16(body, n);
+    db::bytes::put_i16(body, n);
     var i = 0;
     while i < n {
         let p = std::array::get(params, i);
-        pg::bytes::put_i32(body, std::string::len(p));
-        pg::bytes::put_bytes(body, std::string::as_str(p));
+        db::bytes::put_i32(body, std::string::len(p));
+        db::bytes::put_bytes(body, std::string::as_str(p));
         i = i + 1;
     }
 
-    pg::bytes::put_i16(body, 0); // result format codes: none => all text
+    db::bytes::put_i16(body, 0); // result format codes: none => all text
     pg::proto::finish(pg::proto::msg_bind(), body)
 }
 
@@ -308,7 +308,7 @@ pub fn bind_message(in params: Array[String]) -> String {
 ///
 /// Shared by `run` and `run_params`, because after the request differs the
 /// reply sequence is the same.
-pub fn collect(take fd: Int, take timeout_ms: Int) -> Result[ResultSet, pg::error::PgError] {
+pub fn collect(take fd: Int, take timeout_ms: Int) -> Result[ResultSet, db::error::PgError] {
     var columns = std::array::empty();
     var oids = std::array::empty();
     var values = std::array::empty();
@@ -318,7 +318,7 @@ pub fn collect(take fd: Int, take timeout_ms: Int) -> Result[ResultSet, pg::erro
     var tag_text = std::string::empty();
 
     var failed = false;
-    var failure = pg::error::new(pg::error::kind_protocol(), "no error");
+    var failure = db::error::new(db::error::kind_protocol(), "no error");
 
     var guard = 0;
     var done = false;
@@ -389,7 +389,7 @@ pub fn collect(take fd: Int, take timeout_ms: Int) -> Result[ResultSet, pg::erro
 /// ```tuo
 /// // let n = pg::query::execute(fd, "DELETE FROM users WHERE id = 1", 30000);
 /// ```
-pub fn execute(take fd: Int, in sql: Str, take timeout_ms: Int) -> Result[Int, pg::error::PgError] {
+pub fn execute(take fd: Int, in sql: Str, take timeout_ms: Int) -> Result[Int, db::error::PgError] {
     let r = run(fd, sql, timeout_ms);
     if !is_ok_result(r) {
         return Err { error: unwrap_err_result(r) };
@@ -406,14 +406,14 @@ pub fn execute(take fd: Int, in sql: Str, take timeout_ms: Int) -> Result[Int, p
 /// ```tuo
 /// // let v = pg::query::scalar(fd, "SELECT count(*) FROM users", 30000);
 /// ```
-pub fn scalar(take fd: Int, in sql: Str, take timeout_ms: Int) -> Result[String, pg::error::PgError] {
+pub fn scalar(take fd: Int, in sql: Str, take timeout_ms: Int) -> Result[String, db::error::PgError] {
     let r = run(fd, sql, timeout_ms);
     if !is_ok_result(r) {
         return Err { error: unwrap_err_result(r) };
     }
     let rs = unwrap_ok_result(r);
     if row_count(rs) == 0 || column_count(rs) == 0 {
-        return Err { error: pg::error::new(pg::error::kind_decode(), "the query returned no rows") };
+        return Err { error: db::error::new(db::error::kind_decode(), "the query returned no rows") };
     }
     Ok { value: cell(rs, 0, 0) }
 }
@@ -424,14 +424,14 @@ pub fn scalar(take fd: Int, in sql: Str, take timeout_ms: Int) -> Result[String,
 /// ```tuo
 /// // let n = pg::query::scalar_int(fd, "SELECT count(*) FROM users", 0, 30000);
 /// ```
-pub fn scalar_int(take fd: Int, in sql: Str, take fallback: Int, take timeout_ms: Int) -> Result[Int, pg::error::PgError] {
+pub fn scalar_int(take fd: Int, in sql: Str, take fallback: Int, take timeout_ms: Int) -> Result[Int, db::error::PgError] {
     let r = run(fd, sql, timeout_ms);
     if !is_ok_result(r) {
         return Err { error: unwrap_err_result(r) };
     }
     let rs = unwrap_ok_result(r);
     if row_count(rs) == 0 || column_count(rs) == 0 {
-        return Err { error: pg::error::new(pg::error::kind_decode(), "the query returned no rows") };
+        return Err { error: db::error::new(db::error::kind_decode(), "the query returned no rows") };
     }
     Ok { value: cell_int(rs, 0, 0, fallback) }
 }
@@ -444,7 +444,7 @@ pub fn scalar_int(take fd: Int, in sql: Str, take fallback: Int, take timeout_ms
 // ----------------------------------------------------------------------------
 
 /// Is this a successful result set?
-pub fn is_ok_result(in r: Result[ResultSet, pg::error::PgError]) -> Bool {
+pub fn is_ok_result(in r: Result[ResultSet, db::error::PgError]) -> Bool {
     match r {
         Ok { value: _ } => true,
         Err { error: _ } => false,
@@ -452,7 +452,7 @@ pub fn is_ok_result(in r: Result[ResultSet, pg::error::PgError]) -> Bool {
 }
 
 /// The result set of a successful result, or the empty set.
-pub fn unwrap_ok_result(take r: Result[ResultSet, pg::error::PgError]) -> ResultSet {
+pub fn unwrap_ok_result(take r: Result[ResultSet, db::error::PgError]) -> ResultSet {
     match r {
         Ok { value } => value,
         Err { error: _ } => empty_result(),
@@ -460,9 +460,9 @@ pub fn unwrap_ok_result(take r: Result[ResultSet, pg::error::PgError]) -> Result
 }
 
 /// The error of a failed result.
-pub fn unwrap_err_result(take r: Result[ResultSet, pg::error::PgError]) -> pg::error::PgError {
+pub fn unwrap_err_result(take r: Result[ResultSet, db::error::PgError]) -> db::error::PgError {
     match r {
-        Ok { value: _ } => pg::error::new(pg::error::kind_protocol(), "expected an error"),
+        Ok { value: _ } => db::error::new(db::error::kind_protocol(), "expected an error"),
         Err { error } => error,
     }
 }
@@ -488,10 +488,10 @@ pub fn unwrap_err_result(take r: Result[ResultSet, pg::error::PgError]) -> pg::e
 /// //     return 1;                              // ... so never read it below
 /// // }
 /// ```
-pub fn render_error(take r: Result[ResultSet, pg::error::PgError]) -> String {
+pub fn render_error(take r: Result[ResultSet, db::error::PgError]) -> String {
     match r {
         Ok { value: _ } => std::string::from_str("no error"),
-        Err { error } => pg::error::render(error),
+        Err { error } => db::error::render(error),
     }
 }
 
@@ -550,7 +550,7 @@ pub fn bind_framing_ok(take count: Int) -> Bool {
         i = i + 1;
     }
     let m = bind_message(ps);
-    pg::bytes::be_i32(m, 1) == std::string::len(m) - 1
+    db::bytes::be_i32(m, 1) == std::string::len(m) - 1
 }
 
 /// Spec helper: the type byte of a Bind message.

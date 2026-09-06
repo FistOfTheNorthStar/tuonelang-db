@@ -22,7 +22,7 @@ let opened = pg::conn::connect(
     30000,         // timeout in milliseconds
 );
 if !pg::conn::is_ok_int(opened) {
-    let _ = std::rt::write_string(1, pg::error::render(pg::conn::unwrap_err_int(opened)));
+    let _ = std::rt::write_string(1, db::error::render(pg::conn::unwrap_err_int(opened)));
     return 1;
 }
 let db = pg::conn::unwrap_ok_int(opened);
@@ -55,7 +55,7 @@ from the literal.
 
 Every wait in this adapter is bounded — the connect, the accept, and each byte
 read. A database client that blocks forever on a peer that has gone away is not
-a client, it is a hang. A timeout surfaces as `pg::error::kind_timeout()`,
+a client, it is a hang. A timeout surfaces as `db::error::kind_timeout()`,
 which is deliberately distinct from `kind_connection()`: "the server is slow"
 and "the server is gone" call for different responses.
 
@@ -173,7 +173,7 @@ channel; an error is a value you branch on.
 let r = pg::query::run(db, sql, 30000);
 if !pg::query::is_ok_result(r) {
     let e = pg::query::unwrap_err_result(r);
-    if pg::error::kind(e) == pg::error::kind_server() {
+    if db::error::kind(e) == db::error::kind_server() {
         // the server rejected it — inspect the SQLSTATE
     }
     return 1;
@@ -205,10 +205,10 @@ The server's own error code survives into the error value, which is what lets
 you branch on *what went wrong* rather than on English text:
 
 ```tuo
-if pg::error::is_sqlstate(e, pg::error::sqlstate_unique_violation()) {
+if db::error::is_sqlstate(e, db::error::sqlstate_unique_violation()) {
     // 23505 — a duplicate key; probably not fatal
 }
-if pg::error::is_retryable(e) {
+if db::error::is_retryable(e) {
     // 40001 / 40P01 — serialization failure or deadlock; retrying is correct
 }
 ```
@@ -231,7 +231,7 @@ Any other code can be matched literally: `is_sqlstate(e, "22P02")`.
 | `kind_decode` | A value would not decode, or no rows where one was needed. |
 | `kind_unsupported` | A feature this adapter does not implement. |
 
-`pg::error::render(e)` produces `"server: syntax error … (SQLSTATE 42601)"`.
+`db::error::render(e)` produces `"server: syntax error … (SQLSTATE 42601)"`.
 
 ### The connection survives an error
 
@@ -306,16 +306,19 @@ and the adapter says so rather than failing obscurely:
 
 ```
 auth: server requested SCRAM-SHA-256 authentication, which this adapter
-cannot perform: it needs hashing that tuonelang v0 has no bitwise operators
-for. ADR-0019 adds them plus std::crypto; until then, either use trust or
-password authentication for this host in pg_hba.conf, or connect over a
-channel that has already authenticated.
+cannot perform: it needs hashing that this adapter does not yet
+implement. ADR-0019 Stage A landed the bitwise operators, but
+std::crypto (Stage B) is not available yet; until then, either use trust
+or password authentication for this host in pg_hba.conf, or connect over
+a channel that has already authenticated.
 ```
 
-This is not an omission that could be patched in the library: SHA-256 is
-*defined* in terms of `^`, `>>`, and `&`, and v0 has none of them, so the
-function is inexpressible rather than merely unwritten. ADR-0019 adds the
-operators (Stage A) and `std::crypto` (Stage B).
+This used to be inexpressible rather than unwritten, because SHA-256 is
+*defined* in terms of `^`, `>>`, and `&`. **ADR-0019 Stage A has landed**, so
+those operators exist and the hashes could now be written by hand. Stage B —
+`std::crypto` — has not: `std::crypto::sha256` still resolves to
+`R0002: no 'crypto' in 'std'`. So this is now a matter of implementation work,
+not a language limit.
 
 To connect today, grant trust for your client host in `pg_hba.conf` and reload:
 
@@ -348,6 +351,6 @@ non-zero on any disagreement. See
 eight properties and is the best worked example of the whole API in use.
 
 ```bash
-tuo verify src/pg/*.tuo                       # 61 specs, no server needed
-tuo run examples/live_check.tuo src/pg/*.tuo  # the live oracle
+tuo verify src/db/*.tuo src/pg/*.tuo                       # 61 specs, no server needed
+tuo run examples/live_check.tuo src/db/*.tuo src/pg/*.tuo  # the live oracle
 ```

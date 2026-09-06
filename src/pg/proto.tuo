@@ -288,8 +288,8 @@ pub fn auth_sasl_final() -> Int {
 /// ```
 pub fn finish(take type_byte: Int, in payload: String) -> String {
     var out = std::string::empty();
-    pg::bytes::put_byte(out, type_byte);
-    pg::bytes::put_i32(out, std::string::len(payload) + 4);
+    db::bytes::put_byte(out, type_byte);
+    db::bytes::put_i32(out, std::string::len(payload) + 4);
     std::string::append(out, std::string::as_str(payload));
     out
 }
@@ -307,29 +307,29 @@ pub fn finish(take type_byte: Int, in payload: String) -> String {
 /// ```
 pub fn startup(in user: Str, in database: Str) -> String {
     var body = std::string::empty();
-    pg::bytes::put_i32(body, protocol_version());
+    db::bytes::put_i32(body, protocol_version());
 
-    pg::bytes::put_cstr(body, "user");
-    pg::bytes::put_cstr(body, user);
+    db::bytes::put_cstr(body, "user");
+    db::bytes::put_cstr(body, user);
 
     if std::str::len(database) > 0 {
-        pg::bytes::put_cstr(body, "database");
-        pg::bytes::put_cstr(body, database);
+        db::bytes::put_cstr(body, "database");
+        db::bytes::put_cstr(body, database);
     }
 
     // Ask the server for text-format dates we can parse deterministically and
     // announce ourselves, exactly as libpq does.
-    pg::bytes::put_cstr(body, "client_encoding");
-    pg::bytes::put_cstr(body, "UTF8");
-    pg::bytes::put_cstr(body, "application_name");
-    pg::bytes::put_cstr(body, "tuonelang");
+    db::bytes::put_cstr(body, "client_encoding");
+    db::bytes::put_cstr(body, "UTF8");
+    db::bytes::put_cstr(body, "application_name");
+    db::bytes::put_cstr(body, "tuonelang");
 
     // The terminating empty key.
     std::string::push_byte(body, 0);
 
     // Startup has no type byte: length then body.
     var out = std::string::empty();
-    pg::bytes::put_i32(out, std::string::len(body) + 4);
+    db::bytes::put_i32(out, std::string::len(body) + 4);
     std::string::append(out, std::string::as_str(body));
     out
 }
@@ -347,7 +347,7 @@ pub fn startup(in user: Str, in database: Str) -> String {
 /// ```
 pub fn query(in sql: Str) -> String {
     var body = std::string::empty();
-    pg::bytes::put_cstr(body, sql);
+    db::bytes::put_cstr(body, sql);
     finish(msg_query(), body)
 }
 
@@ -367,10 +367,10 @@ pub fn query(in sql: Str) -> String {
 /// ```
 pub fn parse(in name: Str, in sql: Str) -> String {
     var body = std::string::empty();
-    pg::bytes::put_cstr(body, name);
-    pg::bytes::put_cstr(body, sql);
+    db::bytes::put_cstr(body, name);
+    db::bytes::put_cstr(body, sql);
     // Int16 count of parameter type OIDs: zero = infer them all.
-    pg::bytes::put_i16(body, 0);
+    db::bytes::put_i16(body, 0);
     finish(msg_parse(), body)
 }
 
@@ -386,8 +386,8 @@ pub fn parse(in name: Str, in sql: Str) -> String {
 /// ```
 pub fn describe_statement(in name: Str) -> String {
     var body = std::string::empty();
-    pg::bytes::put_byte(body, 83); // 'S' — a statement, not a portal
-    pg::bytes::put_cstr(body, name);
+    db::bytes::put_byte(body, 83); // 'S' — a statement, not a portal
+    db::bytes::put_cstr(body, name);
     finish(msg_describe(), body)
 }
 
@@ -400,8 +400,8 @@ pub fn describe_statement(in name: Str) -> String {
 /// ```
 pub fn execute(in name: Str, take max_rows: Int) -> String {
     var body = std::string::empty();
-    pg::bytes::put_cstr(body, name);
-    pg::bytes::put_i32(body, max_rows);
+    db::bytes::put_cstr(body, name);
+    db::bytes::put_i32(body, max_rows);
     finish(msg_execute(), body)
 }
 
@@ -443,7 +443,7 @@ pub fn terminate() -> String {
 /// ```
 pub fn password(in secret: Str) -> String {
     var body = std::string::empty();
-    pg::bytes::put_cstr(body, secret);
+    db::bytes::put_cstr(body, secret);
     finish(msg_password(), body)
 }
 
@@ -461,9 +461,9 @@ pub fn password(in secret: Str) -> String {
 /// ```
 pub fn sasl_initial(in mechanism: Str, in client_first: Str) -> String {
     var body = std::string::empty();
-    pg::bytes::put_cstr(body, mechanism);
-    pg::bytes::put_i32(body, std::str::len(client_first));
-    pg::bytes::put_bytes(body, client_first);
+    db::bytes::put_cstr(body, mechanism);
+    db::bytes::put_i32(body, std::str::len(client_first));
+    db::bytes::put_bytes(body, client_first);
     finish(msg_password(), body)
 }
 
@@ -476,7 +476,7 @@ pub fn sasl_initial(in mechanism: Str, in client_first: Str) -> String {
 /// ```
 pub fn sasl_response(in payload: Str) -> String {
     var body = std::string::empty();
-    pg::bytes::put_bytes(body, payload);
+    db::bytes::put_bytes(body, payload);
     finish(msg_password(), body)
 }
 
@@ -497,7 +497,7 @@ pub fn type_of(in msg: String) -> Int {
 
 /// The length field a typed message declares.
 pub fn declared_len(in msg: String) -> Int {
-    pg::bytes::be_i32(msg, 1)
+    db::bytes::be_i32(msg, 1)
 }
 
 /// Does a typed message's declared length match the bytes actually present?
@@ -510,12 +510,12 @@ pub fn framing_ok(in msg: String) -> Bool {
 /// Does the untyped startup packet's length field match its real size?
 pub fn startup_framing_ok(in user: Str, in database: Str) -> Bool {
     let m = startup(user, database);
-    pg::bytes::be_i32(m, 0) == std::string::len(m)
+    db::bytes::be_i32(m, 0) == std::string::len(m)
 }
 
 /// The protocol version an encoded startup packet declares.
 pub fn startup_version(in user: Str, in database: Str) -> Int {
-    pg::bytes::be_i32(startup(user, database), 4)
+    db::bytes::be_i32(startup(user, database), 4)
 }
 
 spec startup {
