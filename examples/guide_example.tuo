@@ -1,0 +1,63 @@
+// guide_example — the complete program from `docs/VECTOR_GUIDE.md` §9.
+//
+// It lives here, compiled and run by `run-tests.sh --vector --live`, so the
+// guide cannot drift away from what the library actually does. The two must
+// stay byte-identical below the module line; if you change one, change both.
+//
+// Expected output:
+//
+//     red  1.000
+//     crimson  0.994
+//
+// `green` is filtered out by the 0.5 threshold, being orthogonal to the query.
+
+module notes;
+
+/// Build a 3-D vector. Real embeddings are pushed in a loop.
+fn v3(take a: Float, take b: Float, take c: Float) -> Array[Float] {
+    var xs = std::array::empty();
+    std::array::push(xs, a);
+    std::array::push(xs, b);
+    std::array::push(xs, c);
+    xs
+}
+
+fn main() -> Int {
+    let path = "/tmp/notes.tvec";
+
+    // Build and persist.
+    var store = vec::db::open(path, 3, vec::metric::metric_cosine());
+    if !vec::db::is_ok(store) {
+        let _ = std::rt::write_string(1, vec::db::error(store));
+        return 1;
+    }
+
+    let _ = vec::db::upsert(store, v3(1.0, 0.0, 0.0), "red", "a note about red");
+    let _ = vec::db::upsert(store, v3(0.0, 1.0, 0.0), "green", "a note about green");
+    let _ = vec::db::upsert(store, v3(0.9, 0.1, 0.0), "crimson", "a note about crimson");
+
+    if vec::db::save(store) < 0 {
+        let _ = std::rt::write(1, "could not save\n");
+        return 1;
+    }
+
+    // Reload from disk and search it.
+    var reloaded = vec::db::open(path, 3, vec::metric::metric_cosine());
+    if !vec::db::is_ok(reloaded) {
+        let _ = std::rt::write_string(1, vec::db::error(reloaded));
+        return 1;
+    }
+
+    let hits = vec::db::query_above(reloaded, v3(1.0, 0.0, 0.0), 5, 0.5);
+
+    var i = 0;
+    while i < vec::search::hit_count(hits) {
+        let line = vec::db::render_hit(reloaded, hits, i);
+        let _ = std::rt::write_string(1, line);
+        let _ = std::rt::write(1, "\n");
+        i = i + 1;
+    }
+
+    let _ = vec::disk::remove(path);
+    0
+}

@@ -1,0 +1,840 @@
+// vec::db — the front door: one collection, opened from a path, queried by text
+// or by vector.
+//
+// Every other module in this feature is a layer a serious caller may want to
+// reach into. This one exists so that the common case — open a collection, add
+// some embeddings, ask for the nearest few — is a handful of calls with no
+// ceremony, and so that a model writing tuonelang against this library has a
+// single obvious surface to target.
+//
+// WHY THIS LAYER IS SHAPED FOR CODE GENERATION.
+//
+// The constraint that shapes it is not performance, it is that v0 has no `?`,
+// no methods, no overloading, and a move checker that rejects reading a value
+// after it has been consumed. Every one of those turns a plausible-looking API
+// into a compile error. So this module follows three rules, and they are the
+// same three the PostgreSQL adapter follows:
+//
+//   1. **Nothing fallible returns a bare value.** `open` gives a `Db` that is
+//      valid or is not, and `is_ok` answers which — never a null, never a
+//      sentinel a caller might use by accident.
+//   2. **Inspect borrows; consume once.** `is_ok(db)` borrows. `unwrap(db)`
+//      consumes. That is the same shape as `pg::query::is_ok_result` /
+//      `unwrap_ok_result`, so a caller who has learned one has learned both.
+//   3. **Out-of-range is a value, not a trap.** Every accessor answers with an
+//      empty string, a zero, or a `-1` rather than aborting, because a
+//      generated program that indexes one past the end should produce a wrong
+//      answer a test can catch, not a dead process.
+//
+// The result is that the worked example in `docs/VECTORS.md` is about twenty
+// lines, and every line of it is checkable by the compiler.
+
+module vec::db;
+
+// ----------------------------------------------------------------------------
+// The handle.
+// ----------------------------------------------------------------------------
+
+/// An open collection: the rows in memory, the path they came from, and
+/// whether the open succeeded.
+pub struct Db {
+    store: vec::store::Store,
+    path: String,
+    ok: Bool,
+    error: String,
+}
+
+/// Open the collection at `path`, creating an empty one when the file is not
+/// there.
+///
+/// `dim` and `metric` describe the collection being created; when the file
+/// already exists **its** header wins, because the data on disk is the truth
+/// about its own shape. A mismatch is reported through `error` rather than
+/// silently reinterpreting the file.
+///
+/// # Example
+/// ```tuo
+/// // let db = vec::db::open("/tmp/docs.tvec", 384, vec::metric::metric_cosine());
+/// ```
+pub fn open(in path: Str, take dim: Int, take metric: Int) -> Db {
+    if !vec::disk::exists(path) {
+        Db { store: vec::store::empty(dim, metric), path: std::string::from_str(path), ok: true, error: std::string::empty() }
+    } else {
+        // The header check and the body decode are separate functions because
+        // each ends up *owning* the string it reports. v0 keeps no hidden drop
+        // flags, so a `String` moved into a struct on one branch and left alive
+        // on another has no statically known state at the join (O0008) — and
+        // the cure is a path that always consumes what it created.
+        let bytes = vec::disk::read_bytes(path);
+        let why = vec::codec::header_error(bytes);
+        if std::string::len(why) > 0 {
+            failed(path, dim, metric, why)
+        } else {
+            // `why` is consumed here too — it is empty on this path, and the
+            // move checker requires every path to dispose of it.
+            opened(path, dim, metric, vec::codec::decode(bytes), why)
+        }
+    }
+}
+
+/// A handle reporting a failed open, taking ownership of the reason.
+///
+/// # Example
+/// ```tuo
+/// // let db = vec::db::failed("/tmp/x.tvec", 3, 1, why);
+/// ```
+pub fn failed(in path: Str, take dim: Int, take metric: Int, take why: String) -> Db {
+    Db { store: vec::store::empty(dim, metric), path: std::string::from_str(path), ok: false, error: why }
+}
+
+/// A handle over a decoded store, checking its dimension **and metric** against
+/// the request.
+///
+/// # Example
+/// ```tuo
+/// // let db = vec::db::opened("/tmp/x.tvec", 3, 1, store, std::string::empty());
+/// ```
+pub fn opened(in path: Str, take dim: Int, take metric: Int, take loaded: vec::store::Store, take spent: String) -> Db {
+    // `spent` is the (empty) header-error string from the caller's other
+    // branch; taking it here is what gives `open` a move on every path.
+    let _ = std::string::len(spent);
+    let found_dim = vec::store::dim(loaded);
+    let found_metric = vec::store::metric(loaded);
+    if found_dim == dim && found_metric != metric {
+        // The dimension agrees but the metric does not. This has to be an
+        // error rather than a silent adoption of the file's metric: the two
+        // rank in *opposite directions* (cosine is higher-is-closer, L2 is
+        // lower-is-closer), and a cosine store keeps its vectors normalized
+        // while an L2 one deliberately does not. Quietly serving the file's
+        // metric would hand back confidently ordered, wrong results.
+        var msg = std::string::from_str("metric mismatch: the file was written for ");
+        std::string::append(msg, vec::metric::metric_name(found_metric));
+        std::string::append(msg, ", but ");
+        std::string::append(msg, vec::metric::metric_name(metric));
+        std::string::append(msg, " was requested");
+        Db { store: loaded, path: std::string::from_str(path), ok: false, error: msg }
+    } else if found_dim == dim {
+        Db { store: loaded, path: std::string::from_str(path), ok: true, error: std::string::empty() }
+    } else {
+        var msg = std::string::from_str("dimension mismatch: the file holds ");
+        let found_text = render_int(found_dim);
+        std::string::append(msg, std::string::as_str(found_text));
+        std::string::append(msg, "-dimensional vectors, but ");
+        let want_text = render_int(dim);
+        std::string::append(msg, std::string::as_str(want_text));
+        std::string::append(msg, " was requested");
+        // The file's own shape is kept, so a caller can still inspect what it
+        // actually holds rather than being handed an empty store.
+        Db { store: loaded, path: std::string::from_str(path), ok: false, error: msg }
+    }
+}
+
+/// A collection held only in memory, with no file behind it.
+///
+/// `save` on this is a no-op that reports `0`, so a program can be written
+/// against one API and choose persistence at open time.
+///
+/// # Example
+/// ```tuo
+/// let db = vec::db::in_memory(3, vec::metric::metric_cosine());
+/// ```
+pub fn in_memory(take dim: Int, take metric: Int) -> Db {
+    Db { store: vec::store::empty(dim, metric), path: std::string::empty(), ok: true, error: std::string::empty() }
+}
+
+/// Did the collection open cleanly?
+///
+/// **Borrows** — call it before anything that consumes the handle.
+///
+/// # Example
+/// ```tuo
+/// // if !vec::db::is_ok(db) { .. }
+/// ```
+pub fn is_ok(in d: Db) -> Bool {
+    d.ok
+}
+
+/// Why the collection did not open, or `""` when it did.
+///
+/// # Example
+/// ```tuo
+/// // let why = vec::db::error(db);
+/// ```
+pub fn error(in d: Db) -> String {
+    std::string::from_str(std::string::as_str(d.error))
+}
+
+/// The open failure as a typed `db::error::PgError`, for a caller that already
+/// branches on error kinds elsewhere in this library.
+///
+/// # Example
+/// ```tuo
+/// // let e = vec::db::as_error(db);
+/// ```
+pub fn as_error(in d: Db) -> db::error::PgError {
+    db::error::new(db::error::kind_decode(), std::string::as_str(d.error))
+}
+
+/// The path this collection loads from and saves to, or `""` when in-memory.
+///
+/// # Example
+/// ```tuo
+/// // let p = vec::db::path(db);
+/// ```
+pub fn path(in d: Db) -> String {
+    std::string::from_str(std::string::as_str(d.path))
+}
+
+/// How many vectors the collection holds.
+///
+/// # Example
+/// ```tuo
+/// // let n = vec::db::count(db);
+/// ```
+pub fn count(in d: Db) -> Int {
+    vec::store::live_count(d.store)
+}
+
+/// The dimensionality this collection stores.
+///
+/// # Example
+/// ```tuo
+/// // let n = vec::db::dim(db);
+/// ```
+pub fn dim(in d: Db) -> Int {
+    vec::store::dim(d.store)
+}
+
+/// The metric this collection ranks by.
+///
+/// # Example
+/// ```tuo
+/// // let m = vec::db::metric(db);
+/// ```
+pub fn metric(in d: Db) -> Int {
+    vec::store::metric(d.store)
+}
+
+// ----------------------------------------------------------------------------
+// Writing.
+// ----------------------------------------------------------------------------
+
+/// Add one vector with its id and payload. Returns the row, or `-1` when the
+/// vector is not `dim` long.
+///
+/// The payload is whatever a caller wants back at query time — the source text
+/// is the usual choice, which is what makes this enough to build retrieval on
+/// without a second store to join against.
+///
+/// # Example
+/// ```tuo
+/// // let row = vec::db::add(db, embedding, "doc-1", "the text");
+/// ```
+pub fn add(mut d: Db, take v: Array[Float], in id: Str, in payload: Str) -> Int {
+    vec::store::add(d.store, v, id, payload)
+}
+
+/// Add a vector, replacing any existing row with the same id.
+///
+/// The replaced row becomes a tombstone, so this is an upsert in behaviour and
+/// an append in cost.
+///
+/// # Example
+/// ```tuo
+/// // let row = vec::db::upsert(db, embedding, "doc-1", "the text");
+/// ```
+pub fn upsert(mut d: Db, take v: Array[Float], in id: Str, in payload: Str) -> Int {
+    // Locate the incumbent *before* inserting, and remove it *by row* after.
+    //
+    // Both of the obvious orderings are wrong. Removing first loses the
+    // existing row when `add` then rejects the replacement (a wrong-length or
+    // non-finite vector), reporting -1 as though nothing had happened.
+    // Removing by *id* afterwards is worse: with no incumbent, the first live
+    // match is the row `add` just appended, so a brand-new id is inserted and
+    // immediately tombstoned — while still returning a row index that reads
+    // as success.
+    //
+    // Capturing the row index first makes the removal unambiguous: it names
+    // the one row that existed beforehand, or nothing at all.
+    let previous = vec::store::row_of_id(d.store, id);
+    let row = vec::store::add(d.store, v, id, payload);
+    if row >= 0 && previous >= 0 {
+        let _ = vec::store::remove(d.store, previous);
+    }
+    row
+}
+
+/// Remove the row with this id. Returns `true` when one went away.
+///
+/// # Example
+/// ```tuo
+/// // let gone = vec::db::remove(db, "doc-1");
+/// ```
+pub fn remove(mut d: Db, in id: Str) -> Bool {
+    vec::store::remove_id(d.store, id)
+}
+
+/// Does the collection hold this id?
+///
+/// # Example
+/// ```tuo
+/// // let there = vec::db::contains(db, "doc-1");
+/// ```
+pub fn contains(in d: Db, in id: Str) -> Bool {
+    vec::store::contains(d.store, id)
+}
+
+/// Write the collection to its path. Returns the byte count, `0` for an
+/// in-memory collection, or a negative value on failure.
+///
+/// # Example
+/// ```tuo
+/// // let n = vec::db::save(db);
+/// ```
+pub fn save(in d: Db) -> Int {
+    if std::string::len(d.path) == 0 {
+        0
+    } else {
+        vec::disk::save_verified(d.store, std::string::as_str(d.path))
+    }
+}
+
+/// Write the collection to an explicit `path`, whatever it was opened from.
+///
+/// This is what an in-memory collection uses to become a file, and what a
+/// caller uses to write a snapshot beside the original. Returns the byte count
+/// or a negative value on failure.
+///
+/// # Example
+/// ```tuo
+/// // let n = vec::db::save_as(db, "/tmp/snapshot.tvec");
+/// ```
+pub fn save_as(in d: Db, in path: Str) -> Int {
+    vec::disk::save_verified(d.store, path)
+}
+
+// ----------------------------------------------------------------------------
+// Querying.
+// ----------------------------------------------------------------------------
+
+/// The `k` nearest rows to `query`.
+///
+/// # Example
+/// ```tuo
+/// // let hits = vec::db::query(db, embedding, 5);
+/// ```
+pub fn query(in d: Db, take v: Array[Float], take k: Int) -> vec::search::Hits {
+    vec::search::search(d.store, v, k)
+}
+
+/// The `k` nearest rows to `query` that also clear `threshold`.
+///
+/// # Example
+/// ```tuo
+/// // let hits = vec::db::query_above(db, embedding, 5, 0.75);
+/// ```
+pub fn query_above(in d: Db, take v: Array[Float], take k: Int, take threshold: Float) -> vec::search::Hits {
+    vec::search::search_threshold(d.store, v, k, threshold)
+}
+
+/// The id behind hit `i` of `hits`.
+///
+/// Hits carry row indices; this is what turns one back into the id a caller
+/// gave at insert time, so a caller never has to touch a row number.
+///
+/// # Example
+/// ```tuo
+/// // let id = vec::db::hit_id(db, hits, 0);
+/// ```
+pub fn hit_id(in d: Db, in hits: vec::search::Hits, take i: Int) -> String {
+    vec::store::id_at(d.store, vec::search::hit_row(hits, i))
+}
+
+/// The payload behind hit `i` of `hits`.
+///
+/// # Example
+/// ```tuo
+/// // let text = vec::db::hit_payload(db, hits, 0);
+/// ```
+pub fn hit_payload(in d: Db, in hits: vec::search::Hits, take i: Int) -> String {
+    vec::store::payload_at(d.store, vec::search::hit_row(hits, i))
+}
+
+/// The stored vector behind hit `i` of `hits`.
+///
+/// # Example
+/// ```tuo
+/// // let v = vec::db::hit_vector(db, hits, 0);
+/// ```
+pub fn hit_vector(in d: Db, in hits: vec::search::Hits, take i: Int) -> Array[Float] {
+    vec::store::vector_at(d.store, vec::search::hit_row(hits, i))
+}
+
+/// The id at row `row`, for iterating the collection directly.
+///
+/// # Example
+/// ```tuo
+/// // let id = vec::db::id_at(db, 0);
+/// ```
+pub fn id_at(in d: Db, take row: Int) -> String {
+    vec::store::id_at(d.store, row)
+}
+
+/// The payload at row `row`.
+///
+/// # Example
+/// ```tuo
+/// // let text = vec::db::payload_at(db, 0);
+/// ```
+pub fn payload_at(in d: Db, take row: Int) -> String {
+    vec::store::payload_at(d.store, row)
+}
+
+/// The number of rows including tombstones — the bound for a `row` loop.
+///
+/// # Example
+/// ```tuo
+/// // while i < vec::db::row_bound(db) { .. }
+/// ```
+pub fn row_bound(in d: Db) -> Int {
+    vec::store::count(d.store)
+}
+
+/// Is row `row` present rather than removed?
+///
+/// # Example
+/// ```tuo
+/// // if vec::db::is_live(db, i) { .. }
+/// ```
+pub fn is_live(in d: Db, take row: Int) -> Bool {
+    vec::store::is_live(d.store, row)
+}
+
+// ----------------------------------------------------------------------------
+// Rendering.
+// ----------------------------------------------------------------------------
+
+/// An integer as decimal text.
+///
+/// There is no `std::str::format` reachable from a user package, so a library
+/// that wants to build a message builds its own digits.
+///
+/// # Example
+/// ```tuo
+/// let s = vec::db::render_int(42); // "42"
+/// ```
+pub fn render_int(take n: Int) -> String {
+    if n == 0 {
+        std::string::from_str("0")
+    } else {
+        var digits = std::string::empty();
+        // `0 - n` overflows for Int64::MIN, and overflow traps. Peel the last
+        // digit off the negative side first so the negation is always safe.
+        var v = if n < 0 {
+            0 - (n / 10)
+        } else {
+            n / 10
+        };
+        let last = if n < 0 {
+            0 - (n % 10)
+        } else {
+            n % 10
+        };
+        std::string::push_byte(digits, 48 + last);
+        while v > 0 {
+            std::string::push_byte(digits, 48 + v % 10);
+            v = v / 10;
+        }
+        var out = std::string::empty();
+        if n < 0 {
+            std::string::push_byte(out, 45);
+        }
+        var i = std::string::len(digits) - 1;
+        while i >= 0 {
+            std::string::push_byte(out, std::string::byte_at(digits, i));
+            i = i - 1;
+        }
+        out
+    }
+}
+
+/// A float as text with three decimal places, for printing a score.
+///
+/// # Example
+/// ```tuo
+/// let s = vec::db::render_score(0.75); // "0.750"
+/// ```
+pub fn render_score(take x: Float) -> String {
+    // Anything past this is not a score worth printing digit by digit, and
+    // trying to would trap: `f as Int` **saturates**, so a large `x` drives
+    // both `whole` and the rounding carry to Int64::MAX and their sum
+    // overflows — and integer overflow in v0 is a hard abort, not a wrap.
+    //
+    // This is reachable through ordinary use: `vec::search::hit_score` answers
+    // an out-of-range index with `vec::metric::worst_score`, which is +-1e300.
+    // Rendering one hit past the end of a result set must not kill the process.
+    if db::math::is_nan(x) {
+        std::string::from_str("nan")
+    } else if x > render_limit() {
+        std::string::from_str("+inf")
+    } else if x < 0.0 - render_limit() {
+        std::string::from_str("-inf")
+    } else {
+        var out = std::string::empty();
+        let negative = x < 0.0;
+        let m = db::math::abs_f(x);
+        let whole = m as Int;
+        // Round the fraction to three places rather than truncating, so 0.9999
+        // renders as 1.000 and not 0.999.
+        let thousandths = ((m - (whole as Float)) * 1000.0 + 0.5) as Int;
+        let carry = thousandths / 1000;
+        let frac = thousandths % 1000;
+        if negative {
+            std::string::push_byte(out, 45);
+        }
+        let digits = render_int(whole + carry);
+        std::string::append(out, std::string::as_str(digits));
+        std::string::push_byte(out, 46);
+        std::string::push_byte(out, 48 + frac / 100);
+        std::string::push_byte(out, 48 + frac / 10 % 10);
+        std::string::push_byte(out, 48 + frac % 10);
+        out
+    }
+}
+
+/// The largest magnitude `render_score` spells out in digits.
+///
+/// Well inside the range where `whole + carry` can overflow an `Int`, and far
+/// past any score a real metric produces: a cosine similarity is in [-1, 1] and
+/// a squared L2 distance over sane vectors is many orders below this.
+///
+/// # Example
+/// ```tuo
+/// let cap = vec::db::render_limit();
+/// ```
+pub fn render_limit() -> Float {
+    1000000000000.0
+}
+
+/// One hit as `"<id>  <score>"`, the line a search result usually becomes.
+///
+/// # Example
+/// ```tuo
+/// // let line = vec::db::render_hit(db, hits, 0);
+/// ```
+pub fn render_hit(in d: Db, in hits: vec::search::Hits, take i: Int) -> String {
+    var out = std::string::empty();
+    let id = hit_id(d, hits, i);
+    std::string::append(out, std::string::as_str(id));
+    std::string::append(out, "  ");
+    std::string::append(out, std::string::as_str(render_score(vec::search::hit_score(hits, i))));
+    out
+}
+
+// ----------------------------------------------------------------------------
+// Spec helpers.
+//
+// The pure parts of this module — the renderers, and the in-memory collection
+// behaviours — are spec-checked here. Everything touching a file is exercised
+// by `examples/vector_check.tuo` instead, because a spec cannot open one.
+// ----------------------------------------------------------------------------
+
+/// Spec helper: a 2-D vector.
+pub fn v2(take a: Float, take b: Float) -> Array[Float] {
+    var xs = std::array::empty();
+    std::array::push(xs, a);
+    std::array::push(xs, b);
+    xs
+}
+
+/// Spec helper: an in-memory collection with three rows.
+pub fn fixture() -> Db {
+    var d = in_memory(2, vec::metric::metric_cosine());
+    let _ = add(d, v2(1.0, 0.0), "east", "the east document");
+    let _ = add(d, v2(0.0, 1.0), "north", "the north document");
+    let _ = add(d, v2(1.0, 1.0), "northeast", "the northeast document");
+    d
+}
+
+/// Spec helper: `render_int` as a comparable `Str`.
+pub fn render_int_is(take n: Int, in expect: Str) -> Bool {
+    let s = render_int(n);
+    std::string::as_str(s) == expect
+}
+
+/// Spec helper: `render_score` as a comparable `Str`.
+pub fn render_score_is(take x: Float, in expect: Str) -> Bool {
+    let s = render_score(x);
+    std::string::as_str(s) == expect
+}
+
+/// Spec helper: the count of the fixture.
+pub fn fixture_count() -> Int {
+    count(fixture())
+}
+
+/// Spec helper: the id of the best hit for a due-east query.
+pub fn best_id_is(in expect: Str) -> Bool {
+    let d = fixture();
+    let hits = query(d, v2(1.0, 0.0), 3);
+    let id = hit_id(d, hits, 0);
+    std::string::as_str(id) == expect
+}
+
+/// Spec helper: the payload of the best hit for a due-east query.
+pub fn best_payload_is(in expect: Str) -> Bool {
+    let d = fixture();
+    let hits = query(d, v2(1.0, 0.0), 3);
+    let p = hit_payload(d, hits, 0);
+    std::string::as_str(p) == expect
+}
+
+/// Spec helper: the rendered best hit line.
+pub fn best_line_is(in expect: Str) -> Bool {
+    let d = fixture();
+    let hits = query(d, v2(1.0, 0.0), 3);
+    let line = render_hit(d, hits, 0);
+    std::string::as_str(line) == expect
+}
+
+/// Spec helper: the count after upserting an existing id.
+pub fn count_after_upsert() -> Int {
+    var d = fixture();
+    let _ = upsert(d, v2(0.0, 0.0 - 1.0), "east", "replaced");
+    count(d)
+}
+
+/// Spec helper: the payload of an upserted id.
+pub fn upserted_payload_is(in expect: Str) -> Bool {
+    var d = fixture();
+    let _ = upsert(d, v2(0.0, 0.0 - 1.0), "east", "replaced");
+    let hits = query(d, v2(0.0, 0.0 - 1.0), 1);
+    let p = hit_payload(d, hits, 0);
+    std::string::as_str(p) == expect
+}
+
+/// Spec helper: the count after removing an id.
+pub fn count_after_remove() -> Int {
+    var d = fixture();
+    let _ = remove(d, "north");
+    count(d)
+}
+
+/// Spec helper: is an id still present after removal?
+pub fn contains_after_remove() -> Bool {
+    var d = fixture();
+    let _ = remove(d, "north");
+    contains(d, "north")
+}
+
+/// Spec helper: adding a wrong-length vector is refused.
+pub fn add_wrong_length() -> Int {
+    var d = fixture();
+    var v = std::array::empty();
+    std::array::push(v, 1.0);
+    add(d, v, "bad", "")
+}
+
+/// Spec helper: an in-memory collection is ok and has no error.
+pub fn in_memory_is_clean() -> Bool {
+    let d = fixture();
+    let clean = std::string::len(error(d)) == 0;
+    is_ok(d) && clean
+}
+
+spec render_int {
+    then render_int_is(0, "0");
+    then render_int_is(1, "1");
+    then render_int_is(42, "42");
+    then render_int_is(1000, "1000");
+    then render_int_is(0 - 7, "-7");
+    then render_int_is(0 - 1234, "-1234");
+}
+
+spec render_score {
+    then render_score_is(0.0, "0.000");
+    then render_score_is(1.0, "1.000");
+    then render_score_is(0.5, "0.500");
+    then render_score_is(0.75, "0.750");
+    then render_score_is(0.7071067811865475, "0.707");
+    then render_score_is(0.0 - 1.0, "-1.000");
+    // Rounding, not truncation: 0.9999 is nearer to 1.000 than to 0.999.
+    then render_score_is(0.9999, "1.000");
+    then render_score_is(12.3456, "12.346");
+}
+
+spec in_memory {
+    then fixture_count() == 3;
+    then in_memory_is_clean();
+    then dim(fixture()) == 2;
+    then metric(fixture()) == vec::metric::metric_cosine();
+}
+
+spec query {
+    then best_id_is("east");
+    then best_payload_is("the east document");
+    // The rendered line is what a caller prints, so its exact shape is pinned.
+    then best_line_is("east  1.000");
+}
+
+spec upsert {
+    // An upsert replaces rather than duplicates, so the count does not grow.
+    then count_after_upsert() == 3;
+    then upserted_payload_is("replaced");
+}
+
+spec remove {
+    then count_after_remove() == 2;
+    then !contains_after_remove();
+}
+
+spec add {
+    then add_wrong_length() == 0 - 1;
+}
+
+/// Spec helper: a rejected upsert must leave the existing row alone.
+///
+/// The wrong-dimension embedding is the commonest client error against a
+/// vector store, so "the replacement was refused" must never mean "the
+/// original was deleted".
+pub fn rejected_upsert_keeps_row() -> Bool {
+    var d = in_memory(2, vec::metric::metric_dot());
+    let _ = add(d, v2(1.0, 2.0), "doc", "original");
+    var bad = std::array::empty();
+    std::array::push(bad, 1.0);
+    let rc = upsert(d, bad, "doc", "replacement");
+    let kept = contains(d, "doc");
+    rc == 0 - 1 && kept
+}
+
+/// Spec helper: the payload after a rejected upsert — still the original.
+pub fn rejected_upsert_payload_is(in expect: Str) -> Bool {
+    var d = in_memory(2, vec::metric::metric_dot());
+    let _ = add(d, v2(1.0, 2.0), "doc", "original");
+    var bad = std::array::empty();
+    std::array::push(bad, 1.0);
+    let _ = upsert(d, bad, "doc", "replacement");
+    let hits = query(d, v2(1.0, 2.0), 1);
+    let p = hit_payload(d, hits, 0);
+    std::string::as_str(p) == expect
+}
+
+/// Spec helper: the live count after a successful upsert stays put.
+pub fn accepted_upsert_count() -> Int {
+    var d = in_memory(2, vec::metric::metric_dot());
+    let _ = add(d, v2(1.0, 2.0), "doc", "original");
+    let _ = upsert(d, v2(3.0, 4.0), "doc", "replacement");
+    count(d)
+}
+
+/// Spec helper: `render_score` on a value past `render_limit`.
+pub fn render_score_saturates(take x: Float, in expect: Str) -> Bool {
+    let s = render_score(x);
+    std::string::as_str(s) == expect
+}
+
+/// Spec helper: rendering a hit one past the end must not trap.
+///
+/// `vec::search::hit_score` answers an out-of-range index with
+/// `vec::metric::worst_score`, which is +-1e300 — so this is the ordinary
+/// off-by-one, and it must produce text rather than kill the process.
+pub fn render_hit_past_end_is_safe() -> Bool {
+    var d = in_memory(2, vec::metric::metric_cosine());
+    let _ = add(d, v2(1.0, 0.0), "a", "only");
+    let hits = query(d, v2(1.0, 0.0), 3);
+    let line = render_hit(d, hits, 5);
+    std::string::len(line) > 0
+}
+
+spec "a rejected upsert does not destroy the existing row" {
+    then rejected_upsert_keeps_row();
+    then rejected_upsert_payload_is("original");
+    // A successful upsert still replaces rather than duplicating.
+    then accepted_upsert_count() == 1;
+}
+
+spec "render_score saturates rather than trapping" {
+    // `f as Int` saturates, so a large value would overflow `whole + carry`,
+    // and integer overflow in v0 is an abort.
+    then render_score_saturates(1.0e300, "+inf");
+    then render_score_saturates(0.0 - 1.0e300, "-inf");
+    then render_score_saturates(0.0 / 0.0, "nan");
+    // Ordinary scores are unaffected.
+    then render_score_saturates(0.707, "0.707");
+    then render_score_saturates(0.0, "0.000");
+    then render_hit_past_end_is_safe();
+}
+
+spec "render_int handles the extreme negative" {
+    // `0 - n` overflows for Int64::MIN, which traps.
+    then render_int_is(0 - 9223372036854775807 - 1, "-9223372036854775808");
+    then render_int_is(0 - 9223372036854775807, "-9223372036854775807");
+    then render_int_is(9223372036854775807, "9223372036854775807");
+}
+
+/// Spec helper: a handle built by `opened` directly, so the header checks can
+/// be spec-tested without touching a file.
+pub fn opened_is_ok(take file_dim: Int, take file_metric: Int, take want_dim: Int, take want_metric: Int) -> Bool {
+    let store = vec::store::empty(file_dim, file_metric);
+    let d = opened("/x", want_dim, want_metric, store, std::string::empty());
+    is_ok(d)
+}
+
+/// Spec helper: the error text `opened` produces for a mismatch.
+pub fn opened_error_is(take file_dim: Int, take file_metric: Int, take want_dim: Int, take want_metric: Int, in expect: Str) -> Bool {
+    let store = vec::store::empty(file_dim, file_metric);
+    let d = opened("/x", want_dim, want_metric, store, std::string::empty());
+    let e = error(d);
+    std::string::as_str(e) == expect
+}
+
+spec opened {
+    // Matching shape opens cleanly.
+    then opened_is_ok(3, vec::metric::metric_cosine(), 3, vec::metric::metric_cosine());
+    then opened_is_ok(3, vec::metric::metric_l2(), 3, vec::metric::metric_l2());
+    // A metric mismatch is refused: cosine and l2 rank in opposite directions,
+    // so adopting the file's metric silently would return confidently ordered,
+    // wrong results.
+    then !opened_is_ok(3, vec::metric::metric_l2(), 3, vec::metric::metric_cosine());
+    then !opened_is_ok(3, vec::metric::metric_cosine(), 3, vec::metric::metric_dot());
+    then opened_error_is(3, vec::metric::metric_l2(), 3, vec::metric::metric_cosine(), "metric mismatch: the file was written for l2, but cosine was requested");
+    // A dimension mismatch is still refused.
+    then !opened_is_ok(4, vec::metric::metric_cosine(), 3, vec::metric::metric_cosine());
+    then opened_error_is(4, vec::metric::metric_cosine(), 3, vec::metric::metric_cosine(), "dimension mismatch: the file holds 4-dimensional vectors, but 3 was requested");
+}
+
+/// Spec helper: upserting an id that is not present yet must insert it.
+pub fn upsert_new_id_count() -> Int {
+    var d = in_memory(2, vec::metric::metric_dot());
+    let _ = upsert(d, v2(1.0, 0.0), "doc", "p");
+    count(d)
+}
+
+/// Spec helper: upserting a new id alongside an existing different one.
+pub fn upsert_second_id_count() -> Int {
+    var d = in_memory(2, vec::metric::metric_dot());
+    let _ = add(d, v2(1.0, 0.0), "a", "pa");
+    let _ = upsert(d, v2(0.0, 1.0), "b", "pb");
+    count(d)
+}
+
+/// Spec helper: three upserts of one id leave one row carrying the newest.
+pub fn upsert_thrice_payload_is(in expect: Str) -> Bool {
+    var d = in_memory(2, vec::metric::metric_dot());
+    let _ = upsert(d, v2(1.0, 0.0), "doc", "v1");
+    let _ = upsert(d, v2(2.0, 0.0), "doc", "v2");
+    let _ = upsert(d, v2(3.0, 0.0), "doc", "v3");
+    let hits = query(d, v2(1.0, 0.0), 5);
+    let p = hit_payload(d, hits, 0);
+    let one = vec::search::hit_count(hits) == 1;
+    one && std::string::as_str(p) == expect
+}
+
+spec upsert {
+    // Removing by id *after* adding would tombstone the row just appended
+    // whenever no incumbent existed — losing every newly upserted id while
+    // still returning a row index that reads as success.
+    then upsert_new_id_count() == 1;
+    then upsert_second_id_count() == 2;
+    then upsert_thrice_payload_is("v3");
+}

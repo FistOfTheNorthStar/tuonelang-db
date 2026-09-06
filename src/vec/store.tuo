@@ -1,0 +1,708 @@
+// vec::store — an in-memory collection of vectors, their ids, and their payloads.
+//
+// A `Store` is the whole database in one value: the vectors laid out end to end
+// in a single `Array[Float]`, plus one id and one payload string per row. It is
+// the vector-space counterpart of `pg::query::ResultSet`, and it makes the same
+// structural choice for the same reason — v0 has no nested arrays, so a
+// row-major block plus a stride is the honest representation of a matrix.
+//
+//   vectors: [ v0_0 v0_1 ... v0_{D-1} | v1_0 v1_1 ... v1_{D-1} | ... ]
+//   ids:     [ "doc-0"                | "doc-1"                | ... ]
+//   payloads:[ "the text of doc 0"    | "the text of doc 1"    | ... ]
+//
+// Row `i` occupies `[i * dim, i * dim + dim)`. That single invariant is what
+// every other module in this feature relies on, and `is_consistent` below is
+// the predicate that states it.
+//
+// WHY VECTORS ARE NORMALIZED ON THE WAY IN.
+//
+// `add` scales each vector to unit length when the store's metric is cosine,
+// which makes a cosine query a bare dot product (see `vec::metric`). It is done
+// once here, at insert, rather than at every comparison — for a corpus searched
+// more than once, that is the difference between O(N) square roots per query
+// and none at all.
+//
+// The cost is that a stored vector is not byte-identical to the one handed in.
+// That is stated rather than hidden: `add` normalizes, `vector_at` returns what
+// is stored, and a store built with `metric_dot` or `metric_l2` does not
+// normalize at all, because for those metrics magnitude is information.
+//
+// DELETION IS A TOMBSTONE.
+//
+// `remove` marks a row dead rather than compacting the arrays, because
+// compaction would move every subsequent row and invalidate every index a
+// caller is holding. A dead row is skipped by search and by iteration, and
+// `compact` rebuilds the store without them when the caller decides the space
+// matters more than the stability of the indices.
+
+module vec::store;
+
+// ----------------------------------------------------------------------------
+// The value.
+// ----------------------------------------------------------------------------
+
+/// A collection of equal-length vectors with string ids and payloads.
+///
+/// `live` parallels the rows: `1` for a present row, `0` for a tombstone.
+pub struct Store {
+    dim: Int,
+    metric: Int,
+    count: Int,
+    vectors: Array[Float],
+    ids: Array[String],
+    payloads: Array[String],
+    live: Array[Int],
+}
+
+/// A new, empty store of `dim`-dimensional vectors compared by `metric`.
+///
+/// An unknown metric falls back to cosine rather than failing, so a store is
+/// always usable; `vec::metric::is_metric` is how a caller checks first.
+///
+/// # Example
+/// ```tuo
+/// let s = vec::store::empty(3, vec::metric::metric_cosine());
+/// ```
+pub fn empty(take dim: Int, take metric: Int) -> Store {
+    let m = if vec::metric::is_metric(metric) {
+        metric
+    } else {
+        vec::metric::metric_cosine()
+    };
+    let d = if dim > 0 {
+        dim
+    } else {
+        1
+    };
+    Store { dim: d, metric: m, count: 0, vectors: std::array::empty(), ids: std::array::empty(), payloads: std::array::empty(), live: std::array::empty() }
+}
+
+// ----------------------------------------------------------------------------
+// Accessors.
+// ----------------------------------------------------------------------------
+
+/// The dimensionality of every vector in the store.
+///
+/// # Example
+/// ```tuo
+/// let d = vec::store::dim(vec::store::empty(3, 1)); // 3
+/// ```
+pub fn dim(in s: Store) -> Int {
+    s.dim
+}
+
+/// The metric this store ranks by.
+///
+/// # Example
+/// ```tuo
+/// let m = vec::store::metric(vec::store::empty(3, 2)); // metric_l2
+/// ```
+pub fn metric(in s: Store) -> Int {
+    s.metric
+}
+
+/// The number of rows, **including tombstones**. This is the bound for a loop
+/// over row indices; use `live_count` for the number of rows a search will see.
+///
+/// # Example
+/// ```tuo
+/// let n = vec::store::count(vec::store::empty(3, 1)); // 0
+/// ```
+pub fn count(in s: Store) -> Int {
+    s.count
+}
+
+/// The number of rows that are not tombstones.
+///
+/// # Example
+/// ```tuo
+/// let n = vec::store::live_count(vec::store::empty(3, 1)); // 0
+/// ```
+pub fn live_count(in s: Store) -> Int {
+    var n = 0;
+    var i = 0;
+    while i < s.count {
+        if std::array::get(s.live, i) == 1 {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    n
+}
+
+/// Is row `row` present (not a tombstone and in range)?
+///
+/// # Example
+/// ```tuo
+/// // let ok = vec::store::is_live(s, 0);
+/// ```
+pub fn is_live(in s: Store, take row: Int) -> Bool {
+    if row < 0 || row >= s.count {
+        false
+    } else {
+        std::array::get(s.live, row) == 1
+    }
+}
+
+/// The offset of row `row` in the flat vector block — `row * dim`, or `-1`
+/// when `row` is out of range.
+///
+/// This is the one place the row-major invariant is written down, so nothing
+/// else has to open-code the multiplication.
+///
+/// # Example
+/// ```tuo
+/// // let at = vec::store::offset_of(s, 2);
+/// ```
+pub fn offset_of(in s: Store, take row: Int) -> Int {
+    // Clamped rather than multiplied blindly: integer overflow traps in v0, so
+    // an absurd `row` would abort the process from the one function that is
+    // documented as *the* place the row-major invariant lives.
+    if row < 0 || row > s.count {
+        0 - 1
+    } else {
+        row * s.dim
+    }
+}
+
+/// The id of row `row`, or `""` when the row is out of range.
+///
+/// # Example
+/// ```tuo
+/// // let id = vec::store::id_at(s, 0);
+/// ```
+pub fn id_at(in s: Store, take row: Int) -> String {
+    if row < 0 || row >= s.count {
+        std::string::empty()
+    } else {
+        std::string::from_str(std::string::as_str(std::array::get(s.ids, row)))
+    }
+}
+
+/// The payload of row `row`, or `""` when the row is out of range.
+///
+/// # Example
+/// ```tuo
+/// // let text = vec::store::payload_at(s, 0);
+/// ```
+pub fn payload_at(in s: Store, take row: Int) -> String {
+    if row < 0 || row >= s.count {
+        std::string::empty()
+    } else {
+        std::string::from_str(std::string::as_str(std::array::get(s.payloads, row)))
+    }
+}
+
+/// Component `c` of row `row`, or `0.0` when either index is out of range.
+///
+/// # Example
+/// ```tuo
+/// // let x = vec::store::component_at(s, 0, 1);
+/// ```
+pub fn component_at(in s: Store, take row: Int, take c: Int) -> Float {
+    if row < 0 || row >= s.count || c < 0 || c >= s.dim {
+        0.0
+    } else {
+        std::array::get(s.vectors, row * s.dim + c)
+    }
+}
+
+/// Score row `row` of this store against `q` under `metric`, without copying.
+///
+/// This lives here, rather than in `vec::search` where it is called, for one
+/// reason: the flat block is a private field, and a borrow of it cannot leave
+/// the module (v0 has no borrowing return type — a `block(s) -> Array[Float]`
+/// accessor would have to *copy* the entire corpus on every call, which for a
+/// scan is O(N * D) of pure waste per query).
+///
+/// So the kernel comes to the data instead. The store hands `vec::metric` a
+/// borrow of its own block, and a search over N rows allocates nothing at all.
+///
+/// # Example
+/// ```tuo
+/// // let s = vec::store::score_row_at(store, 0, q, vec::metric::metric_cosine());
+/// ```
+pub fn score_row_at(in s: Store, take row: Int, in q: Array[Float], take metric: Int) -> Float {
+    // Range-checked like every other accessor in this module: an out-of-range
+    // row is a value, not a trap (the rule `vec::db`'s header states). Without
+    // this, `row * s.dim` indexes past the block — or overflows outright — and
+    // aborts the process from a `pub` function.
+    if row < 0 || row >= s.count || std::array::len(q) < s.dim {
+        vec::metric::worst_score(metric)
+    } else {
+        vec::metric::score_at(s.vectors, row * s.dim, q, 0, s.dim, metric)
+    }
+}
+
+/// A copy of row `row`'s vector as its own `dim`-length array.
+///
+/// # Example
+/// ```tuo
+/// // let v = vec::store::vector_at(s, 0);
+/// ```
+pub fn vector_at(in s: Store, take row: Int) -> Array[Float] {
+    var out = std::array::empty();
+    if row >= 0 && row < s.count {
+        let at = row * s.dim;
+        var i = 0;
+        while i < s.dim {
+            std::array::push(out, std::array::get(s.vectors, at + i));
+            i = i + 1;
+        }
+    }
+    out
+}
+
+/// The row whose id is `id`, or `-1` when no live row has it.
+///
+/// This is a linear scan: ids are a convenience for callers, not an index, and
+/// pretending otherwise would hide an O(N) cost behind an O(1)-looking name.
+///
+/// # Example
+/// ```tuo
+/// // let row = vec::store::row_of_id(s, "doc-7");
+/// ```
+pub fn row_of_id(in s: Store, in id: Str) -> Int {
+    var found = 0 - 1;
+    var i = 0;
+    while i < s.count && found < 0 {
+        if std::array::get(s.live, i) == 1 {
+            let candidate = std::array::get(s.ids, i);
+            if std::string::as_str(candidate) == id {
+                found = i;
+            }
+        }
+        i = i + 1;
+    }
+    found
+}
+
+/// Does the store hold a live row with this id?
+///
+/// # Example
+/// ```tuo
+/// // let there = vec::store::contains(s, "doc-7");
+/// ```
+pub fn contains(in s: Store, in id: Str) -> Bool {
+    row_of_id(s, id) >= 0
+}
+
+// ----------------------------------------------------------------------------
+// Mutation.
+// ----------------------------------------------------------------------------
+
+/// Append a vector with its id and payload, returning the new row index, or
+/// `-1` when `v` is not exactly `dim` long **or holds a NaN or an infinity**.
+///
+/// The vector is normalized in place first when the store's metric is cosine —
+/// see the module header for why. `v` is consumed because it is moved into the
+/// store rather than copied.
+///
+/// # Example
+/// ```tuo
+/// // let row = vec::store::add(s, v, "doc-1", "hello");
+/// ```
+pub fn add(mut s: Store, take v: Array[Float], in id: Str, in payload: Str) -> Int {
+    // `v` is taken unconditionally into `incoming` before any branch: v0 keeps
+    // no hidden drop flags, so a value moved on one path and not the other has
+    // no statically known state at its drop point (O0008). The length is then
+    // checked on the binding that owns it.
+    //
+    // The binding is *not* called `vec`: a local of that name shadows the
+    // `vec::` module namespace, and a call to `vec::metric::*` under the shadow
+    // is dropped from MIR lowering rather than rejected — a spec then traps
+    // with "the interpreter only executes functions present in the lowered
+    // MIR". Naming it `incoming` keeps the namespace reachable.
+    var incoming = v;
+    // A vector is refused unless it is the right length *and* every component
+    // is a finite number. A NaN component silently poisons every comparison it
+    // takes part in — NaN compares false to everything, so a NaN row can never
+    // be displaced from a ranking once it enters one — and an infinity does
+    // the same to any sum it joins. Rejecting at the door is the only place
+    // this can be caught once and for all.
+    let fits = std::array::len(incoming) == s.dim && all_finite(incoming, s.dim);
+    if fits {
+        if s.metric == vec::metric::metric_cosine() {
+            vec::metric::normalize_at(incoming, 0, s.dim);
+        }
+        var i = 0;
+        while i < s.dim {
+            std::array::push(s.vectors, std::array::get(incoming, i));
+            i = i + 1;
+        }
+        std::array::push(s.ids, std::string::from_str(id));
+        std::array::push(s.payloads, std::string::from_str(payload));
+        std::array::push(s.live, 1);
+        s.count = s.count + 1;
+        s.count - 1
+    } else {
+        0 - 1
+    }
+}
+
+/// Are the first `dim` components of `v` all finite — no NaN, no infinity?
+///
+/// # Example
+/// ```tuo
+/// // let ok = vec::store::all_finite(v, 3);
+/// ```
+pub fn all_finite(in v: Array[Float], take dim: Int) -> Bool {
+    var ok = true;
+    var i = 0;
+    while i < dim {
+        if !db::math::is_finite(std::array::get(v, i)) {
+            ok = false;
+        }
+        i = i + 1;
+    }
+    ok
+}
+
+/// Mark row `row` dead. Returns `true` when a live row was removed.
+///
+/// The row keeps its slot so that every other row keeps its index; see the
+/// module header.
+///
+/// # Example
+/// ```tuo
+/// // let gone = vec::store::remove(s, 3);
+/// ```
+pub fn remove(mut s: Store, take row: Int) -> Bool {
+    if row < 0 || row >= s.count {
+        false
+    } else if std::array::get(s.live, row) == 0 {
+        false
+    } else {
+        std::array::set(s.live, row, 0);
+        true
+    }
+}
+
+/// Mark the row with id `id` dead. Returns `true` when one was removed.
+///
+/// # Example
+/// ```tuo
+/// // let gone = vec::store::remove_id(s, "doc-7");
+/// ```
+pub fn remove_id(mut s: Store, in id: Str) -> Bool {
+    let row = row_of_id(s, id);
+    if row < 0 {
+        false
+    } else {
+        std::array::set(s.live, row, 0);
+        true
+    }
+}
+
+/// A copy of `s` with every tombstone dropped and the survivors renumbered.
+///
+/// Row indices change; ids do not. Call this when reclaiming space matters more
+/// than the stability of row indices.
+///
+/// # Example
+/// ```tuo
+/// // let fresh = vec::store::compact(s);
+/// ```
+pub fn compact(in s: Store) -> Store {
+    var out = empty(s.dim, s.metric);
+    var i = 0;
+    while i < s.count {
+        if std::array::get(s.live, i) == 1 {
+            let at = i * s.dim;
+            var v = std::array::empty();
+            var c = 0;
+            while c < s.dim {
+                std::array::push(v, std::array::get(s.vectors, at + c));
+                c = c + 1;
+            }
+            // Already normalized on the way in, so `add` re-normalizing a unit
+            // vector is a no-op that costs one norm and changes nothing.
+            let id = std::array::get(s.ids, i);
+            let payload = std::array::get(s.payloads, i);
+            let _ = add(out, v, std::string::as_str(id), std::string::as_str(payload));
+        }
+        i = i + 1;
+    }
+    out
+}
+
+// ----------------------------------------------------------------------------
+// Invariants.
+// ----------------------------------------------------------------------------
+
+/// Does the store satisfy its layout invariant?
+///
+/// Every parallel array must have one entry per row, and the flat block must
+/// hold exactly `count * dim` floats. This is the property every other module
+/// in the feature assumes, so it is stated as code rather than as a comment.
+///
+/// # Example
+/// ```tuo
+/// // let ok = vec::store::is_consistent(s);
+/// ```
+pub fn is_consistent(in s: Store) -> Bool {
+    std::array::len(s.vectors) == s.count * s.dim && std::array::len(s.ids) == s.count && std::array::len(s.payloads) == s.count && std::array::len(s.live) == s.count
+}
+
+// ----------------------------------------------------------------------------
+// Spec helpers.
+// ----------------------------------------------------------------------------
+
+/// Spec helper: a 2-D vector as its own array.
+pub fn v2(take a: Float, take b: Float) -> Array[Float] {
+    var xs = std::array::empty();
+    std::array::push(xs, a);
+    std::array::push(xs, b);
+    xs
+}
+
+/// Spec helper: a store of three 2-D rows, un-normalized (metric `dot`), so
+/// the stored components are exactly what was handed in.
+pub fn fixture_dot() -> Store {
+    var s = empty(2, vec::metric::metric_dot());
+    let _ = add(s, v2(1.0, 0.0), "a", "alpha");
+    let _ = add(s, v2(0.0, 1.0), "b", "beta");
+    let _ = add(s, v2(3.0, 4.0), "c", "gamma");
+    s
+}
+
+/// Spec helper: the same three rows in a cosine store, so they are normalized.
+pub fn fixture_cosine() -> Store {
+    var s = empty(2, vec::metric::metric_cosine());
+    let _ = add(s, v2(1.0, 0.0), "a", "alpha");
+    let _ = add(s, v2(0.0, 1.0), "b", "beta");
+    let _ = add(s, v2(3.0, 4.0), "c", "gamma");
+    s
+}
+
+/// Spec helper: `count` of the dot fixture.
+pub fn fixture_count() -> Int {
+    count(fixture_dot())
+}
+
+/// Spec helper: `live_count` of the dot fixture.
+pub fn fixture_live() -> Int {
+    live_count(fixture_dot())
+}
+
+/// Spec helper: a component of the dot fixture.
+pub fn fixture_component(take row: Int, take c: Int) -> Float {
+    component_at(fixture_dot(), row, c)
+}
+
+/// Spec helper: a component of the cosine fixture — normalized on the way in.
+pub fn fixture_cosine_component(take row: Int, take c: Int) -> Float {
+    component_at(fixture_cosine(), row, c)
+}
+
+/// Spec helper: the id at a row of the dot fixture, as a comparable `Str`.
+pub fn fixture_id_is(take row: Int, in expect: Str) -> Bool {
+    let id = id_at(fixture_dot(), row);
+    std::string::as_str(id) == expect
+}
+
+/// Spec helper: the payload at a row of the dot fixture.
+pub fn fixture_payload_is(take row: Int, in expect: Str) -> Bool {
+    let p = payload_at(fixture_dot(), row);
+    std::string::as_str(p) == expect
+}
+
+/// Spec helper: the row an id resolves to in the dot fixture.
+pub fn fixture_row_of(in id: Str) -> Int {
+    row_of_id(fixture_dot(), id)
+}
+
+/// Spec helper: adding a wrong-length vector is refused.
+pub fn add_wrong_length_returns() -> Int {
+    var s = empty(2, vec::metric::metric_dot());
+    var v = std::array::empty();
+    std::array::push(v, 1.0);
+    add(s, v, "x", "")
+}
+
+/// Spec helper: `live_count` after removing one row by id.
+pub fn live_after_remove(in id: Str) -> Int {
+    var s = fixture_dot();
+    let _ = remove_id(s, id);
+    live_count(s)
+}
+
+/// Spec helper: `count` after removing one row — unchanged, because a removal
+/// is a tombstone.
+pub fn count_after_remove(in id: Str) -> Int {
+    var s = fixture_dot();
+    let _ = remove_id(s, id);
+    count(s)
+}
+
+/// Spec helper: is a removed id still found?
+pub fn contains_after_remove(in id: Str) -> Bool {
+    var s = fixture_dot();
+    let _ = remove_id(s, id);
+    contains(s, id)
+}
+
+/// Spec helper: removing the same row twice reports `false` the second time.
+pub fn double_remove_is_false() -> Bool {
+    var s = fixture_dot();
+    let _ = remove_id(s, "a");
+    remove_id(s, "a")
+}
+
+/// Spec helper: `count` after compacting a store with one tombstone.
+pub fn count_after_compact() -> Int {
+    var s = fixture_dot();
+    let _ = remove_id(s, "b");
+    count(compact(s))
+}
+
+/// Spec helper: the id at a row of the compacted fixture — the survivors are
+/// renumbered, so row 1 is "c".
+pub fn compacted_id_is(take row: Int, in expect: Str) -> Bool {
+    var s = fixture_dot();
+    let _ = remove_id(s, "b");
+    let id = id_at(compact(s), row);
+    std::string::as_str(id) == expect
+}
+
+/// Spec helper: is the fixture consistent after a removal and a compaction?
+pub fn stays_consistent() -> Bool {
+    var s = fixture_dot();
+    let _ = remove_id(s, "b");
+    // `compact` borrows `s`, so it must run before anything consumes it.
+    let compacted = is_consistent(compact(s));
+    is_consistent(s) && compacted
+}
+
+/// Spec helper: the norm of a stored row in the cosine fixture.
+pub fn fixture_cosine_norm(take row: Int) -> Float {
+    let s = fixture_cosine();
+    let v = vector_at(s, row);
+    vec::metric::norm_at(v, 0, 2)
+}
+
+/// Spec helper: the length of `vector_at` for a row.
+pub fn vector_at_len(take row: Int) -> Int {
+    std::array::len(vector_at(fixture_dot(), row))
+}
+
+spec empty {
+    then dim(empty(3, vec::metric::metric_cosine())) == 3;
+    then metric(empty(3, vec::metric::metric_l2())) == vec::metric::metric_l2();
+    then count(empty(3, vec::metric::metric_cosine())) == 0;
+    then live_count(empty(3, vec::metric::metric_cosine())) == 0;
+    // An unknown metric degrades to cosine rather than producing a broken store.
+    then metric(empty(3, 99)) == vec::metric::metric_cosine();
+    // A non-positive dimension is clamped to 1, so `offset_of` never collapses.
+    then dim(empty(0, 1)) == 1;
+    then is_consistent(empty(3, 1));
+}
+
+spec add {
+    then fixture_count() == 3;
+    then fixture_live() == 3;
+    // A dot store keeps the vector exactly as handed in.
+    then db::math::near(fixture_component(0, 0), 1.0);
+    then db::math::near(fixture_component(2, 0), 3.0);
+    then db::math::near(fixture_component(2, 1), 4.0);
+    // A wrong-length vector is refused with -1 rather than corrupting the block.
+    then add_wrong_length_returns() == 0 - 1;
+    then is_consistent(fixture_dot());
+}
+
+spec "a cosine store normalizes on the way in" {
+    // [3,4] has norm 5, so it is stored as [0.6, 0.8].
+    then db::math::near(fixture_cosine_component(2, 0), 0.6);
+    then db::math::near(fixture_cosine_component(2, 1), 0.8);
+    // Every stored row is unit length.
+    then db::math::near(fixture_cosine_norm(0), 1.0);
+    then db::math::near(fixture_cosine_norm(2), 1.0);
+}
+
+spec id_at {
+    then fixture_id_is(0, "a");
+    then fixture_id_is(2, "c");
+    // Out of range reads as empty rather than trapping.
+    then fixture_id_is(9, "");
+    then fixture_id_is(0 - 1, "");
+}
+
+spec payload_at {
+    then fixture_payload_is(0, "alpha");
+    then fixture_payload_is(2, "gamma");
+    then fixture_payload_is(9, "");
+}
+
+spec row_of_id {
+    then fixture_row_of("a") == 0;
+    then fixture_row_of("b") == 1;
+    then fixture_row_of("c") == 2;
+    then fixture_row_of("nope") == 0 - 1;
+}
+
+spec component_at {
+    // Out-of-range reads are 0.0, never a trap.
+    then db::math::near(fixture_component(9, 0), 0.0);
+    then db::math::near(fixture_component(0, 9), 0.0);
+    then db::math::near(fixture_component(0 - 1, 0), 0.0);
+}
+
+spec vector_at {
+    then vector_at_len(0) == 2;
+    then vector_at_len(9) == 0;
+}
+
+spec remove {
+    then live_after_remove("b") == 2;
+    // A tombstone does not renumber: `count` is unchanged.
+    then count_after_remove("b") == 3;
+    then !contains_after_remove("b");
+    then !double_remove_is_false();
+}
+
+spec compact {
+    then count_after_compact() == 2;
+    // The survivors are renumbered, so "c" moves from row 2 to row 1.
+    then compacted_id_is(0, "a");
+    then compacted_id_is(1, "c");
+}
+
+spec is_consistent {
+    then stays_consistent();
+}
+
+/// Spec helper: NaN and infinity are refused by `add`.
+pub fn add_non_finite(take a: Float) -> Int {
+    var s = empty(2, vec::metric::metric_dot());
+    add(s, v2(a, 1.0), "x", "")
+}
+
+/// Spec helper: `score_row_at` on an out-of-range row must not trap.
+pub fn score_row_out_of_range(take row: Int) -> Float {
+    let s = empty(2, vec::metric::metric_dot());
+    score_row_at(s, row, v2(1.0, 0.0), vec::metric::metric_dot())
+}
+
+/// Spec helper: `offset_of` on an absurd row must not overflow.
+pub fn offset_out_of_range() -> Int {
+    let s = empty(1000000000, vec::metric::metric_dot());
+    offset_of(s, 1000000000000)
+}
+
+spec all_finite {
+    // A NaN component poisons every comparison it later joins, and an infinity
+    // does the same to any sum — both are refused at the door.
+    then add_non_finite(0.0 / 0.0) == 0 - 1;
+    then add_non_finite(1.0 / 0.0) == 0 - 1;
+    then add_non_finite(0.0 - 1.0 / 0.0) == 0 - 1;
+    // An ordinary vector is still accepted.
+    then add_non_finite(1.0) == 0;
+}
+
+spec score_row_at {
+    // Out of range is a value, not a trap — the rule every other accessor in
+    // this module follows.
+    then db::math::is_infinite(score_row_out_of_range(1000000));
+    then db::math::is_infinite(score_row_out_of_range(0 - 1));
+    then offset_out_of_range() == 0 - 1;
+}

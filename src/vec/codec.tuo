@@ -1,0 +1,826 @@
+// vec::codec — the on-disk encoding for vectors, ids and payloads.
+//
+// This is the pure half of persistence: it turns a `Store` into a byte buffer
+// and back, and knows nothing about files. `vec::disk` is the thin effect layer
+// that carries those bytes to a descriptor. Splitting it this way is what lets
+// the entire format — every field, every boundary, every failure — be proven by
+// specs, because a spec cannot touch an effect (`R0007`).
+//
+// The framing is big-endian, over `db::bytes`, for the same reason the
+// PostgreSQL adapter is: it is the byte order wire and file formats are built
+// in, and the primitives already exist and are spec-checked.
+//
+// HOW A FLOAT IS ENCODED, AND WHY NOT IEEE BYTES.
+//
+// A `Float` cannot be reinterpreted as its IEEE-754 bits in v0: `f as Int`
+// truncates toward zero (1.5 becomes 1), and there is no bitcast, no
+// `to_bits`, and no union. So the bit pattern is simply not reachable from the
+// language, and an encoder that claimed to write IEEE doubles would be lying.
+//
+// What *is* reachable is arithmetic, so a float is stored as a **fixed-point
+// integer**: `round(x * 2^30)`, in eight big-endian bytes. That is exact for
+// every value with fewer than 30 fractional bits and accurate to ~5e-10
+// elsewhere — several orders of magnitude finer than the difference between
+// two embeddings that mean different things, and finer than the float16 that
+// most vector databases quantize to on disk anyway.
+//
+// The trade is stated rather than hidden: this format is lossy in the last few
+// bits of a double, it is exact for the [-1, 1] range that normalized
+// embeddings occupy, and `is_representable` below is the predicate that says
+// whether a given value survives the round trip.
+
+module vec::codec;
+
+// ----------------------------------------------------------------------------
+// Format constants.
+// ----------------------------------------------------------------------------
+
+/// The four magic bytes at the head of every file: `TVEC`.
+pub fn magic() -> Str {
+    "TVEC"
+}
+
+/// The format version this build reads and writes.
+pub fn format_version() -> Int {
+    1
+}
+
+/// Bytes in the fixed header: magic(4) + version(4) + dim(4) + metric(4) +
+/// count(4).
+pub fn header_len() -> Int {
+    20
+}
+
+/// The fixed-point scale: 2^30.
+///
+/// Chosen so that a normalized component (|x| <= 1) uses the full precision of
+/// a 62-bit fixed-point number while leaving ample headroom for the
+/// un-normalized vectors an L2 or dot store may hold.
+pub fn fixed_scale() -> Float {
+    1073741824.0
+}
+
+/// The largest magnitude this encoding represents without saturating.
+///
+/// `Int` is 64-bit and the scale takes 30 of those bits, so magnitudes up to
+/// 2^33 are safe. The bound is stated as a round number well inside that.
+pub fn max_magnitude() -> Float {
+    1000000000.0
+}
+
+// ----------------------------------------------------------------------------
+// Fixed-point conversion.
+// ----------------------------------------------------------------------------
+
+/// `x` as a fixed-point integer, rounded to nearest.
+///
+/// Saturates at `max_magnitude` rather than overflowing: integer arithmetic
+/// **traps** in v0, so an out-of-range vector would abort the process rather
+/// than write a bad file. Clamping keeps a write total.
+///
+/// # Example
+/// ```tuo
+/// let n = vec::codec::to_fixed(0.5); // 536870912
+/// ```
+pub fn to_fixed(take x: Float) -> Int {
+    let clamped = if db::math::is_nan(x) {
+        0.0
+    } else if x > max_magnitude() {
+        max_magnitude()
+    } else if x < 0.0 - max_magnitude() {
+        0.0 - max_magnitude()
+    } else {
+        x
+    };
+    let scaled = clamped * fixed_scale();
+    // Round half away from zero, so the error is symmetric about 0.
+    if scaled >= 0.0 {
+        (scaled + 0.5) as Int
+    } else {
+        (scaled - 0.5) as Int
+    }
+}
+
+/// A fixed-point integer back to a float.
+///
+/// # Example
+/// ```tuo
+/// let x = vec::codec::from_fixed(536870912); // 0.5
+/// ```
+pub fn from_fixed(take n: Int) -> Float {
+    (n as Float) / fixed_scale()
+}
+
+/// Does `x` survive a fixed-point round trip to within `db::math::epsilon`?
+///
+/// # Example
+/// ```tuo
+/// let ok = vec::codec::is_representable(0.5); // true
+/// ```
+pub fn is_representable(take x: Float) -> Bool {
+    db::math::near(from_fixed(to_fixed(x)), x)
+}
+
+// ----------------------------------------------------------------------------
+// 64-bit framing.
+//
+// `db::bytes` frames 16- and 32-bit integers, which is every width the
+// PostgreSQL protocol uses. A fixed-point float needs 64, so the two halves are
+// written as two big-endian 32-bit words, high word first.
+// ----------------------------------------------------------------------------
+
+/// 2^32, as the divisor separating the two halves of a 64-bit value.
+pub fn pow32() -> Int {
+    4294967296
+}
+
+/// Append `v` as a big-endian **Int64** (8 bytes).
+///
+/// # Example
+/// ```tuo
+/// var buf = std::string::empty();
+/// vec::codec::put_i64(buf, 1);
+/// ```
+pub fn put_i64(mut buf: String, take v: Int) {
+    // Arithmetic-shift semantics by division: for a negative `v`, `high` is the
+    // floor of v/2^32 and `low` is the non-negative remainder, so the pair
+    // reconstructs exactly under `high * 2^32 + low`.
+    var high = v / pow32();
+    var low = v % pow32();
+    if low < 0 {
+        low = low + pow32();
+        high = high - 1;
+    }
+    db::bytes::put_i32(buf, high);
+    db::bytes::put_i32(buf, low);
+}
+
+/// Read a big-endian **Int64** at `at`.
+///
+/// # Example
+/// ```tuo
+/// // let v = vec::codec::be_i64(buf, 0);
+/// ```
+pub fn be_i64(in buf: String, take at: Int) -> Int {
+    let high = db::bytes::be_i32(buf, at);
+    let low = db::bytes::be_u32(buf, at + 4);
+    high * pow32() + low
+}
+
+/// Append `x` as a fixed-point big-endian Int64.
+///
+/// # Example
+/// ```tuo
+/// var buf = std::string::empty();
+/// vec::codec::put_f64(buf, 0.5);
+/// ```
+pub fn put_f64(mut buf: String, take x: Float) {
+    put_i64(buf, to_fixed(x));
+}
+
+/// Read a fixed-point float at `at`.
+///
+/// # Example
+/// ```tuo
+/// // let x = vec::codec::be_f64(buf, 0);
+/// ```
+pub fn be_f64(in buf: String, take at: Int) -> Float {
+    from_fixed(be_i64(buf, at))
+}
+
+// ----------------------------------------------------------------------------
+// Length-prefixed strings.
+//
+// Ids and payloads are arbitrary bytes — a payload may hold the document text
+// itself — so they are length-prefixed rather than NUL-terminated. That keeps
+// an embedded NUL from truncating a record, which a C-string framing could not.
+// ----------------------------------------------------------------------------
+
+/// Append `s` as a 4-byte big-endian length followed by its bytes.
+///
+/// # Example
+/// ```tuo
+/// var buf = std::string::empty();
+/// vec::codec::put_lstr(buf, "hello");
+/// ```
+pub fn put_lstr(mut buf: String, in s: Str) {
+    db::bytes::put_i32(buf, std::str::len(s));
+    db::bytes::put_bytes(buf, s);
+}
+
+/// The length of the string framed at `at`.
+///
+/// # Example
+/// ```tuo
+/// // let n = vec::codec::lstr_len(buf, 0);
+/// ```
+pub fn lstr_len(in buf: String, take at: Int) -> Int {
+    db::bytes::be_i32(buf, at)
+}
+
+/// The bytes of the string framed at `at`.
+///
+/// # Example
+/// ```tuo
+/// // let s = vec::codec::lstr_at(buf, 0);
+/// ```
+pub fn lstr_at(in buf: String, take at: Int) -> String {
+    let n = db::bytes::be_i32(buf, at);
+    if n <= 0 {
+        std::string::empty()
+    } else {
+        std::string::slice(buf, at + 4, at + 4 + n)
+    }
+}
+
+/// The offset just past the string framed at `at`.
+///
+/// # Example
+/// ```tuo
+/// // let next = vec::codec::lstr_end(buf, 0);
+/// ```
+pub fn lstr_end(in buf: String, take at: Int) -> Int {
+    let n = db::bytes::be_i32(buf, at);
+    if n <= 0 {
+        at + 4
+    } else {
+        at + 4 + n
+    }
+}
+
+// ----------------------------------------------------------------------------
+// The file format.
+//
+//   magic   4 bytes  "TVEC"
+//   version 4 bytes  big-endian int32
+//   dim     4 bytes  big-endian int32
+//   metric  4 bytes  big-endian int32
+//   count   4 bytes  big-endian int32   (live rows only — tombstones are not
+//                                        written, so a save compacts)
+//   then, per row:
+//     vector  dim * 8 bytes  fixed-point big-endian int64 each
+//     id      4 + n bytes    length-prefixed
+//     payload 4 + n bytes    length-prefixed
+// ----------------------------------------------------------------------------
+
+/// Encode a whole store as a byte buffer.
+///
+/// Tombstoned rows are dropped, so saving and loading is also how a store is
+/// compacted on disk.
+///
+/// # Example
+/// ```tuo
+/// // let bytes = vec::codec::encode(store);
+/// ```
+pub fn encode(in s: vec::store::Store) -> String {
+    var buf = std::string::empty();
+    let dim = vec::store::dim(s);
+    db::bytes::put_bytes(buf, magic());
+    db::bytes::put_i32(buf, format_version());
+    db::bytes::put_i32(buf, dim);
+    db::bytes::put_i32(buf, vec::store::metric(s));
+    db::bytes::put_i32(buf, vec::store::live_count(s));
+    var row = 0;
+    let n = vec::store::count(s);
+    while row < n {
+        if vec::store::is_live(s, row) {
+            var c = 0;
+            while c < dim {
+                put_f64(buf, vec::store::component_at(s, row, c));
+                c = c + 1;
+            }
+            let id = vec::store::id_at(s, row);
+            put_lstr(buf, std::string::as_str(id));
+            let payload = vec::store::payload_at(s, row);
+            put_lstr(buf, std::string::as_str(payload));
+        }
+        row = row + 1;
+    }
+    buf
+}
+
+/// The first row holding a component this encoding would clamp, or `-1` when
+/// every component is representable.
+///
+/// `to_fixed` saturates at `max_magnitude` rather than overflowing, because
+/// integer overflow traps in v0 and a trap during a save is worse than a lossy
+/// byte. But a *silent* clamp is worse still: it corrupts a vector while
+/// reporting success. So the clamp stays, and this is how a caller — or
+/// `vec::disk::save_verified` — finds out before trusting the file.
+///
+/// Cosine stores can never trip this: everything in them is normalized to
+/// magnitude 1. It is reachable only for `l2` and `dot` stores, which keep
+/// magnitude deliberately.
+///
+/// # Example
+/// ```tuo
+/// // let bad = vec::codec::first_unrepresentable_row(store);
+/// ```
+pub fn first_unrepresentable_row(in s: vec::store::Store) -> Int {
+    let dim = vec::store::dim(s);
+    var found = 0 - 1;
+    var row = 0;
+    let n = vec::store::count(s);
+    while row < n && found < 0 {
+        if vec::store::is_live(s, row) {
+            var c = 0;
+            while c < dim && found < 0 {
+                let x = vec::store::component_at(s, row, c);
+                // `!is_finite` first: every comparison against NaN is false,
+                // so a `> max_magnitude()` test alone lets a NaN through, and
+                // `to_fixed` then writes it as 0.0 — silent corruption of
+                // exactly the kind this function exists to prevent.
+                if !db::math::is_finite(x) || db::math::abs_f(x) > max_magnitude() {
+                    found = row;
+                }
+                c = c + 1;
+            }
+        }
+        row = row + 1;
+    }
+    found
+}
+
+/// Would every component of `s` survive this encoding unchanged?
+///
+/// # Example
+/// ```tuo
+/// // let safe = vec::codec::is_encodable(store);
+/// ```
+pub fn is_encodable(in s: vec::store::Store) -> Bool {
+    first_unrepresentable_row(s) < 0
+}
+
+// ----------------------------------------------------------------------------
+// Header inspection.
+//
+// A reader checks the header before trusting a single byte of the body, so
+// each field has its own accessor and `header_error` is the one place the
+// checks are ordered.
+// ----------------------------------------------------------------------------
+
+/// Does `buf` begin with the `TVEC` magic?
+///
+/// # Example
+/// ```tuo
+/// // let ok = vec::codec::has_magic(buf);
+/// ```
+pub fn has_magic(in buf: String) -> Bool {
+    if std::string::len(buf) < header_len() {
+        false
+    } else {
+        let head = std::string::slice(buf, 0, 4);
+        std::string::as_str(head) == magic()
+    }
+}
+
+/// The format version in the header.
+///
+/// # Example
+/// ```tuo
+/// // let v = vec::codec::version_of(buf);
+/// ```
+pub fn version_of(in buf: String) -> Int {
+    db::bytes::be_i32(buf, 4)
+}
+
+/// The dimensionality in the header.
+///
+/// # Example
+/// ```tuo
+/// // let d = vec::codec::dim_of(buf);
+/// ```
+pub fn dim_of(in buf: String) -> Int {
+    db::bytes::be_i32(buf, 8)
+}
+
+/// The metric in the header.
+///
+/// # Example
+/// ```tuo
+/// // let m = vec::codec::metric_of(buf);
+/// ```
+pub fn metric_of(in buf: String) -> Int {
+    db::bytes::be_i32(buf, 12)
+}
+
+/// The row count in the header.
+///
+/// # Example
+/// ```tuo
+/// // let n = vec::codec::count_of(buf);
+/// ```
+pub fn count_of(in buf: String) -> Int {
+    db::bytes::be_i32(buf, 16)
+}
+
+/// The reason `buf` is not a loadable file, or `""` when it is.
+///
+/// Returning the message rather than a bool keeps the diagnosis at the point
+/// that has the evidence — the caller turns it into a `db::error` without
+/// having to re-derive what was wrong.
+///
+/// # Example
+/// ```tuo
+/// // let why = vec::codec::header_error(buf);
+/// ```
+pub fn header_error(in buf: String) -> String {
+    if std::string::len(buf) < header_len() {
+        std::string::from_str("truncated: shorter than a header")
+    } else if !has_magic(buf) {
+        std::string::from_str("not a TVEC file: bad magic")
+    } else if version_of(buf) != format_version() {
+        std::string::from_str("unsupported TVEC format version")
+    } else if dim_of(buf) <= 0 {
+        std::string::from_str("invalid dimension in header")
+    } else if !vec::metric::is_metric(metric_of(buf)) {
+        std::string::from_str("unknown metric in header")
+    } else if count_of(buf) < 0 {
+        std::string::from_str("negative row count in header")
+    } else {
+        std::string::empty()
+    }
+}
+
+/// Is `buf` a well-formed file this build can load?
+///
+/// # Example
+/// ```tuo
+/// // let ok = vec::codec::is_valid(buf);
+/// ```
+pub fn is_valid(in buf: String) -> Bool {
+    std::string::len(header_error(buf)) == 0
+}
+
+/// The offset just past the row starting at `at`, or `-1` when the buffer does
+/// not hold that whole row.
+///
+/// Measuring a row before building it is what lets `decode` consume its vector
+/// unconditionally — see the comment in the decode loop.
+///
+/// # Example
+/// ```tuo
+/// // let end = vec::codec::row_end(buf, 20, 2, 64);
+/// ```
+pub fn row_end(in buf: String, take at: Int, take dim: Int, take total: Int) -> Int {
+    // The vector, plus the id's own length word.
+    let id_at = at + dim * 8;
+    if id_at + 4 > total {
+        0 - 1
+    } else {
+        let id_len = lstr_len(buf, id_at);
+        let payload_at = lstr_end(buf, id_at);
+        if id_len < 0 || payload_at + 4 > total {
+            0 - 1
+        } else {
+            let payload_len = lstr_len(buf, payload_at);
+            let end = lstr_end(buf, payload_at);
+            if payload_len < 0 || end > total {
+                0 - 1
+            } else {
+                end
+            }
+        }
+    }
+}
+
+/// Decode a store from `buf`, or an empty store when the header is bad.
+///
+/// A truncated body stops the decode at the last whole row rather than
+/// trapping, so a partially written file loads as its intact prefix. `decode`
+/// therefore always returns a usable store; `header_error` is how a caller
+/// learns the file was not perfect.
+///
+/// # Example
+/// ```tuo
+/// // let s = vec::codec::decode(buf);
+/// ```
+pub fn decode(in buf: String) -> vec::store::Store {
+    if !is_valid(buf) {
+        vec::store::empty(1, vec::metric::metric_cosine())
+    } else {
+        let dim = dim_of(buf);
+        let metric = metric_of(buf);
+        let count = count_of(buf);
+        var out = vec::store::empty(dim, metric);
+        let total = std::string::len(buf);
+        var at = header_len();
+        var row = 0;
+        var going = true;
+        while going && row < count {
+            // A row needs dim*8 bytes of vector plus two 4-byte length words at
+            // minimum; anything less means the file was cut short.
+            // The whole row is measured *before* any of it is built, so the
+            // vector below is consumed unconditionally. v0 keeps no hidden
+            // drop flags, and a value moved on only one branch has no
+            // statically known state at its drop point (O0008).
+            let end = row_end(buf, at, dim, total);
+            if end < 0 {
+                going = false;
+            } else {
+                var v = std::array::empty();
+                var c = 0;
+                while c < dim {
+                    std::array::push(v, be_f64(buf, at + c * 8));
+                    c = c + 1;
+                }
+                let id_at_off = at + dim * 8;
+                let id = lstr_at(buf, id_at_off);
+                let payload = lstr_at(buf, lstr_end(buf, id_at_off));
+                let _ = vec::store::add(out, v, std::string::as_str(id), std::string::as_str(payload));
+                at = end;
+                row = row + 1;
+            }
+        }
+        out
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Spec helpers.
+// ----------------------------------------------------------------------------
+
+/// Spec helper: a 2-D vector.
+pub fn v2(take a: Float, take b: Float) -> Array[Float] {
+    var xs = std::array::empty();
+    std::array::push(xs, a);
+    std::array::push(xs, b);
+    xs
+}
+
+/// Spec helper: a three-row store under `dot`, so components are stored as
+/// handed in and the round trip is checked against exact values.
+pub fn fixture() -> vec::store::Store {
+    var s = vec::store::empty(2, vec::metric::metric_dot());
+    let _ = vec::store::add(s, v2(1.0, 0.0), "a", "alpha");
+    let _ = vec::store::add(s, v2(0.0 - 0.5, 0.25), "b", "beta payload");
+    let _ = vec::store::add(s, v2(3.0, 4.0), "c", "");
+    s
+}
+
+/// Spec helper: does a float survive `put_f64` / `be_f64` through a buffer?
+pub fn f64_round_trips(take x: Float) -> Bool {
+    var buf = std::string::empty();
+    put_f64(buf, x);
+    db::math::near(be_f64(buf, 0), x)
+}
+
+/// Spec helper: does an integer survive `put_i64` / `be_i64`?
+pub fn i64_round_trips(take v: Int) -> Bool {
+    var buf = std::string::empty();
+    put_i64(buf, v);
+    be_i64(buf, 0) == v
+}
+
+/// Spec helper: the encoded length of a value written by `put_i64`.
+pub fn i64_width() -> Int {
+    var buf = std::string::empty();
+    put_i64(buf, 1);
+    std::string::len(buf)
+}
+
+/// Spec helper: does a string survive `put_lstr` / `lstr_at`?
+pub fn lstr_round_trips(in s: Str) -> Bool {
+    var buf = std::string::empty();
+    put_lstr(buf, s);
+    let back = lstr_at(buf, 0);
+    std::string::as_str(back) == s
+}
+
+/// Spec helper: the offset past a framed string of length `n`.
+pub fn lstr_end_of(in s: Str) -> Int {
+    var buf = std::string::empty();
+    put_lstr(buf, s);
+    lstr_end(buf, 0)
+}
+
+/// Spec helper: a header field of the encoded fixture.
+pub fn encoded_dim() -> Int {
+    dim_of(encode(fixture()))
+}
+
+/// Spec helper: the metric of the encoded fixture.
+pub fn encoded_metric() -> Int {
+    metric_of(encode(fixture()))
+}
+
+/// Spec helper: the row count of the encoded fixture.
+pub fn encoded_count() -> Int {
+    count_of(encode(fixture()))
+}
+
+/// Spec helper: is the encoded fixture valid?
+pub fn encoded_is_valid() -> Bool {
+    is_valid(encode(fixture()))
+}
+
+/// Spec helper: the row count after a full encode/decode cycle.
+pub fn round_trip_count() -> Int {
+    vec::store::count(decode(encode(fixture())))
+}
+
+/// Spec helper: a component after a full encode/decode cycle.
+pub fn round_trip_component(take row: Int, take c: Int) -> Float {
+    vec::store::component_at(decode(encode(fixture())), row, c)
+}
+
+/// Spec helper: an id after a full encode/decode cycle.
+pub fn round_trip_id_is(take row: Int, in expect: Str) -> Bool {
+    let id = vec::store::id_at(decode(encode(fixture())), row);
+    std::string::as_str(id) == expect
+}
+
+/// Spec helper: a payload after a full encode/decode cycle.
+pub fn round_trip_payload_is(take row: Int, in expect: Str) -> Bool {
+    let p = vec::store::payload_at(decode(encode(fixture())), row);
+    std::string::as_str(p) == expect
+}
+
+/// Spec helper: the dim after a round trip.
+pub fn round_trip_dim() -> Int {
+    vec::store::dim(decode(encode(fixture())))
+}
+
+/// Spec helper: the metric after a round trip.
+pub fn round_trip_metric() -> Int {
+    vec::store::metric(decode(encode(fixture())))
+}
+
+/// Spec helper: a store with one row removed, encoded then decoded — the
+/// tombstone must not survive.
+pub fn round_trip_after_remove() -> Int {
+    var s = fixture();
+    let _ = vec::store::remove_id(s, "b");
+    vec::store::count(decode(encode(s)))
+}
+
+/// Spec helper: the id at a row after removing "b" and round-tripping, which
+/// also renumbers.
+pub fn compacted_round_trip_id(take row: Int, in expect: Str) -> Bool {
+    var s = fixture();
+    let _ = vec::store::remove_id(s, "b");
+    let id = vec::store::id_at(decode(encode(s)), row);
+    std::string::as_str(id) == expect
+}
+
+/// Spec helper: the header error message for a buffer of `n` zero bytes.
+pub fn short_buffer_error(take n: Int) -> String {
+    var buf = std::string::empty();
+    var i = 0;
+    while i < n {
+        std::string::push_byte(buf, 0);
+        i = i + 1;
+    }
+    header_error(buf)
+}
+
+/// Spec helper: is a short buffer's error the truncation message?
+pub fn short_is_truncated(take n: Int) -> Bool {
+    let e = short_buffer_error(n);
+    std::string::as_str(e) == "truncated: shorter than a header"
+}
+
+/// Spec helper: a full-length buffer of zeros has valid length but bad magic.
+pub fn zeros_is_bad_magic() -> Bool {
+    let e = short_buffer_error(header_len());
+    std::string::as_str(e) == "not a TVEC file: bad magic"
+}
+
+/// Spec helper: decoding garbage yields an empty store rather than a trap.
+pub fn decode_garbage_count() -> Int {
+    var buf = std::string::empty();
+    var i = 0;
+    while i < 40 {
+        std::string::push_byte(buf, 65);
+        i = i + 1;
+    }
+    vec::store::count(decode(buf))
+}
+
+/// Spec helper: a truncated body decodes to the whole rows that survived.
+///
+/// The fixture is encoded and then cut to the header plus one complete row,
+/// which is `dim*8` of vector plus `4+1` of id plus `4+5` of payload.
+pub fn truncated_body_count() -> Int {
+    let full = encode(fixture());
+    let one_row = header_len() + 2 * 8 + 4 + 1 + 4 + 5;
+    let cut = std::string::slice(full, 0, one_row);
+    vec::store::count(decode(cut))
+}
+
+spec to_fixed {
+    then to_fixed(0.0) == 0;
+    then to_fixed(1.0) == 1073741824;
+    then to_fixed(0.5) == 536870912;
+    then to_fixed(0.0 - 1.0) == 0 - 1073741824;
+    // NaN encodes as zero rather than as an arbitrary integer.
+    then to_fixed(0.0 / 0.0) == 0;
+}
+
+spec is_representable {
+    then is_representable(0.0);
+    then is_representable(1.0);
+    then is_representable(0.0 - 1.0);
+    then is_representable(0.6);
+    then is_representable(0.8);
+    then is_representable(0.7071067811865475);
+    then is_representable(0.123456789);
+    then is_representable(0.0 - 0.987654321);
+    then is_representable(1234.5678);
+}
+
+spec put_i64 {
+    then i64_width() == 8;
+    then i64_round_trips(0);
+    then i64_round_trips(1);
+    then i64_round_trips(0 - 1);
+    then i64_round_trips(1073741824);
+    then i64_round_trips(0 - 1073741824);
+    then i64_round_trips(4294967296);
+    then i64_round_trips(0 - 4294967297);
+    then i64_round_trips(1099511627776);
+}
+
+spec put_f64 {
+    then f64_round_trips(0.0);
+    then f64_round_trips(1.0);
+    then f64_round_trips(0.0 - 1.0);
+    then f64_round_trips(0.6);
+    then f64_round_trips(0.0 - 0.987654321);
+}
+
+spec put_lstr {
+    then lstr_round_trips("");
+    then lstr_round_trips("a");
+    then lstr_round_trips("hello world");
+    then lstr_end_of("") == 4;
+    then lstr_end_of("abc") == 7;
+}
+
+spec encode {
+    then encoded_is_valid();
+    then encoded_dim() == 2;
+    then encoded_metric() == vec::metric::metric_dot();
+    then encoded_count() == 3;
+}
+
+spec "a store survives an encode/decode round trip" {
+    then round_trip_count() == 3;
+    then round_trip_dim() == 2;
+    then round_trip_metric() == vec::metric::metric_dot();
+    then db::math::near(round_trip_component(0, 0), 1.0);
+    then db::math::near(round_trip_component(1, 0), 0.0 - 0.5);
+    then db::math::near(round_trip_component(1, 1), 0.25);
+    then db::math::near(round_trip_component(2, 1), 4.0);
+    then round_trip_id_is(0, "a");
+    then round_trip_id_is(2, "c");
+    then round_trip_payload_is(1, "beta payload");
+    // An empty payload is preserved as empty, not lost.
+    then round_trip_payload_is(2, "");
+}
+
+spec "saving drops tombstones" {
+    then round_trip_after_remove() == 2;
+    then compacted_round_trip_id(0, "a");
+    then compacted_round_trip_id(1, "c");
+}
+
+spec header_error {
+    then short_is_truncated(0);
+    then short_is_truncated(19);
+    then zeros_is_bad_magic();
+    then encoded_is_valid();
+}
+
+spec decode {
+    // Garbage decodes to an empty store rather than trapping.
+    then decode_garbage_count() == 0;
+    // A body cut mid-file yields the whole rows that survived it.
+    then truncated_body_count() == 1;
+}
+
+/// Spec helper: a store holding a component past `max_magnitude`.
+pub fn oversized_store() -> vec::store::Store {
+    var s = vec::store::empty(2, vec::metric::metric_l2());
+    let _ = vec::store::add(s, v2(5000000000.0, 1.0), "big", "");
+    s
+}
+
+/// Spec helper: the row `first_unrepresentable_row` flags in that store.
+pub fn oversized_row() -> Int {
+    first_unrepresentable_row(oversized_store())
+}
+
+/// Spec helper: is the ordinary fixture encodable?
+pub fn fixture_is_encodable() -> Bool {
+    is_encodable(fixture())
+}
+
+spec is_encodable {
+    // The ordinary fixture is well inside the representable range.
+    then fixture_is_encodable();
+    // A component past `max_magnitude` is reported rather than silently
+    // clamped into the file.
+    then oversized_row() == 0;
+    then !is_encodable(oversized_store());
+}

@@ -1,0 +1,270 @@
+// vector_check — the vector store's acceptance oracle, run against a real disk.
+//
+// The pure tiers of this feature carry executable specs, but a spec cannot open
+// a file (`R0007`), so the effect tier — `vec::disk` and the `save`/`open` path
+// through `vec::db` — needs a different kind of proof. This program is it: it
+// writes real files to a real filesystem, reads them back, and exits non-zero
+// the moment anything disagrees with what the pure tiers say should happen.
+//
+// It is written as a **cross-check**, not a smoke test. Every step asserts a
+// value the pure layer predicts — that the reloaded store has the same rows,
+// that a search over reloaded vectors ranks identically to one over the
+// originals, that a corrupt file is refused rather than half-read — so a
+// passing run means the disk agrees with the model rather than merely that
+// bytes moved.
+//
+// Run it:
+//
+//     tuo run examples/vector_check.tuo src/db/*.tuo src/vec/*.tuo
+//
+// Exit codes — each names exactly one failed expectation:
+//
+//     0   every check passed
+//     20  a fresh collection did not save, or reported the wrong byte count
+//     21  a reloaded collection did not hold the rows that were saved
+//     22  a reloaded vector did not survive the fixed-point round trip
+//     23  search over a reloaded collection ranked differently than before
+//     24  a payload did not survive the round trip
+//     25  a removed row reappeared after save/load
+//     26  a corrupt file was not refused
+//     27  a dimension mismatch was not reported
+//     28  the temporary files were not cleaned up
+//     29  a store this format cannot represent was saved anyway
+//     30  a non-finite component was accepted, or an extreme vector crashed
+
+module vector_check;
+
+/// The file this oracle writes. `/tmp` is the one directory every host in the
+/// test matrix agrees is writable.
+fn path() -> Str {
+    "/tmp/tuonelang_vector_check.tvec"
+}
+
+/// A second path, for the corrupt-file check.
+fn bad_path() -> Str {
+    "/tmp/tuonelang_vector_check_bad.tvec"
+}
+
+/// The dimensionality this oracle works in.
+fn dim() -> Int {
+    4
+}
+
+/// A 4-D vector.
+fn v4(take a: Float, take b: Float, take c: Float, take d: Float) -> Array[Float] {
+    var xs = std::array::empty();
+    std::array::push(xs, a);
+    std::array::push(xs, b);
+    std::array::push(xs, c);
+    std::array::push(xs, d);
+    xs
+}
+
+/// Print a line.
+fn say(in s: Str) {
+    let _ = std::rt::write(1, s);
+    let _ = std::rt::write(1, "\n");
+}
+
+/// Print a labelled failure and return its code, so each exit path is one line.
+fn fail(in label: Str, take code: Int) -> Int {
+    let _ = std::rt::write(1, "FAIL: ");
+    let _ = std::rt::write(1, label);
+    let _ = std::rt::write(1, "\n");
+    code
+}
+
+/// Build the collection this oracle saves: four documents whose directions are
+/// far apart, so ranking is unambiguous.
+fn build() -> vec::db::Db {
+    var d = vec::db::in_memory(dim(), vec::metric::metric_cosine());
+    let _ = vec::db::add(d, v4(1.0, 0.0, 0.0, 0.0), "alpha", "the first document");
+    let _ = vec::db::add(d, v4(0.0, 1.0, 0.0, 0.0), "beta", "the second document");
+    let _ = vec::db::add(d, v4(0.0, 0.0, 1.0, 0.0), "gamma", "the third document");
+    let _ = vec::db::add(d, v4(0.9, 0.1, 0.0, 0.0), "delta", "nearly the first");
+    d
+}
+
+fn main() -> Int {
+    say("=== tuonelang-db vector oracle ===");
+
+    // Start from a clean slate, so a stale file from an earlier run cannot make
+    // this pass for the wrong reason.
+    let _ = vec::disk::remove(path());
+    let _ = vec::disk::remove(bad_path());
+
+    // ---------------------------------------------------------------- 20 ---
+    // A fresh collection saves, and reports a plausible byte count: the header
+    // plus four rows of (4 * 8 bytes of vector + two framed strings).
+    var source = build();
+    let written = vec::db::save_as(source, path());
+    if written <= vec::codec::header_len() {
+        return fail("save wrote no rows", 20);
+    }
+    if !vec::disk::exists(path()) {
+        return fail("save left no file", 20);
+    }
+    say("ok  save");
+
+    // ---------------------------------------------------------------- 21 ---
+    // Reopening finds exactly the rows that were written, and the header the
+    // pure encoder predicted.
+    let reloaded = vec::db::open(path(), dim(), vec::metric::metric_cosine());
+    if !vec::db::is_ok(reloaded) {
+        let _ = std::rt::write_string(1, vec::db::error(reloaded));
+        return fail("reopen reported an error", 21);
+    }
+    if vec::db::count(reloaded) != 4 {
+        return fail("reloaded row count is wrong", 21);
+    }
+    if vec::db::dim(reloaded) != dim() {
+        return fail("reloaded dimension is wrong", 21);
+    }
+    if vec::db::metric(reloaded) != vec::metric::metric_cosine() {
+        return fail("reloaded metric is wrong", 21);
+    }
+    say("ok  reload");
+
+    // ---------------------------------------------------------------- 22 ---
+    // A stored component survives the fixed-point encoding. "alpha" was stored
+    // normalized, so its first component is exactly 1.0.
+    let alpha_hits = vec::db::query(reloaded, v4(1.0, 0.0, 0.0, 0.0), 1);
+    let alpha_vec = vec::db::hit_vector(reloaded, alpha_hits, 0);
+    if !db::math::near(std::array::get(alpha_vec, 0), 1.0) {
+        return fail("a component did not survive the round trip", 22);
+    }
+    if !db::math::near(vec::metric::norm_at(alpha_vec, 0, dim()), 1.0) {
+        return fail("a reloaded vector is no longer unit length", 22);
+    }
+    say("ok  fixed-point round trip");
+
+    // ---------------------------------------------------------------- 23 ---
+    // The ranking over reloaded vectors matches the ranking over the originals.
+    // This is the property that matters: persistence must not perturb search.
+    let before = vec::db::query(source, v4(1.0, 0.0, 0.0, 0.0), 4);
+    let after = vec::db::query(reloaded, v4(1.0, 0.0, 0.0, 0.0), 4);
+    if vec::search::hit_count(before) != vec::search::hit_count(after) {
+        return fail("hit counts differ across a save/load", 23);
+    }
+    var i = 0;
+    var same = true;
+    while i < vec::search::hit_count(before) {
+        let id_before = vec::db::hit_id(source, before, i);
+        let id_after = vec::db::hit_id(reloaded, after, i);
+        if std::string::as_str(id_before) != std::string::as_str(id_after) {
+            same = false;
+        }
+        // Scores must agree to within the encoding's precision.
+        if !db::math::near(vec::search::hit_score(before, i), vec::search::hit_score(after, i)) {
+            same = false;
+        }
+        i = i + 1;
+    }
+    if !same {
+        return fail("ranking changed across a save/load", 23);
+    }
+    // And the ranking is the one the geometry predicts: alpha, then delta.
+    let best = vec::db::hit_id(reloaded, after, 0);
+    if std::string::as_str(best) != "alpha" {
+        return fail("nearest neighbour is not alpha", 23);
+    }
+    let second = vec::db::hit_id(reloaded, after, 1);
+    if std::string::as_str(second) != "delta" {
+        return fail("second neighbour is not delta", 23);
+    }
+    say("ok  ranking is stable across persistence");
+
+    // ---------------------------------------------------------------- 24 ---
+    // Payloads survive, which is what makes this enough to build retrieval on.
+    let payload = vec::db::hit_payload(reloaded, after, 0);
+    if std::string::as_str(payload) != "the first document" {
+        return fail("a payload did not survive the round trip", 24);
+    }
+    say("ok  payloads");
+
+    // ---------------------------------------------------------------- 25 ---
+    // A removed row does not come back, and the file shrinks: a save compacts.
+    var edited = build();
+    let _ = vec::db::remove(edited, "beta");
+    let _ = vec::db::save_as(edited, path());
+    let after_remove = vec::db::open(path(), dim(), vec::metric::metric_cosine());
+    if vec::db::count(after_remove) != 3 {
+        return fail("a removed row survived the save", 25);
+    }
+    if vec::db::contains(after_remove, "beta") {
+        return fail("a removed id is still present after reload", 25);
+    }
+    say("ok  removal compacts on save");
+
+    // ---------------------------------------------------------------- 26 ---
+    // A file that is not a TVEC file is refused rather than half-read.
+    let _ = vec::disk::write_bytes(bad_path(), std::string::from_str("this is not a vector file at all"));
+    let corrupt = vec::db::open(bad_path(), dim(), vec::metric::metric_cosine());
+    if vec::db::is_ok(corrupt) {
+        return fail("a corrupt file was accepted", 26);
+    }
+    if vec::db::count(corrupt) != 0 {
+        return fail("a corrupt file yielded rows", 26);
+    }
+    say("ok  corrupt files are refused");
+
+    // ---------------------------------------------------------------- 27 ---
+    // Opening a good file at the wrong dimension is an error, not a
+    // reinterpretation of its bytes.
+    let mismatched = vec::db::open(path(), dim() + 1, vec::metric::metric_cosine());
+    if vec::db::is_ok(mismatched) {
+        return fail("a dimension mismatch was accepted", 27);
+    }
+    say("ok  dimension mismatch is reported");
+
+    // ---------------------------------------------------------------- 29 ---
+    // A component past what the fixed-point format holds must be refused, not
+    // silently clamped into the file. Only l2/dot stores can reach this;
+    // cosine normalizes everything to magnitude 1.
+    var oversized = vec::store::empty(dim(), vec::metric::metric_l2());
+    let _ = vec::store::add(oversized, v4(5000000000.0, 1.0, 0.0, 0.0), "huge", "");
+    if vec::codec::is_encodable(oversized) {
+        return fail("an unrepresentable store claimed to be encodable", 29);
+    }
+    // And the refusal names *why*, distinctly from a host error, so a caller
+    // can tell "your data will not fit" from "the path could not be opened".
+    if vec::disk::save_verified(oversized, bad_path()) != vec::disk::err_unrepresentable() {
+        return fail("an unrepresentable store was saved anyway", 29);
+    }
+    say("ok  unrepresentable components are refused");
+
+    // ---------------------------------------------------------------- 30 ---
+    // Non-finite components are refused, and extreme-but-finite ones are
+    // handled without overflowing an intermediate. Squaring a 1e200 component
+    // overflows to infinity, which once drove `sqrt` into unbounded recursion
+    // and aborted the process from an ordinary `add`.
+    var guard = vec::store::empty(dim(), vec::metric::metric_cosine());
+    if vec::store::add(guard, v4(0.0 / 0.0, 1.0, 0.0, 0.0), "nan", "") != 0 - 1 {
+        return fail("a NaN component was accepted", 30);
+    }
+    if vec::store::add(guard, v4(1.0 / 0.0, 1.0, 0.0, 0.0), "inf", "") != 0 - 1 {
+        return fail("an infinite component was accepted", 30);
+    }
+    if vec::store::add(guard, v4(1.0e200, 1.0e200, 0.0, 0.0), "huge", "") != 0 {
+        return fail("an extreme but finite vector was refused", 30);
+    }
+    // ...and it is stored as a true unit vector, not a NaN-poisoned one.
+    let unit = vec::store::vector_at(guard, 0);
+    if !db::math::near(vec::metric::norm_at(unit, 0, dim()), 1.0) {
+        return fail("an extreme vector did not normalize to unit length", 30);
+    }
+    say("ok  non-finite refused, extreme magnitudes handled");
+
+    // ---------------------------------------------------------------- 28 ---
+    // Clean up after ourselves, and prove it.
+    let _ = vec::disk::remove(path());
+    let _ = vec::disk::remove(bad_path());
+    if vec::disk::exists(path()) || vec::disk::exists(bad_path()) {
+        return fail("temporary files were left behind", 28);
+    }
+    say("ok  cleanup");
+
+    say("");
+    say("all vector checks passed");
+    0
+}

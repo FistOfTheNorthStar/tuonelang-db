@@ -1,0 +1,517 @@
+// vec::metric — the distance and similarity functions, over flat float slices.
+//
+// This is the hot loop of the whole library: a search over N vectors of
+// dimension D is N calls into this module, so everything here is written to be
+// a single pass over contiguous memory with no allocation.
+//
+// THE FLAT-SLICE CONVENTION.
+//
+// v0 has no `Array[Array[Float]]`, exactly as it has no `Array[Array[String]]`
+// — which is why `pg::query::ResultSet` is already a flat row-major array. This
+// module takes the same shape: every function reads a vector as `dim` floats
+// starting at an offset in one big `Array[Float]`. That is not a workaround, it
+// is the layout a vector index wants anyway — one allocation for the whole
+// corpus, and each vector's components adjacent in cache.
+//
+// WHY COSINE IS A DOT PRODUCT HERE.
+//
+// Cosine similarity is `dot(a, b) / (norm(a) * norm(b))`. Both norms are
+// properties of a vector alone, so if every vector is scaled to norm 1 *once*
+// at insert time, the denominator is 1 forever and the similarity of any pair
+// is just their dot product. That turns the per-comparison cost from
+// `2D multiplies + 2 sqrt + a divide` into `D multiplies`, and the sqrt this
+// library had to hand-write (`db::math::sqrt`) is then paid once per vector
+// rather than twice per comparison.
+//
+// Embeddings from every mainstream model are compared by cosine, so this is
+// the default path. `cosine_at` (the honest, un-normalized form) is kept for
+// vectors that were not normalized, and the two agree to within `epsilon` —
+// which a spec below pins.
+
+module vec::metric;
+
+// ----------------------------------------------------------------------------
+// Metric tags.
+//
+// A tag is an `Int` rather than an enum so it can be stored in a file header
+// and compared without a match — the same choice `db::error` makes for kinds.
+// ----------------------------------------------------------------------------
+
+/// Cosine similarity — **higher is closer**. The default for embeddings.
+pub fn metric_cosine() -> Int {
+    1
+}
+
+/// Squared Euclidean (L2) distance — **lower is closer**.
+pub fn metric_l2() -> Int {
+    2
+}
+
+/// Inner (dot) product — **higher is closer**.
+pub fn metric_dot() -> Int {
+    3
+}
+
+/// A short human name for a metric tag, for rendering and error messages.
+///
+/// # Example
+/// ```tuo
+/// let n = vec::metric::metric_name(vec::metric::metric_cosine()); // "cosine"
+/// ```
+pub fn metric_name(take m: Int) -> Str {
+    if m == metric_cosine() {
+        "cosine"
+    } else if m == metric_l2() {
+        "l2"
+    } else if m == metric_dot() {
+        "dot"
+    } else {
+        "unknown"
+    }
+}
+
+/// Is `m` a metric this library implements?
+///
+/// # Example
+/// ```tuo
+/// let ok = vec::metric::is_metric(1); // true
+/// ```
+pub fn is_metric(take m: Int) -> Bool {
+    m == metric_cosine() || m == metric_l2() || m == metric_dot()
+}
+
+/// Does a **higher** score mean a **closer** match for this metric?
+///
+/// Ranking code needs exactly this bit and nothing else about a metric, so it
+/// is answered once here rather than re-derived at every call site.
+///
+/// # Example
+/// ```tuo
+/// let desc = vec::metric::higher_is_closer(vec::metric::metric_cosine()); // true
+/// ```
+pub fn higher_is_closer(take m: Int) -> Bool {
+    m == metric_cosine() || m == metric_dot()
+}
+
+// ----------------------------------------------------------------------------
+// The kernels.
+//
+// Each reads `dim` floats from `a` at `a_at` and from `b` at `b_at`.
+// ----------------------------------------------------------------------------
+
+/// The dot product of two `dim`-length slices.
+///
+/// # Example
+/// ```tuo
+/// // let d = vec::metric::dot_at(xs, 0, ys, 0, 3);
+/// ```
+pub fn dot_at(in a: Array[Float], take a_at: Int, in b: Array[Float], take b_at: Int, take dim: Int) -> Float {
+    var sum = 0.0;
+    var i = 0;
+    while i < dim {
+        sum = sum + std::array::get(a, a_at + i) * std::array::get(b, b_at + i);
+        i = i + 1;
+    }
+    sum
+}
+
+/// The squared Euclidean distance between two `dim`-length slices.
+///
+/// The square root is deliberately **not** taken: it is monotonic, so it
+/// changes no ranking, and omitting it saves a `sqrt` per comparison. Call
+/// `db::math::sqrt` on the result if a true distance is needed for display.
+///
+/// # Example
+/// ```tuo
+/// // let d = vec::metric::l2_squared_at(xs, 0, ys, 0, 3);
+/// ```
+pub fn l2_squared_at(in a: Array[Float], take a_at: Int, in b: Array[Float], take b_at: Int, take dim: Int) -> Float {
+    var sum = 0.0;
+    var i = 0;
+    while i < dim {
+        let d = std::array::get(a, a_at + i) - std::array::get(b, b_at + i);
+        sum = sum + d * d;
+        i = i + 1;
+    }
+    sum
+}
+
+/// The squared L2 norm of a `dim`-length slice.
+///
+/// # Example
+/// ```tuo
+/// // let n = vec::metric::norm_squared_at(xs, 0, 3);
+/// ```
+pub fn norm_squared_at(in a: Array[Float], take a_at: Int, take dim: Int) -> Float {
+    var sum = 0.0;
+    var i = 0;
+    while i < dim {
+        let v = std::array::get(a, a_at + i);
+        sum = sum + v * v;
+        i = i + 1;
+    }
+    sum
+}
+
+/// The L2 norm (magnitude) of a `dim`-length slice.
+///
+/// # Example
+/// ```tuo
+/// // let n = vec::metric::norm_at(xs, 0, 3);
+/// ```
+pub fn norm_at(in a: Array[Float], take a_at: Int, take dim: Int) -> Float {
+    // Squaring is what overflows and underflows, not the norm itself: a vector
+    // of 1e200s has a perfectly representable norm, but its *squared* norm is
+    // +inf, and a vector of 1e-200s has a representable norm whose square
+    // underflows to 0. Both cases silently destroyed the magnitude.
+    //
+    // So factor the largest component out first — `norm(v) = m * norm(v / m)`
+    // — which puts every squared term in [0, 1] and makes the sum safe. This
+    // is the standard scaled-hypot construction, and it costs one extra pass.
+    let m = max_abs_at(a, a_at, dim);
+    if m <= 0.0 || db::math::is_nan(m) {
+        // An all-zero (or NaN-bearing) vector has no magnitude to report.
+        m
+    } else if db::math::is_infinite(m) {
+        m
+    } else {
+        var sum = 0.0;
+        var i = 0;
+        while i < dim {
+            let scaled = std::array::get(a, a_at + i) / m;
+            sum = sum + scaled * scaled;
+            i = i + 1;
+        }
+        m * db::math::sqrt(sum)
+    }
+}
+
+/// The largest absolute component of a `dim`-length slice.
+///
+/// The scale factor `norm_at` divides by; exposed because it is the honest
+/// answer to "how big is this vector" when the squared norm would not fit.
+///
+/// # Example
+/// ```tuo
+/// // let m = vec::metric::max_abs_at(xs, 0, 3);
+/// ```
+pub fn max_abs_at(in a: Array[Float], take a_at: Int, take dim: Int) -> Float {
+    var m = 0.0;
+    var i = 0;
+    while i < dim {
+        let v = db::math::abs_f(std::array::get(a, a_at + i));
+        if v > m || db::math::is_nan(v) {
+            m = v;
+        }
+        i = i + 1;
+    }
+    m
+}
+
+/// Full cosine similarity, dividing by both magnitudes.
+///
+/// Returns `0.0` when either vector has zero magnitude, which is the only
+/// defensible answer: a zero vector has no direction to be similar to.
+///
+/// # Example
+/// ```tuo
+/// // let s = vec::metric::cosine_at(xs, 0, ys, 0, 3);
+/// ```
+pub fn cosine_at(in a: Array[Float], take a_at: Int, in b: Array[Float], take b_at: Int, take dim: Int) -> Float {
+    let na = norm_at(a, a_at, dim);
+    let nb = norm_at(b, b_at, dim);
+    if na <= 0.0 || nb <= 0.0 {
+        0.0
+    } else {
+        dot_at(a, a_at, b, b_at, dim) / (na * nb)
+    }
+}
+
+/// Score two slices under `metric`, in the metric's own orientation
+/// (higher-is-closer for cosine and dot, lower-is-closer for L2).
+///
+/// `metric_cosine` assumes both slices are **already normalized** and so is a
+/// bare dot product — see the module header. Use `cosine_at` for raw vectors.
+///
+/// # Example
+/// ```tuo
+/// // let s = vec::metric::score_at(xs, 0, ys, 0, 3, vec::metric::metric_l2());
+/// ```
+pub fn score_at(in a: Array[Float], take a_at: Int, in b: Array[Float], take b_at: Int, take dim: Int, take metric: Int) -> Float {
+    if metric == metric_l2() {
+        l2_squared_at(a, a_at, b, b_at, dim)
+    } else {
+        // Cosine over normalized vectors and a raw inner product are the same
+        // kernel; they differ only in what the caller guaranteed about input.
+        dot_at(a, a_at, b, b_at, dim)
+    }
+}
+
+/// Is `candidate` a better score than `incumbent` under `metric`?
+///
+/// The single place the direction of a metric is applied, so no ranking code
+/// has to remember which way L2 points.
+///
+/// # Example
+/// ```tuo
+/// let b = vec::metric::is_better(0.9, 0.5, vec::metric::metric_cosine()); // true
+/// ```
+pub fn is_better(take candidate: Float, take incumbent: Float, take metric: Int) -> Bool {
+    if higher_is_closer(metric) {
+        candidate > incumbent
+    } else {
+        candidate < incumbent
+    }
+}
+
+/// The score that loses to every real score under `metric` — the seed for a
+/// running best.
+///
+/// # Example
+/// ```tuo
+/// let w = vec::metric::worst_score(vec::metric::metric_l2());
+/// ```
+pub fn worst_score(take metric: Int) -> Float {
+    // A true infinity, not a large finite number. `1e300` is a *reachable*
+    // score — an L2 squared distance between two 1e160-magnitude vectors
+    // exceeds it, and can itself be +inf — so a finite sentinel is one a real
+    // score can beat. That makes `hit_score` on an out-of-range index return
+    // something a caller's comparison silently prefers to a genuine result.
+    if higher_is_closer(metric) {
+        0.0 - infinity()
+    } else {
+        infinity()
+    }
+}
+
+/// Positive infinity.
+///
+/// Float arithmetic in v0 is IEEE-754 and never traps, so dividing by zero is
+/// the direct way to name this value; there is no literal for it.
+///
+/// # Example
+/// ```tuo
+/// let big = vec::metric::infinity();
+/// ```
+pub fn infinity() -> Float {
+    1.0 / 0.0
+}
+
+// ----------------------------------------------------------------------------
+// Normalization.
+// ----------------------------------------------------------------------------
+
+/// Scale the `dim` floats at `at` in `xs` to unit length, in place.
+///
+/// A zero vector is left untouched — there is no direction to preserve, and
+/// dividing would produce the NaNs this library refuses to store.
+///
+/// # Example
+/// ```tuo
+/// // vec::metric::normalize_at(xs, 0, 3);
+/// ```
+pub fn normalize_at(mut xs: Array[Float], take at: Int, take dim: Int) {
+    let n = norm_at(xs, at, dim);
+    if n > 0.0 {
+        var i = 0;
+        while i < dim {
+            std::array::set(xs, at + i, std::array::get(xs, at + i) / n);
+            i = i + 1;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Spec helpers.
+//
+// Specs cannot bind locals, so each property that needs a constructed vector
+// gets a named builder here.
+// ----------------------------------------------------------------------------
+
+/// Spec helper: a two-element array `[a, b]`.
+pub fn pair_of(take a: Float, take b: Float) -> Array[Float] {
+    var xs = std::array::empty();
+    std::array::push(xs, a);
+    std::array::push(xs, b);
+    xs
+}
+
+/// Spec helper: a four-element array holding two 2-D vectors back to back.
+pub fn quad_of(take a: Float, take b: Float, take c: Float, take d: Float) -> Array[Float] {
+    var xs = std::array::empty();
+    std::array::push(xs, a);
+    std::array::push(xs, b);
+    std::array::push(xs, c);
+    std::array::push(xs, d);
+    xs
+}
+
+/// Spec helper: the dot product of `[a,b]` and `[c,d]`.
+pub fn dot2(take a: Float, take b: Float, take c: Float, take d: Float) -> Float {
+    let xs = quad_of(a, b, c, d);
+    dot_at(xs, 0, xs, 2, 2)
+}
+
+/// Spec helper: the squared L2 distance between `[a,b]` and `[c,d]`.
+pub fn l2_2(take a: Float, take b: Float, take c: Float, take d: Float) -> Float {
+    let xs = quad_of(a, b, c, d);
+    l2_squared_at(xs, 0, xs, 2, 2)
+}
+
+/// Spec helper: the cosine similarity of `[a,b]` and `[c,d]`.
+pub fn cosine2(take a: Float, take b: Float, take c: Float, take d: Float) -> Float {
+    let xs = quad_of(a, b, c, d);
+    cosine_at(xs, 0, xs, 2, 2)
+}
+
+/// Spec helper: the norm of `[a,b]`.
+pub fn norm2(take a: Float, take b: Float) -> Float {
+    let xs = pair_of(a, b);
+    norm_at(xs, 0, 2)
+}
+
+/// Spec helper: the norm of `[a,b]` after normalizing it.
+pub fn norm_after_normalize(take a: Float, take b: Float) -> Float {
+    var xs = pair_of(a, b);
+    normalize_at(xs, 0, 2);
+    norm_at(xs, 0, 2)
+}
+
+/// Spec helper: the first component of `[a,b]` after normalizing.
+pub fn first_after_normalize(take a: Float, take b: Float) -> Float {
+    var xs = pair_of(a, b);
+    normalize_at(xs, 0, 2);
+    std::array::get(xs, 0)
+}
+
+/// Spec helper: cosine of a raw pair vs. the dot product of the same pair once
+/// both sides are normalized. These must agree — that equivalence is the whole
+/// reason the index stores normalized vectors.
+pub fn cosine_matches_normalized_dot(take a: Float, take b: Float, take c: Float, take d: Float) -> Bool {
+    let raw = cosine2(a, b, c, d);
+    var xs = quad_of(a, b, c, d);
+    normalize_at(xs, 0, 2);
+    normalize_at(xs, 2, 2);
+    db::math::near(raw, dot_at(xs, 0, xs, 2, 2))
+}
+
+spec metric_name {
+    then metric_name(metric_cosine()) == "cosine";
+    then metric_name(metric_l2()) == "l2";
+    then metric_name(metric_dot()) == "dot";
+    then metric_name(99) == "unknown";
+}
+
+spec is_metric {
+    then is_metric(metric_cosine());
+    then is_metric(metric_l2());
+    then is_metric(metric_dot());
+    then !is_metric(0);
+    then !is_metric(4);
+}
+
+spec higher_is_closer {
+    then higher_is_closer(metric_cosine());
+    then higher_is_closer(metric_dot());
+    // L2 is a distance: closer means smaller. This is the bit ranking depends on.
+    then !higher_is_closer(metric_l2());
+}
+
+spec dot_at {
+    then db::math::near(dot2(1.0, 0.0, 1.0, 0.0), 1.0);
+    then db::math::near(dot2(1.0, 0.0, 0.0, 1.0), 0.0);
+    then db::math::near(dot2(1.0, 2.0, 3.0, 4.0), 11.0);
+    then db::math::near(dot2(0.0 - 1.0, 0.0, 1.0, 0.0), 0.0 - 1.0);
+}
+
+spec l2_squared_at {
+    then db::math::near(l2_2(0.0, 0.0, 3.0, 4.0), 25.0);
+    then db::math::near(l2_2(1.0, 1.0, 1.0, 1.0), 0.0);
+    then db::math::near(l2_2(0.0, 0.0, 0.0, 0.0), 0.0);
+}
+
+spec norm_at {
+    then db::math::near(norm2(3.0, 4.0), 5.0);
+    then db::math::near(norm2(1.0, 0.0), 1.0);
+    then db::math::near(norm2(0.0, 0.0), 0.0);
+}
+
+spec cosine_at {
+    // Identical direction is 1, opposite is -1, orthogonal is 0.
+    then db::math::near(cosine2(1.0, 0.0, 1.0, 0.0), 1.0);
+    then db::math::near(cosine2(1.0, 0.0, 0.0 - 1.0, 0.0), 0.0 - 1.0);
+    then db::math::near(cosine2(1.0, 0.0, 0.0, 1.0), 0.0);
+    // Magnitude does not affect cosine — only direction does.
+    then db::math::near(cosine2(1.0, 1.0, 5.0, 5.0), 1.0);
+    // A zero vector has no direction, so it scores 0 rather than NaN.
+    then db::math::near(cosine2(0.0, 0.0, 1.0, 0.0), 0.0);
+    then !db::math::is_nan(cosine2(0.0, 0.0, 0.0, 0.0));
+}
+
+spec normalize_at {
+    then db::math::near(norm_after_normalize(3.0, 4.0), 1.0);
+    then db::math::near(norm_after_normalize(0.001, 0.0), 1.0);
+    then db::math::near(first_after_normalize(3.0, 4.0), 0.6);
+    // A zero vector is left alone rather than turned into NaNs.
+    then db::math::near(norm_after_normalize(0.0, 0.0), 0.0);
+    then !db::math::is_nan(first_after_normalize(0.0, 0.0));
+}
+
+spec "cosine of raw vectors equals dot of normalized vectors" {
+    then cosine_matches_normalized_dot(1.0, 2.0, 3.0, 4.0);
+    then cosine_matches_normalized_dot(5.0, 0.0, 0.0, 2.0);
+    then cosine_matches_normalized_dot(0.0 - 1.0, 3.0, 2.0, 0.0 - 4.0);
+}
+
+spec is_better {
+    then is_better(0.9, 0.5, metric_cosine());
+    then !is_better(0.5, 0.9, metric_cosine());
+    // Lower wins for L2 — the opposite comparison, from the same helper.
+    then is_better(0.5, 0.9, metric_l2());
+    then !is_better(0.9, 0.5, metric_l2());
+}
+
+spec worst_score {
+    then is_better(0.0, worst_score(metric_cosine()), metric_cosine());
+    then is_better(1000.0, worst_score(metric_l2()), metric_l2());
+}
+
+/// Spec helper: the norm of `[a, b]` after normalizing — must be 1 at every
+/// magnitude a double can hold.
+pub fn unit_after_normalize(take a: Float, take b: Float) -> Bool {
+    var xs = pair_of(a, b);
+    normalize_at(xs, 0, 2);
+    db::math::near(norm_at(xs, 0, 2), 1.0)
+}
+
+/// Spec helper: the norm of `[a, b]`, for checking scale safety.
+pub fn norm_of(take a: Float, take b: Float) -> Float {
+    let xs = pair_of(a, b);
+    norm_at(xs, 0, 2)
+}
+
+spec "norm_at is safe at every scale" {
+    // A squared norm overflows for 1e200 components and underflows for 1e-200
+    // ones; factoring out the largest component keeps both exact.
+    then db::math::near_by(norm_of(3.0e200, 4.0e200), 5.0e200, 1.0e192);
+    then db::math::near_by(norm_of(3.0e-200, 4.0e-200), 5.0e-200, 1.0e-208);
+    then db::math::near(norm_of(3.0, 4.0), 5.0);
+    then !db::math::is_nan(norm_of(1.0e200, 1.0e200));
+    // And normalizing yields a true unit vector throughout.
+    then unit_after_normalize(1.0e7, 0.0);
+    then unit_after_normalize(1.0e8, 0.0);
+    then unit_after_normalize(1.0e200, 1.0e200);
+    then unit_after_normalize(1.0e-200, 0.0);
+    then unit_after_normalize(0.0000000001, 0.0);
+    then unit_after_normalize(3.0, 4.0);
+}
+
+spec "worst_score is beaten by every real score" {
+    // A finite sentinel is reachable: an L2 squared distance can exceed 1e300
+    // or be +inf outright.
+    then is_better(1.0e301, worst_score(metric_l2()), metric_l2());
+    then is_better(1.0e300, worst_score(metric_l2()), metric_l2());
+    then is_better(0.0, worst_score(metric_l2()), metric_l2());
+    then is_better(0.0 - 1.0e301, worst_score(metric_cosine()), metric_cosine());
+    then db::math::is_infinite(worst_score(metric_l2()));
+}

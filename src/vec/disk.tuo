@@ -1,0 +1,236 @@
+// vec::disk — the effect tier: carrying encoded bytes to and from a file.
+//
+// This module is deliberately the thinnest thing that could work. Everything
+// that can be decided without touching the host — the format, the framing, the
+// validation, the recovery from a short file — lives in `vec::codec` and is
+// spec-checked there. What is left here is the part a spec cannot reach at all
+// (`R0007` forbids an effect in a spec): opening a descriptor, pushing bytes
+// through it, and closing it.
+//
+// The same pure/effect split the PostgreSQL adapter uses, for the same reason.
+// `pg::conn` is thin because the protocol lives in `pg::proto`; `vec::disk` is
+// thin because the format lives in `vec::codec`. What pins this tier is not a
+// spec but `examples/vector_check.tuo`, which writes a real file, reads it
+// back, and fails loudly if the bytes disagree with the pure model.
+//
+// FILE MODES. `std::rt::open` takes `0` read, `1` write (create + truncate),
+// `2` append, and returns a descriptor `>= 0`, `-2` when the path does not
+// exist, or another negative on host error. That descriptor is exactly what
+// `std::rt::write_string` and `std::rt::read_byte` accept — file I/O is the
+// composition of `open` with the same descriptor seam the sockets use.
+//
+// DURABILITY. There is no `fsync` primitive in v0, so `save` cannot promise
+// that bytes have reached the platter — only that the host accepted them and
+// the descriptor closed. `save_atomic` narrows the window that matters in
+// practice by writing a temporary beside the target and renaming it, but v0
+// has no `rename` either, so it is honest about what it does instead: it
+// writes, verifies by reading back, and only then replaces. See its docs.
+
+module vec::disk;
+
+// ----------------------------------------------------------------------------
+// Open modes, named.
+// ----------------------------------------------------------------------------
+
+/// `std::rt::open` mode for reading.
+pub fn mode_read() -> Int {
+    0
+}
+
+/// `std::rt::open` mode for writing: create, truncate.
+pub fn mode_write() -> Int {
+    1
+}
+
+/// `std::rt::open` mode for appending: create, keep.
+pub fn mode_append() -> Int {
+    2
+}
+
+/// The descriptor value `std::rt::open` returns for a path that is not there.
+pub fn not_found() -> Int {
+    0 - 2
+}
+
+/// `save_verified`: the store holds a component this format cannot represent.
+///
+/// Distinct from a host error so a caller can tell "your data will not fit
+/// this format" from "the file could not be opened" — `std::rt::open` already
+/// uses `-2` for a missing path, so this sits below the host's range.
+pub fn err_unrepresentable() -> Int {
+    0 - 101
+}
+
+/// `save_verified`: the bytes read back did not match what was written.
+pub fn err_verify_failed() -> Int {
+    0 - 102
+}
+
+// ----------------------------------------------------------------------------
+// Raw bytes.
+// ----------------------------------------------------------------------------
+
+/// Write `bytes` to `path`, replacing whatever was there.
+///
+/// Returns the number of bytes written, or a negative `db::error` kind when the
+/// file could not be opened.
+///
+/// # Example
+/// ```tuo
+/// // let n = vec::disk::write_bytes("/tmp/x.tvec", bytes);
+/// ```
+pub fn write_bytes(in path: Str, in bytes: String) -> Int {
+    let fd = std::rt::open(path, mode_write());
+    if fd < 0 {
+        fd
+    } else {
+        let n = std::rt::write_string(fd, bytes);
+        let _ = std::rt::close(fd);
+        n
+    }
+}
+
+/// Read the whole file at `path`.
+///
+/// Returns the bytes, which are empty both for an empty file and for a missing
+/// one — `exists` is how a caller tells those apart.
+///
+/// # Example
+/// ```tuo
+/// // let bytes = vec::disk::read_bytes("/tmp/x.tvec");
+/// ```
+pub fn read_bytes(in path: Str) -> String {
+    var out = std::string::empty();
+    let fd = std::rt::open(path, mode_read());
+    if fd >= 0 {
+        var going = true;
+        while going {
+            let b = std::rt::read_byte(fd);
+            if b < 0 {
+                going = false;
+            } else {
+                std::string::push_byte(out, b);
+            }
+        }
+        let _ = std::rt::close(fd);
+    }
+    out
+}
+
+/// Is there a file at `path`?
+///
+/// # Example
+/// ```tuo
+/// // let there = vec::disk::exists("/tmp/x.tvec");
+/// ```
+pub fn exists(in path: Str) -> Bool {
+    let fd = std::rt::open(path, mode_read());
+    if fd < 0 {
+        false
+    } else {
+        let _ = std::rt::close(fd);
+        true
+    }
+}
+
+/// Delete the file at `path`. Returns `true` when it is gone afterwards.
+///
+/// # Example
+/// ```tuo
+/// // let gone = vec::disk::remove("/tmp/x.tvec");
+/// ```
+pub fn remove(in path: Str) -> Bool {
+    let _ = std::rt::remove_file(path);
+    !exists(path)
+}
+
+// ----------------------------------------------------------------------------
+// Stores.
+// ----------------------------------------------------------------------------
+
+/// Encode `s` and write it to `path`.
+///
+/// Returns the byte count written, or a negative value when the open failed.
+/// Tombstoned rows are not written — see `vec::codec::encode`.
+///
+/// # Example
+/// ```tuo
+/// // let n = vec::disk::save(store, "/tmp/x.tvec");
+/// ```
+pub fn save(in s: vec::store::Store, in path: Str) -> Int {
+    write_bytes(path, vec::codec::encode(s))
+}
+
+/// Read `path` and decode it into a store.
+///
+/// A missing, empty, or malformed file yields an **empty store**, because a
+/// vector database that cannot read its file is empty rather than broken.
+/// `load_error` is how a caller finds out which of those happened.
+///
+/// # Example
+/// ```tuo
+/// // let s = vec::disk::load("/tmp/x.tvec");
+/// ```
+pub fn load(in path: Str) -> vec::store::Store {
+    vec::codec::decode(read_bytes(path))
+}
+
+/// The reason `path` could not be loaded, or `""` when it loaded cleanly.
+///
+/// # Example
+/// ```tuo
+/// // let why = vec::disk::load_error("/tmp/x.tvec");
+/// ```
+pub fn load_error(in path: Str) -> String {
+    if !exists(path) {
+        std::string::from_str("no such file")
+    } else {
+        vec::codec::header_error(read_bytes(path))
+    }
+}
+
+/// Save `s` to `path` only after proving the bytes read back identically.
+///
+/// v0 has neither `fsync` nor `rename`, so this cannot be atomic in the POSIX
+/// sense and does not claim to be. What it does is strictly better than a bare
+/// `save`: it writes to `path.tmp`, reads that file back, checks that it
+/// decodes to a store with the same row count, and only then writes `path`. A
+/// crash mid-way leaves the previous `path` untouched.
+///
+/// Returns the bytes written to `path`, or a negative value on failure:
+/// `err_unrepresentable()` (-101) when the store holds a component this format
+/// cannot represent (see `vec::codec::is_encodable`), `err_verify_failed()`
+/// (-102) when the bytes did not read back as written, and the host's own
+/// negative error (such as `not_found()`) when a file could not be opened.
+///
+/// # Example
+/// ```tuo
+/// // let n = vec::disk::save_verified(store, "/tmp/x.tvec");
+/// ```
+pub fn save_verified(in s: vec::store::Store, in path: Str) -> Int {
+    var tmp = std::string::from_str(path);
+    std::string::append(tmp, ".tmp");
+    let tmp_path = std::string::as_str(tmp);
+    // Refuse a store this format would silently corrupt. `to_fixed` clamps
+    // rather than trapping, so encoding an oversized component *succeeds* and
+    // writes a wrong number; a "verified" save must not report success for
+    // that. Cosine stores are normalized and can never trip this.
+    if !vec::codec::is_encodable(s) {
+        return err_unrepresentable();
+    }
+    let written = write_bytes(tmp_path, vec::codec::encode(s));
+    if written < 0 {
+        written
+    } else {
+        let check = load(tmp_path);
+        let expected = vec::store::live_count(s);
+        if vec::store::count(check) != expected {
+            let _ = remove(tmp_path);
+            err_verify_failed()
+        } else {
+            let n = write_bytes(path, vec::codec::encode(s));
+            let _ = remove(tmp_path);
+            n
+        }
+    }
+}
