@@ -1,0 +1,188 @@
+// db::text — numbers as text, for messages and for wire formats.
+//
+// This is part of the backend-neutral `core` feature. There is no
+// `std::str::format` reachable from a user package, so anything that renders
+// a number — an error message naming a row count, a vector literal bound as
+// a query parameter — has to build its own digits. Before this module each
+// feature carried its own copy; this is the one they share.
+//
+// `render_int` is exact. `render_float` is fixed-point with nine fractional
+// digits, chosen for what these renderings are *for*: an embedding component
+// carries about seven significant digits (float32), and nine places past the
+// point keeps every one of them for any magnitude an embedding takes. It is
+// not a shortest-round-trip printer, and does not claim to be.
+
+module db::text;
+
+/// `n` in decimal, with a leading `-` when negative. Exact for every `Int`,
+/// including the minimum, whose magnitude does not fit a positive `Int`.
+///
+/// # Example
+/// ```tuo
+/// let s = db::text::render_int(0 - 42); // "-42"
+/// ```
+pub fn render_int(take n: Int) -> String {
+    if n == 0 {
+        return std::string::from_str("0");
+    }
+    var digits = std::string::empty();
+    // `0 - n` overflows for the minimum, and overflow traps. Peel the last
+    // digit off the negative side first so the negation is always safe.
+    var v = if n < 0 {
+        0 - (n / 10)
+    } else {
+        n / 10
+    };
+    let last = if n < 0 {
+        0 - (n % 10)
+    } else {
+        n % 10
+    };
+    std::string::push_byte(digits, 48 + last);
+    while v > 0 {
+        std::string::push_byte(digits, 48 + v % 10);
+        v = v / 10;
+    }
+    var out = std::string::empty();
+    if n < 0 {
+        std::string::push_byte(out, 45);
+    }
+    var i = std::string::len(digits) - 1;
+    while i >= 0 {
+        std::string::push_byte(out, std::string::byte_at(digits, i));
+        i = i - 1;
+    }
+    out
+}
+
+/// How many digits `render_float` keeps past the point.
+pub fn float_places() -> Int {
+    9
+}
+
+/// `10^float_places()` as a `Float`.
+pub fn float_scale() -> Float {
+    1000000000.0
+}
+
+/// `10^float_places()` as an `Int`.
+pub fn float_scale_int() -> Int {
+    1000000000
+}
+
+/// The magnitude past which `render_float` keeps only the integer part:
+/// `|x| * float_scale()` must stay inside an `Int`.
+pub fn float_whole_limit() -> Float {
+    9000000000.0
+}
+
+/// `x` in plain decimal: an optional `-`, the integer part, a point, and up
+/// to nine fractional digits with trailing zeros trimmed (but at least one
+/// digit kept, so `1.0` reads as a float). Rounds to nearest at the last
+/// place. Never an exponent, which is what makes the result usable inside a
+/// PostgreSQL array or vector literal.
+///
+/// Non-finite values render as PostgreSQL spells them — `NaN`, `Infinity`,
+/// `-Infinity`. Magnitudes at or above `float_whole_limit` render their
+/// integer part with `.0`, since the fixed-point scaling would overflow.
+///
+/// # Example
+/// ```tuo
+/// let s = db::text::render_float(0.0 - 1.25); // "-1.25"
+/// ```
+pub fn render_float(take x: Float) -> String {
+    if db::math::is_nan(x) {
+        return std::string::from_str("NaN");
+    }
+    if db::math::is_infinite(x) {
+        if x > 0.0 {
+            return std::string::from_str("Infinity");
+        }
+        return std::string::from_str("-Infinity");
+    }
+    let negative = x < 0.0;
+    let magnitude = db::math::abs_f(x);
+    var out = std::string::empty();
+    if negative {
+        std::string::push_byte(out, 45);
+    }
+    if magnitude >= float_whole_limit() {
+        std::string::append(out, std::string::as_str(render_int(magnitude as Int)));
+        std::string::append(out, ".0");
+        return out;
+    }
+    // Scale to an integer count of the last place, rounded to nearest, then
+    // split it into the whole part and the fraction.
+    let scaled = (magnitude * float_scale() + 0.5) as Int;
+    let whole = scaled / float_scale_int();
+    var frac = scaled % float_scale_int();
+    std::string::append(out, std::string::as_str(render_int(whole)));
+    std::string::push_byte(out, 46);
+    // The fraction, zero-padded to `float_places` digits, most significant
+    // first, then trimmed of trailing zeros down to one digit.
+    var digits = std::string::empty();
+    var place = 0;
+    while place < float_places() {
+        std::string::push_byte(digits, 48 + frac % 10);
+        frac = frac / 10;
+        place = place + 1;
+    }
+    // `digits` holds the last place first, so the trailing zeros of the
+    // rendering are its leading entries. Skip them, keeping one digit.
+    let n = std::string::len(digits);
+    var skip = 0;
+    while skip < n - 1 && std::string::byte_at(digits, skip) == 48 {
+        skip = skip + 1;
+    }
+    var i = n - 1;
+    while i >= skip {
+        std::string::push_byte(out, std::string::byte_at(digits, i));
+        i = i - 1;
+    }
+    out
+}
+
+// ----------------------------------------------------------------------------
+// Specs.
+// ----------------------------------------------------------------------------
+
+/// Spec helper: `render_int` as a comparable `Str`.
+pub fn int_is(take n: Int, in expect: Str) -> Bool {
+    std::string::as_str(render_int(n)) == expect
+}
+
+/// Spec helper: `render_float` as a comparable `Str`.
+pub fn float_is(take x: Float, in expect: Str) -> Bool {
+    std::string::as_str(render_float(x)) == expect
+}
+
+spec render_int {
+    then int_is(0, "0");
+    then int_is(7, "7");
+    then int_is(1234, "1234");
+    then int_is(0 - 7, "-7");
+    then int_is(9223372036854775807, "9223372036854775807");
+    // The minimum, whose magnitude does not fit a positive Int.
+    then int_is(0 - 9223372036854775807 - 1, "-9223372036854775808");
+}
+
+spec render_float {
+    then float_is(0.0, "0.0");
+    then float_is(1.0, "1.0");
+    then float_is(0.5, "0.5");
+    then float_is(0.0 - 1.25, "-1.25");
+    then float_is(123.456, "123.456");
+    // Nine places are kept; the tenth rounds.
+    then float_is(0.000000001, "0.000000001");
+    then float_is(0.1234567894, "0.123456789");
+    then float_is(0.1234567896, "0.12345679");
+    // Typical embedding components.
+    then float_is(0.0 - 0.031415927, "-0.031415927");
+    then float_is(0.70710678, "0.70710678");
+    // The renderings PostgreSQL itself uses for the specials.
+    then float_is(0.0 / 0.0, "NaN");
+    then float_is(1.0 / 0.0, "Infinity");
+    then float_is(0.0 - 1.0 / 0.0, "-Infinity");
+    // Past the fixed-point range only the integer part survives.
+    then float_is(12345678901.0, "12345678901.0");
+}

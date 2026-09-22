@@ -1,0 +1,292 @@
+// bridge_check — embeddings through PostgreSQL and into the vector store.
+//
+// The two features are independent, and this program is the proof that they
+// meet: vectors go into a `float8[]` column as parameters, come back out as
+// text, are decoded into the store, and a search over the store ranks them
+// exactly as a search over the originals does. Exits non-zero the moment the
+// round trip disagrees with the pure model.
+//
+// Run it (against the docker-compose Postgres in ../shallowflaws):
+//
+//     tuo run examples/bridge_check.tuo src/db/*.tuo src/pg/*.tuo src/vec/*.tuo
+//
+// Exit codes:
+//
+//     0   every check passed
+//     40  could not connect
+//     41  an INSERT through array_literal failed
+//     42  the column did not come back as a float array
+//     43  a vector did not survive the round trip through the column
+//     44  the store refused a decoded vector
+//     45  search over decoded vectors ranked differently than over the originals
+//     46  a vector sent as a parameter was not read correctly by the server
+
+module bridge_check;
+
+/// A 4-D vector.
+fn v4(take a: Float, take b: Float, take c: Float, take d: Float) -> Array[Float] {
+    var xs = std::array::empty();
+    std::array::push(xs, a);
+    std::array::push(xs, b);
+    std::array::push(xs, c);
+    std::array::push(xs, d);
+    xs
+}
+
+/// The dimensionality this oracle works in.
+fn dim() -> Int {
+    4
+}
+
+/// How many documents the corpus holds.
+fn corpus_size() -> Int {
+    4
+}
+
+/// Document `i`'s vector. Directions far apart, with values that exercise
+/// sign, magnitude and precision through the text rendering.
+fn original(take i: Int) -> Array[Float] {
+    if i == 0 {
+        v4(1.0, 0.0, 0.0, 0.0)
+    } else if i == 1 {
+        v4(0.0, 1.0, 0.0, 0.0)
+    } else if i == 2 {
+        v4(0.0 - 0.031415927, 0.70710678, 0.5, 0.25)
+    } else {
+        v4(0.9, 0.1, 0.0, 0.0)
+    }
+}
+
+/// Document `i`'s id.
+fn original_id(take i: Int) -> Str {
+    if i == 0 {
+        "alpha"
+    } else if i == 1 {
+        "beta"
+    } else if i == 2 {
+        "gamma"
+    } else {
+        "delta"
+    }
+}
+
+/// Document `i`'s payload.
+fn original_body(take i: Int) -> Str {
+    if i == 0 {
+        "the first document"
+    } else if i == 1 {
+        "the second document"
+    } else if i == 2 {
+        "the third document"
+    } else {
+        "nearly the first"
+    }
+}
+
+/// The index of the document with `id`, or -1.
+fn index_of(in id: Str) -> Int {
+    var i = 0;
+    while i < corpus_size() {
+        if original_id(i) == id {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+/// The corpus as an in-memory collection, straight from the originals.
+fn originals() -> vec::db::Db {
+    var d = vec::db::in_memory(dim(), vec::metric::metric_cosine());
+    var i = 0;
+    while i < corpus_size() {
+        let _ = vec::db::add(d, original(i), original_id(i), original_body(i));
+        i = i + 1;
+    }
+    d
+}
+
+fn say(in s: Str) {
+    let _ = std::rt::write(1, s);
+    let _ = std::rt::write(1, "\n");
+}
+
+fn fail(in label: Str, take code: Int) -> Int {
+    let _ = std::rt::write(1, "FAIL: ");
+    let _ = std::rt::write(1, label);
+    let _ = std::rt::write(1, "\n");
+    code
+}
+
+/// EFFECT: insert document `i` through a parameterized INSERT, its vector
+/// rendered as an array literal and cast server-side.
+fn insert(take fd: Int, take i: Int) -> Bool {
+    var ps = std::array::empty();
+    std::array::push(ps, std::string::from_str(original_id(i)));
+    std::array::push(ps, std::string::from_str(original_body(i)));
+    std::array::push(ps, pg::value::array_literal(original(i)));
+    let r = pg::query::execute_params(fd, "INSERT INTO docs (id, body, embedding) VALUES ($1, $2, $3::float8[])", ps, 30000);
+    pg::conn::is_ok_int(r) && pg::conn::unwrap_ok_int(r) == 1
+}
+
+/// Does `v` match document `i`'s vector component-wise?
+fn matches_original(in v: Array[Float], take i: Int) -> Bool {
+    if std::array::len(v) != dim() {
+        return false;
+    }
+    let want = original(i);
+    var c = 0;
+    while c < dim() {
+        if !db::math::near(std::array::get(v, c), std::array::get(want, c)) {
+            return false;
+        }
+        c = c + 1;
+    }
+    true
+}
+
+/// Do two collections rank query `q` identically, ids and scores alike?
+fn same_ranking(in a: vec::db::Db, in b: vec::db::Db, take q: Array[Float]) -> Bool {
+    var qa = q;
+    var qb = std::array::empty();
+    var c = 0;
+    while c < dim() {
+        std::array::push(qb, std::array::get(qa, c));
+        c = c + 1;
+    }
+    let ha = vec::db::query(a, qa, corpus_size());
+    let hb = vec::db::query(b, qb, corpus_size());
+    if vec::search::hit_count(ha) != corpus_size() || vec::search::hit_count(hb) != corpus_size() {
+        return false;
+    }
+    var i = 0;
+    while i < corpus_size() {
+        let ida = vec::db::hit_id(a, ha, i);
+        let idb = vec::db::hit_id(b, hb, i);
+        if std::string::as_str(ida) != std::string::as_str(idb) {
+            return false;
+        }
+        if !db::math::near(vec::search::hit_score(ha, i), vec::search::hit_score(hb, i)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn main() -> Int {
+    say("=== tuonelang-db bridge oracle ===");
+
+    let opened = pg::conn::connect("127.0.0.1", 5432, "shallowflaws", "deepflaws", "", 30000);
+    if !pg::conn::is_ok_int(opened) {
+        return fail("could not connect", 40);
+    }
+    let fd = pg::conn::unwrap_ok_int(opened);
+    let _ = pg::query::execute(fd, "CREATE TEMP TABLE docs (id text PRIMARY KEY, body text, embedding float8[])", 30000);
+
+    // ---------------------------------------------------------------- 41 ---
+    // Every original goes in through array_literal, as a parameter.
+    var i = 0;
+    while i < corpus_size() {
+        if !insert(fd, i) {
+            let _ = pg::conn::shutdown(fd);
+            return fail("INSERT through array_literal failed", 41);
+        }
+        i = i + 1;
+    }
+    say("ok  vectors stored through array_literal parameters");
+
+    // ---------------------------------------------------------------- 42 ---
+    // They come back as a float array column, which is_float_array names.
+    let sel = pg::query::run(fd, "SELECT id, body, embedding FROM docs ORDER BY id", 30000);
+    if !pg::query::is_ok_result(sel) {
+        let _ = pg::conn::shutdown(fd);
+        return fail("SELECT failed", 42);
+    }
+    let rows = pg::query::unwrap_ok_result(sel);
+    if pg::query::row_count(rows) != corpus_size() {
+        let _ = pg::conn::shutdown(fd);
+        return fail("wrong row count", 42);
+    }
+    if !pg::value::is_float_array(pg::query::column_oid(rows, 2)) {
+        let _ = pg::conn::shutdown(fd);
+        return fail("embedding column is not a float array", 42);
+    }
+    say("ok  column reported as float8[]");
+
+    // ---------------------------------------------------------------- 43 ---
+    // Each decoded vector equals its original, component for component — the
+    // text rendering lost nothing an embedding carries.
+    // ---------------------------------------------------------------- 44 ---
+    // And the store accepts every one of them.
+    var loaded = vec::db::in_memory(dim(), vec::metric::metric_cosine());
+    var r = 0;
+    while r < corpus_size() {
+        let id = pg::query::cell(rows, r, 0);
+        let body = pg::query::cell(rows, r, 1);
+        let raw = pg::query::cell(rows, r, 2);
+        let v = pg::value::as_floats_or_empty(std::string::as_str(raw));
+        let which = index_of(std::string::as_str(id));
+        if which < 0 || !matches_original(v, which) {
+            let _ = pg::conn::shutdown(fd);
+            return fail("a vector changed on its way through the column", 43);
+        }
+        if vec::db::add(loaded, v, std::string::as_str(id), std::string::as_str(body)) < 0 {
+            let _ = pg::conn::shutdown(fd);
+            return fail("the store refused a decoded vector", 44);
+        }
+        r = r + 1;
+    }
+    say("ok  every vector round-tripped exactly and loaded");
+
+    // ---------------------------------------------------------------- 45 ---
+    // A search over the loaded collection ranks like one over the originals,
+    // for a query along one axis and for one off every axis.
+    let source = originals();
+    if !same_ranking(source, loaded, v4(1.0, 0.0, 0.0, 0.0)) {
+        let _ = pg::conn::shutdown(fd);
+        return fail("ranking differs after the round trip (axis query)", 45);
+    }
+    if !same_ranking(source, loaded, v4(0.2, 0.7, 0.4, 0.3)) {
+        let _ = pg::conn::shutdown(fd);
+        return fail("ranking differs after the round trip (off-axis query)", 45);
+    }
+    let best = vec::db::query(loaded, v4(1.0, 0.0, 0.0, 0.0), 2);
+    let first = vec::db::hit_id(loaded, best, 0);
+    let second = vec::db::hit_id(loaded, best, 1);
+    if std::string::as_str(first) != "alpha" || std::string::as_str(second) != "delta" {
+        let _ = pg::conn::shutdown(fd);
+        return fail("nearest neighbours are not alpha then delta", 45);
+    }
+    say("ok  search ranks identically over decoded vectors");
+
+    // ---------------------------------------------------------------- 46 ---
+    // A query vector travels the other way as a parameter and the server
+    // reads its components — the shape a pgvector `<=>` query takes.
+    var qp = std::array::empty();
+    std::array::push(qp, pg::value::array_literal(original(2)));
+    let comp = pg::query::run_params(fd, "SELECT ($1::float8[])[2], array_length($1::float8[], 1)", qp, 30000);
+    if !pg::query::is_ok_result(comp) {
+        let _ = pg::conn::shutdown(fd);
+        return fail("the server rejected the array literal", 46);
+    }
+    let crs = pg::query::unwrap_ok_result(comp);
+    if !db::math::near(pg::query::cell_float(crs, 0, 0, 0.0), 0.70710678) || pg::query::cell_int(crs, 0, 1, 0) != dim() {
+        let _ = pg::conn::shutdown(fd);
+        return fail("the server read the array literal wrong", 46);
+    }
+    say("ok  query vector accepted as a parameter server-side");
+
+    // pgvector is optional: report whether this server has it, either way.
+    let void = pg::query::scalar_int(fd, pg::value::vector_oid_query(), 0, 30000);
+    if pg::conn::is_ok_int(void) {
+        say("    pgvector present; vector_literal + $1::vector will work here");
+    } else {
+        say("    pgvector absent on this server; float8[] path verified");
+    }
+
+    let _ = pg::conn::shutdown(fd);
+    say("");
+    say("all bridge checks passed");
+    0
+}

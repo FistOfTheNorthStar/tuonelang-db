@@ -1,6 +1,6 @@
 // live_check — the adapter's acceptance oracle, run against a real server.
 //
-// The pure tiers of this adapter carry 61 executable specs, but a spec cannot
+// The pure tiers of this adapter carry 87 executable specs, but a spec cannot
 // touch a socket (`R0007`), so the effect tier — connecting, the handshake,
 // framing messages off a live stream — needs a different kind of proof. This
 // program is it: it connects to a real PostgreSQL server, runs real SQL, and
@@ -13,7 +13,7 @@
 //
 // Run it (against the docker-compose Postgres in ../shallowflaws):
 //
-//     tuo run examples/live_check.tuo src/pg/*.tuo
+//     tuo run examples/live_check.tuo src/db/*.tuo src/pg/*.tuo
 //
 // Exit codes — each names exactly one failed expectation:
 //
@@ -25,6 +25,10 @@
 //     14  a parameterized query did not round-trip its parameter
 //     15  a deliberate SQL error was not reported as a server error
 //     16  multi-row ordering or row counts were wrong
+//     17  a NULL parameter did not arrive as SQL NULL
+//     18  two row-returning statements were not refused, or wedged the connection
+//     19  COPY was not refused as unsupported, or wedged the connection
+//     20  65536 parameters were sent instead of refused, or wedged the connection
 //
 // The connection parameters match `shallowflaws/docker/docker-compose.yml`,
 // whose `pg_hba.conf` grants `trust` from 127.0.0.1 — which is what lets this
@@ -189,6 +193,27 @@ fn main() -> Int {
     }
     let _ = say("ok   parameterized query ($1 round-trip)");
 
+    // --- 4b. A NULL parameter ----------------------------------------------
+    // NULL has no text form, so it travels as a -1 length in Bind. The server
+    // must see it as NULL — not as '' — and hand it back as NULL.
+    var null_params = std::array::empty();
+    std::array::push(null_params, std::string::from_str("ignored"));
+    var null_flags = std::array::empty();
+    std::array::push(null_flags, 1);
+    let r4n = pg::query::run_params_null(fd, "SELECT $1::text IS NULL, $1::text", null_params, null_flags, timeout_ms());
+    if !pg::query::is_ok_result(r4n) {
+        let _ = std::rt::write_string(1, pg::query::render_error(r4n));
+        let _ = pg::conn::shutdown(fd);
+        return 17;
+    }
+    let rs4n = pg::query::unwrap_ok_result(r4n);
+    if !pg::query::cell_bool(rs4n, 0, 0) || !pg::query::is_null(rs4n, 0, 1) {
+        let _ = say("FAIL NULL parameter arrived as a value");
+        let _ = pg::conn::shutdown(fd);
+        return 17;
+    }
+    let _ = say("ok   NULL parameter (length -1 in Bind)");
+
     // --- 5. A real server error --------------------------------------------
     // A deliberate syntax error must arrive as a typed server error carrying
     // SQLSTATE 42601 — and the connection must remain usable afterwards,
@@ -240,6 +265,108 @@ fn main() -> Int {
     }
     let _ = say("ok   multi-row ordering + command tag");
     let _ = say("ok   connection reusable after a server error");
+
+    // --- 7. Two result sets in one query -----------------------------------
+    // A ResultSet holds one result, so a second RowDescription must be
+    // refused as unsupported rather than merged — and, as with a server
+    // error, the stream must still be drained so the next query works.
+    let r7 = pg::query::run(fd, "SELECT 1; SELECT 2, 3", timeout_ms());
+    if pg::query::is_ok_result(r7) {
+        let _ = say("FAIL multi-result: two result sets were merged");
+        let _ = pg::conn::shutdown(fd);
+        return 18;
+    }
+    let e7 = pg::query::unwrap_err_result(r7);
+    if db::error::kind(e7) != db::error::kind_unsupported() {
+        let _ = say("FAIL multi-result: wrong error kind");
+        let _ = pg::conn::shutdown(fd);
+        return 18;
+    }
+    // Several statements with only one row-returning one are fine, and the
+    // tag is the last statement's.
+    let r7b = pg::query::run(fd, "CREATE TEMP TABLE m (a int); INSERT INTO m VALUES (1), (2); SELECT a FROM m ORDER BY a", timeout_ms());
+    if !pg::query::is_ok_result(r7b) {
+        let _ = say("FAIL multi-result: connection unusable, or a single result set was refused");
+        let _ = pg::conn::shutdown(fd);
+        return 18;
+    }
+    let rs7b = pg::query::unwrap_ok_result(r7b);
+    if pg::query::row_count(rs7b) != 2 || pg::query::cell_int(rs7b, 1, 0, 0) != 2 {
+        let _ = say("FAIL multi-result: the surviving result set is wrong");
+        let _ = pg::conn::shutdown(fd);
+        return 18;
+    }
+    let _ = say("ok   two result sets refused; one among many accepted");
+
+    // --- 8. COPY, both directions ------------------------------------------
+    // COPY TO streams data the adapter has nowhere to put; COPY FROM STDIN
+    // leaves the server waiting for rows. Both must be refused as
+    // unsupported — never an empty "success" — and the second needs a
+    // CopyFail on the wire, or the connection is wedged for good.
+    let r8 = pg::query::run(fd, "COPY (SELECT 1) TO STDOUT", timeout_ms());
+    if pg::query::is_ok_result(r8) {
+        let _ = say("FAIL COPY TO: reported as success");
+        let _ = pg::conn::shutdown(fd);
+        return 19;
+    }
+    let e8 = pg::query::unwrap_err_result(r8);
+    if db::error::kind(e8) != db::error::kind_unsupported() {
+        let _ = say("FAIL COPY TO: wrong error kind");
+        let _ = pg::conn::shutdown(fd);
+        return 19;
+    }
+    let _ = pg::query::execute(fd, "CREATE TEMP TABLE cp (a int)", timeout_ms());
+    let r8b = pg::query::run(fd, "COPY cp FROM STDIN", timeout_ms());
+    if pg::query::is_ok_result(r8b) {
+        let _ = say("FAIL COPY FROM STDIN: reported as success");
+        let _ = pg::conn::shutdown(fd);
+        return 19;
+    }
+    let e8b = pg::query::unwrap_err_result(r8b);
+    if db::error::kind(e8b) != db::error::kind_unsupported() {
+        let _ = say("FAIL COPY FROM STDIN: wrong error kind");
+        let _ = pg::conn::shutdown(fd);
+        return 19;
+    }
+    // The CopyFail must have ended the exchange: the next query works, and
+    // fast — a wedged connection would time out here instead.
+    let r8c = pg::query::scalar_int(fd, "SELECT count(*) FROM cp", 0 - 1, timeout_ms());
+    if !pg::conn::is_ok_int(r8c) || pg::conn::unwrap_ok_int(r8c) != 0 {
+        let _ = say("FAIL COPY FROM STDIN: connection unusable afterwards");
+        let _ = pg::conn::shutdown(fd);
+        return 19;
+    }
+    let _ = say("ok   COPY refused both ways; connection survives CopyFail");
+
+    // --- 9. Too many parameters -------------------------------------------
+    // The Bind count is an Int16. One past it must be refused before a byte
+    // is sent — a wrapped count would desynchronize the connection — and the
+    // next query must work.
+    var many = std::array::empty();
+    var k = 0;
+    while k <= pg::query::max_params() {
+        std::array::push(many, std::string::from_str("1"));
+        k = k + 1;
+    }
+    let r9 = pg::query::run_params(fd, "SELECT $1", many, timeout_ms());
+    if pg::query::is_ok_result(r9) {
+        let _ = say("FAIL params: 65536 parameters were accepted");
+        let _ = pg::conn::shutdown(fd);
+        return 20;
+    }
+    let e9 = pg::query::unwrap_err_result(r9);
+    if db::error::kind(e9) != db::error::kind_unsupported() {
+        let _ = say("FAIL params: wrong error kind");
+        let _ = pg::conn::shutdown(fd);
+        return 20;
+    }
+    let r9b = pg::query::scalar_int(fd, "SELECT 9", 0, timeout_ms());
+    if !pg::conn::is_ok_int(r9b) || pg::conn::unwrap_ok_int(r9b) != 9 {
+        let _ = say("FAIL params: connection unusable after the refusal");
+        let _ = pg::conn::shutdown(fd);
+        return 20;
+    }
+    let _ = say("ok   65536 parameters refused before sending");
 
     // --- Done --------------------------------------------------------------
     let _ = pg::conn::shutdown(fd);

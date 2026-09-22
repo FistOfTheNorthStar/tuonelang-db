@@ -303,8 +303,8 @@ pub fn handshake(take fd: Int, in user: Str, in database: Str, in password: Str,
 
         if type_byte == pg::proto::be_authentication() {
             let outcome = respond_to_auth(fd, payload, password);
-            if outcome != 0 {
-                return Err { error: pg::auth::unsupported_error(pg::message::auth_kind(payload)) };
+            if outcome != auth_continue() {
+                return Err { error: auth_outcome_error(outcome, pg::message::auth_kind(payload)) };
             }
         } else if type_byte == pg::proto::be_ready_for_query() {
             // The handshake is complete; report the transaction status.
@@ -317,8 +317,29 @@ pub fn handshake(take fd: Int, in user: Str, in database: Str, in password: Str,
     Err { error: db::error::new(db::error::kind_protocol(), "the server sent too many messages without completing the handshake") }
 }
 
-/// EFFECT: answer one `AuthenticationRequest`. Returns `0` when the exchange
-/// may continue, and non-zero when the demanded method cannot be performed.
+/// `respond_to_auth`: the exchange may continue.
+pub fn auth_continue() -> Int {
+    0
+}
+
+/// `respond_to_auth`: the demanded method cannot be performed.
+pub fn auth_refused() -> Int {
+    1
+}
+
+/// `respond_to_auth`: the method is fine, but the answer could not be sent.
+pub fn auth_send_failed() -> Int {
+    2
+}
+
+/// EFFECT: answer one `AuthenticationRequest`. Returns `auth_continue` when
+/// the exchange may go on, `auth_refused` when the demanded method cannot be
+/// performed, and `auth_send_failed` when the password could not be written.
+///
+/// The last two are kept apart because they call for different fixes: a
+/// refused method is a `pg_hba.conf` matter, a failed write means the socket
+/// is gone — and reporting the second as the first would send an operator
+/// to the wrong place.
 ///
 /// Split from `handshake` so the authentication policy is one readable
 /// function rather than a nested branch inside a loop.
@@ -327,18 +348,35 @@ pub fn respond_to_auth(take fd: Int, in payload: String, in password: Str) -> In
     let p = pg::auth::plan(k);
     if p == pg::auth::plan_ok() {
         // Authenticated; the caller keeps draining until ReadyForQuery.
-        0
+        auth_continue()
     } else if p == pg::auth::plan_cleartext() {
         let n = write_message(fd, pg::proto::password(password));
         if n < 0 {
-            1
+            auth_send_failed()
         } else {
-            0
+            auth_continue()
         }
     } else {
         // md5 / SCRAM / Kerberos / GSSAPI — refused with a typed error by the
         // caller, which has the auth kind to name it.
-        1
+        auth_refused()
+    }
+}
+
+/// The error for a `respond_to_auth` outcome that ended the handshake.
+///
+/// Pure, so the mapping is spec-checked: a refusal is `kind_auth` naming the
+/// method and the fix, a failed send is `kind_connection`.
+///
+/// # Example
+/// ```tuo
+/// let e = pg::conn::auth_outcome_error(pg::conn::auth_refused(), 5);
+/// ```
+pub fn auth_outcome_error(take outcome: Int, take auth_kind: Int) -> db::error::PgError {
+    if outcome == auth_send_failed() {
+        db::error::new(db::error::kind_connection(), "the connection failed while sending the password")
+    } else {
+        pg::auth::unsupported_error(auth_kind)
     }
 }
 
@@ -482,4 +520,14 @@ spec error_from_payload {
 
 spec default_port {
     then default_port() == 5432;
+}
+
+spec auth_outcome_error {
+    // A refused method is an auth error; a failed send is a connection
+    // error, never an "unsupported cleartext" one.
+    then db::error::kind(auth_outcome_error(auth_refused(), pg::proto::auth_md5())) == db::error::kind_auth();
+    then db::error::kind(auth_outcome_error(auth_send_failed(), pg::proto::auth_cleartext())) == db::error::kind_connection();
+    // The three outcomes are distinct.
+    then auth_continue() != auth_refused();
+    then auth_refused() != auth_send_failed();
 }

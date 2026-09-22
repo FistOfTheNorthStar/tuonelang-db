@@ -31,6 +31,7 @@
 //     28  the temporary files were not cleaned up
 //     29  a store this format cannot represent was saved anyway
 //     30  a non-finite component was accepted, or an extreme vector crashed
+//     31  a truncated file was loaded as its prefix instead of being refused
 
 module vector_check;
 
@@ -216,6 +217,29 @@ fn main() -> Int {
         return fail("a dimension mismatch was accepted", 27);
     }
     say("ok  dimension mismatch is reported");
+
+    // ---------------------------------------------------------------- 31 ---
+    // A file cut inside its last row must be refused outright. Loading the
+    // intact prefix would be a store that silently holds fewer rows than were
+    // saved — a failure no search result can reveal.
+    let whole = vec::disk::read_bytes(path());
+    let cut = std::string::slice(whole, 0, std::string::len(whole) - 5);
+    let _ = vec::disk::write_bytes(bad_path(), cut);
+    let truncated = vec::db::open(bad_path(), dim(), vec::metric::metric_cosine());
+    if vec::db::is_ok(truncated) {
+        return fail("a truncated file was accepted", 31);
+    }
+    if vec::db::count(truncated) != 0 {
+        return fail("a truncated file yielded its prefix", 31);
+    }
+    let why = vec::db::error(truncated);
+    if std::string::len(why) == 0 {
+        return fail("a truncated file gave no reason", 31);
+    }
+    let _ = std::rt::write(1, "    ");
+    let _ = std::rt::write_string(1, why);
+    let _ = std::rt::write(1, "\n");
+    say("ok  truncated files are refused");
 
     // ---------------------------------------------------------------- 29 ---
     // A component past what the fixed-point format holds must be refused, not

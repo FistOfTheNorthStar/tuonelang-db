@@ -29,7 +29,7 @@ tuo run myprogram.tuo src/db/*.tuo src/vec/*.tuo
 ```
 
 Both source directories are needed: `src/db/` is the backend-neutral core
-(`db::bytes`, `db::error`, `db::math`) and `src/vec/` is the store itself. If
+(`db::bytes`, `db::error`, `db::math`, `db::text`) and `src/vec/` is the store itself. If
 you only ever use vectors, `./build.sh --vector` compiles exactly that set and
 no line of the PostgreSQL protocol.
 
@@ -291,7 +291,10 @@ if !vec::db::is_ok(store) {
 }
 ```
 
-`error` explains which of these happened:
+`error` explains which of these happened. A damaged file is refused whole:
+it never loads as the rows that happened to survive, because a store that
+silently holds fewer rows than were saved is a failure no search result can
+reveal.
 
 | Situation | Reported |
 |-----------|----------|
@@ -300,6 +303,8 @@ if !vec::db::is_ok(store) {
 | Written by a newer format | `"unsupported TVEC format version"` |
 | Wrong dimension requested | `"dimension mismatch: the file holds 3-dimensional vectors, but 4 was requested"` |
 | Wrong metric requested | `"metric mismatch: the file was written for cosine, but l2 was requested"` |
+| Cut short mid-row | `"truncated: the header promises 3 rows, but the file holds 2 whole rows"` |
+| Bytes after the last row | `"corrupt: 7 unexpected bytes after the last row"` |
 
 `vec::db::as_error(store)` gives the same thing as a `db::error::PgError`, if
 you are already branching on error kinds elsewhere in your program.
@@ -420,6 +425,11 @@ crimson  0.994
 - [`VECTORS.md`](VECTORS.md) — the full API surface, the language rules that
   bite, and the anti-patterns that do not compile. Read this before asking a
   model to generate tuonelang against the library.
+- [`examples/bridge_check.tuo`](../examples/bridge_check.tuo) — embeddings
+  stored in a PostgreSQL `float8[]` column, decoded with
+  `pg::value::as_floats`, loaded into a collection, and searched — with a
+  proof that the round trip does not perturb the ranking. Start here if your
+  vectors already live in a database.
 - [`examples/vector_check.tuo`](../examples/vector_check.tuo) — the acceptance
   oracle. It is also the most thorough worked example of the API under real
   conditions, including every failure path in §7.

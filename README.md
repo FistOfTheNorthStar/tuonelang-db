@@ -11,7 +11,7 @@ Two features share one backend-neutral core:
 | **`vector`** | An embedded vector store for embeddings: cosine/L2/dot search, string payloads, and a single-file format. No server, no dependencies. |
 
 Both are implemented from their specifications, and both have their whole pure
-layer proven by colocated executable specs — **130** of them.
+layer proven by colocated executable specs — **149** of them.
 
 ```tuo
 module app;
@@ -99,7 +99,8 @@ excellent to roughly 10^5 vectors and honest beyond it.
 - ✅ Startup handshake, `ParameterStatus`/`BackendKeyData` drain, `ReadyForQuery`
 - ✅ Simple query protocol (`Query`)
 - ✅ Extended query protocol (`Parse`/`Bind`/`Describe`/`Execute`/`Sync`) with
-  **out-of-band parameters** — the injection-safe path
+  **out-of-band parameters** — the injection-safe path — including SQL NULL
+  as a parameter
 - ✅ `RowDescription` decoding: column names, type OIDs, format codes
 - ✅ `DataRow` decoding, including **SQL NULL** kept distinct from `''`
 - ✅ Text-format decoders for int, float, bool, text, and the type-OID
@@ -120,9 +121,44 @@ message framing is encoded byte-exactly and spec-checked, and the two functions
 that need a digest carry their final signatures and return a typed error naming
 the blocker and the operator's fix. See [Authentication](#authentication).
 
-Not implemented (and reported as `kind_unsupported` rather than mis-handled):
-COPY, LISTEN/NOTIFY delivery, cursors/portal suspension, binary format,
-multi-statement result separation, connection pooling.
+Not implemented: LISTEN/NOTIFY delivery, cursors/portal suspension, binary
+format, connection pooling. Two things are **refused with `kind_unsupported`**,
+with the stream drained so the connection stays usable: a query that returns
+more than one result set (two `SELECT`s in one `run`; several statements with
+at most one row-returning one are fine), and `COPY` to or from the client —
+a `COPY … FROM STDIN` is answered with `CopyFail` rather than left hanging.
+A query with more than 65535 parameters (the protocol's Int16 count) is
+refused the same way, before anything is sent.
+
+## Using the two together
+
+The features are independent, but they are built to meet: an embedding
+stored in PostgreSQL comes out of `pg::value::as_floats` as the
+`Array[Float]` that `vec::db::add` takes, and a query vector goes back in
+through `pg::value::array_literal` (for `float8[]`) or `vector_literal` (for
+pgvector's `vector`).
+
+```tuo
+// Load every embedding in a table into an in-memory collection.
+let rows = pg::query::unwrap_ok_result(pg::query::run(db, "SELECT id, body, embedding FROM docs", 30000));
+var store = vec::db::in_memory(384, vec::metric::metric_cosine());
+var i = 0;
+while i < pg::query::row_count(rows) {
+    let raw = pg::query::cell(rows, i, 2);
+    let id = pg::query::cell(rows, i, 0);
+    let body = pg::query::cell(rows, i, 1);
+    let _ = vec::db::add(store, pg::value::as_floats_or_empty(std::string::as_str(raw)), std::string::as_str(id), std::string::as_str(body));
+    i = i + 1;
+}
+```
+
+[`examples/bridge_check.tuo`](examples/bridge_check.tuo) is the live proof:
+it writes vectors into a `float8[]` column through parameters, reads them
+back, loads them into the store, and checks that a search ranks them exactly
+as the originals do. `./run-tests.sh --live` runs it whenever both features
+are selected. pgvector's `vector` type works the same way with
+`vector_literal` and a `$1::vector` cast; its OID is per-install, so
+`pg::value::vector_oid_query` is how a program learns it.
 
 ## Requirements
 
@@ -135,7 +171,7 @@ multi-statement result separation, connection pooling.
 ## Running
 
 ```bash
-# Everything that needs no server: front end, 130 specs, formatting
+# Everything that needs no server: front end, 149 specs, formatting
 ./run-tests.sh
 
 # Also run the live oracles. The vector one needs only a writable /tmp;
@@ -149,7 +185,7 @@ multi-statement result separation, connection pooling.
 Or drive the compiler directly:
 
 ```bash
-tuo verify src/db/*.tuo src/pg/*.tuo src/vec/*.tuo            # 130 specs, nothing running
+tuo verify src/db/*.tuo src/pg/*.tuo src/vec/*.tuo            # 149 specs, nothing running
 tuo run examples/live_check.tuo src/db/*.tuo src/pg/*.tuo     # protocol oracle
 tuo run examples/crud_check.tuo src/db/*.tuo src/pg/*.tuo     # the guide's patterns
 tuo run examples/vector_check.tuo src/db/*.tuo src/vec/*.tuo  # vector oracle
@@ -157,7 +193,7 @@ tuo run examples/vector_check.tuo src/db/*.tuo src/vec/*.tuo  # vector oracle
 
 Both live programs exit 0 only when the wire agrees with the pure model, and
 each failure has its own exit code so a CI log says exactly what broke:
-`live_check` cross-checks eight protocol properties, and `crud_check` verifies
+`live_check` cross-checks twelve protocol properties, and `crud_check` verifies
 the usage patterns `docs/GUIDE.md` teaches — so the documentation cannot drift
 away from what the library does.
 
@@ -207,12 +243,13 @@ depending only on those above it.
 | `db::bytes` | core | pure | Big-endian encode/decode, C strings. The byte-order layer. |
 | `db::error` | core | pure | Typed errors: kind + message + SQLSTATE. |
 | `db::math` | core | pure | `sqrt` and float helpers — v0 has no `std::math`. |
+| `db::text` | core | pure | Integers and floats as decimal text, for messages and literals. |
 | `pg::proto` | postgresql | pure | Protocol constants and every **frontend** message encoder. |
 | `pg::message` | postgresql | pure | **Backend** message decoding — field accessors over payload bytes. |
-| `pg::value` | postgresql | pure | Type OIDs and text-format value decoders. |
+| `pg::value` | postgresql | pure | Type OIDs, text-format value decoders, and the float-array / pgvector codec. |
 | `pg::auth` | postgresql | pure | Authentication policy, and the crypto seam. |
 | `pg::conn` | postgresql | **effect** | The socket: connect, framed read/write, handshake. |
-| `pg::query` | postgresql | **effect** | `run` / `run_params` / `execute` / `scalar`, and `ResultSet`. |
+| `pg::query` | postgresql | **effect** | `run` / `execute` / `scalar` and their `_params` forms, `run_params_null` for SQL NULL, and `ResultSet`. |
 | `vec::metric` | vector | pure | Cosine / L2 / dot kernels over flat float slices. |
 | `vec::store` | vector | pure | The rows: vectors, ids, payloads, tombstones. |
 | `vec::search` | vector | pure | Bounded top-k ranking, and `Hits`. |
@@ -236,7 +273,7 @@ The **pure/effect split** is the same one `tuo-stdlib` uses, and it is load
 bearing: a spec cannot touch an effect (`R0007`), so all the logic worth
 proving — framing, decoding, NULL handling, error mapping, auth policy, and on
 the vector side every metric, the ranking, and the whole file format — lives in
-the pure tier and carries **130 executable specs**. The effect tier is thin by
+the pure tier and carries **149 executable specs**. The effect tier is thin by
 design and is pinned by `examples/live_check.tuo` against a real server and by
 `examples/vector_check.tuo` against a real filesystem.
 
@@ -292,7 +329,8 @@ that has already authenticated.
 ```
 
 To connect today, grant `trust` (or `password`) for your client host in
-`pg_hba.conf`:
+`pg_hba.conf`. With no TLS, `password` sends the secret in cleartext, so keep
+it to loopback or a link you already trust:
 
 ```
 host  all  all  127.0.0.1/32  trust

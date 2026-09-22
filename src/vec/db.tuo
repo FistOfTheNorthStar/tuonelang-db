@@ -66,7 +66,7 @@ pub fn open(in path: Str, take dim: Int, take metric: Int) -> Db {
         // on another has no statically known state at the join (O0008) — and
         // the cure is a path that always consumes what it created.
         let bytes = vec::disk::read_bytes(path);
-        let why = vec::codec::header_error(bytes);
+        let why = vec::codec::file_error(bytes);
         if std::string::len(why) > 0 {
             failed(path, dim, metric, why)
         } else {
@@ -417,45 +417,15 @@ pub fn is_live(in d: Db, take row: Int) -> Bool {
 /// An integer as decimal text.
 ///
 /// There is no `std::str::format` reachable from a user package, so a library
-/// that wants to build a message builds its own digits.
+/// that wants to build a message builds its own digits — once, in
+/// `db::text`; this is that renderer under the name this module always had.
 ///
 /// # Example
 /// ```tuo
 /// let s = vec::db::render_int(42); // "42"
 /// ```
 pub fn render_int(take n: Int) -> String {
-    if n == 0 {
-        std::string::from_str("0")
-    } else {
-        var digits = std::string::empty();
-        // `0 - n` overflows for Int64::MIN, and overflow traps. Peel the last
-        // digit off the negative side first so the negation is always safe.
-        var v = if n < 0 {
-            0 - (n / 10)
-        } else {
-            n / 10
-        };
-        let last = if n < 0 {
-            0 - (n % 10)
-        } else {
-            n % 10
-        };
-        std::string::push_byte(digits, 48 + last);
-        while v > 0 {
-            std::string::push_byte(digits, 48 + v % 10);
-            v = v / 10;
-        }
-        var out = std::string::empty();
-        if n < 0 {
-            std::string::push_byte(out, 45);
-        }
-        var i = std::string::len(digits) - 1;
-        while i >= 0 {
-            std::string::push_byte(out, std::string::byte_at(digits, i));
-            i = i - 1;
-        }
-        out
-    }
+    db::text::render_int(n)
 }
 
 /// A float as text with three decimal places, for printing a score.

@@ -368,9 +368,12 @@ pub fn column_offset(in payload: String, take index: Int) -> Int {
 
 /// Is column `index` SQL NULL?
 ///
-/// NULL is signalled by a length of `-1`, which is why `db::bytes::be_i32`
-/// sign-corrects: read unsigned, this would be 4294967295 and every later
-/// column would be misframed.
+/// NULL is signalled by a length of `-1` — `pg::proto::null_len`, the same
+/// value `pg::query` sends for a NULL parameter — which is why
+/// `db::bytes::be_i32` sign-corrects: read unsigned, this would be 4294967295
+/// and every later column would be misframed. Any negative is treated as
+/// NULL, so a malformed length degrades to a missing value rather than a
+/// negative slice.
 ///
 /// # Example
 /// ```tuo

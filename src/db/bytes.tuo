@@ -79,8 +79,9 @@ pub fn int32_sign_bit() -> Int {
 /// length prefix and object id uses.
 ///
 /// Negative values are encoded in two's complement, which is how the protocol
-/// spells the `-1` that means SQL NULL in a `DataRow` column length and
-/// "unspecified" in a `Bind` parameter length.
+/// spells the `-1` that means SQL NULL — in a `DataRow` column length coming
+/// from the server and in a `Bind` parameter length going to it alike (named
+/// `pg::proto::null_len` on the PostgreSQL side).
 ///
 /// # Example
 /// ```tuo

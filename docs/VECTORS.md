@@ -243,6 +243,8 @@ fn read_bytes(in path: Str) -> String
 fn encode(in s: Store) -> String
 fn decode(in buf: String) -> Store
 fn header_error(in buf: String) -> String
+fn body_error(in buf: String) -> String
+fn file_error(in buf: String) -> String     // header, then body
 fn is_valid(in buf: String) -> Bool
 ```
 
@@ -275,7 +277,10 @@ unary minus on a literal in every position either; write `0.0 - 1.0`.
 Stated plainly, so a model does not generate a call for something absent:
 
 - **No embedding model.** This stores and searches vectors; producing them is
-  someone else's job. Feed it output from whatever model you use.
+  someone else's job. Feed it output from whatever model you use. If the
+  vectors live in PostgreSQL, `pg::value::as_floats` turns a `float8[]` or
+  pgvector cell into the `Array[Float]` that `add` takes — see
+  [`AGENTS.md`](AGENTS.md) §3 and `examples/bridge_check.tuo`.
 - **No approximate index (HNSW/IVF).** Search is an exact linear scan. It is
   O(N·D) per query — excellent to roughly 10^5 vectors, and honest about it.
   There is no `vec::index` module; do not call one.
