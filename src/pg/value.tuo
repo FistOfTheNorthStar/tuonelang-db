@@ -131,6 +131,29 @@ pub fn oid_jsonb() -> Int {
     3802
 }
 
+/// `float4[]` (real array) — OID 1021.
+pub fn oid_float4_array() -> Int {
+    1021
+}
+
+/// `float8[]` (double precision array) — OID 1022.
+pub fn oid_float8_array() -> Int {
+    1022
+}
+
+/// pgvector's `vector` type has **no fixed OID**: it is assigned when the
+/// extension is installed, so a client learns it by asking. This is the query
+/// to run once per connection; `scalar_int` on it gives the OID, or an error
+/// when the extension is absent.
+///
+/// # Example
+/// ```tuo
+/// let q = pg::value::vector_oid_query();
+/// ```
+pub fn vector_oid_query() -> Str {
+    "SELECT oid FROM pg_type WHERE typname = 'vector'"
+}
+
 // ----------------------------------------------------------------------------
 // OID classification — what shape a column's text rendering has.
 // ----------------------------------------------------------------------------
@@ -169,6 +192,16 @@ pub fn is_text(take oid: Int) -> Bool {
     oid == oid_text() || oid == oid_varchar() || oid == oid_name() || oid == oid_char() || oid == oid_uuid() || oid == oid_json() || oid == oid_jsonb()
 }
 
+/// Is this OID a float array whose text form `as_floats` decodes?
+///
+/// # Example
+/// ```tuo
+/// let b = pg::value::is_float_array(pg::value::oid_float8_array()); // true
+/// ```
+pub fn is_float_array(take oid: Int) -> Bool {
+    oid == oid_float4_array() || oid == oid_float8_array()
+}
+
 /// Is this OID one of the date/time types? Their text renderings are ISO-8601
 /// when `DateStyle` is the default `ISO, MDY`, which the adapter does not
 /// change.
@@ -204,10 +237,16 @@ pub fn as_bool(in raw: Str) -> Bool {
 /// non-digit byte, so a malformed value is a value the caller branches on
 /// rather than a silent zero.
 ///
-/// **Overflow traps** rather than wrapping — tuonelang has no wraparound — so
-/// an `int8` beyond `Int`'s range aborts rather than returning a wrong number.
-/// Every value a PostgreSQL `int8` can hold fits in `Int` (both are 64-bit
-/// signed), so this is reachable only from a `numeric` misrouted here.
+/// **Out of range is an `Err`, never a trap.** Integer overflow traps in
+/// tuonelang, and any text column can carry twenty digits, so the accumulator
+/// checks each step before it multiplies and reports "out of range" instead
+/// of aborting the process. Every value a PostgreSQL `int8` can hold fits in
+/// `Int` (both are 64-bit signed), so this fires only for text or `numeric`.
+///
+/// The digits are accumulated on the **negative** side: `int8`'s minimum,
+/// `-9223372036854775808`, has a magnitude one past what a positive `Int`
+/// holds, so accumulating positively and negating at the end would trap on
+/// the one legitimate value it must decode.
 ///
 /// # Example
 /// ```tuo
@@ -232,21 +271,38 @@ pub fn as_int(in raw: Str) -> Result[Int, Str] {
         return Err { error: "integer value has a sign but no digits" };
     }
 
+    // `total` holds the negated magnitude; see the doc comment on overflow.
     var total = 0;
     while i < n {
         let b = std::str::byte_at(raw, i);
         if b < 48 || b > 57 {
             return Err { error: "integer value has a non-digit byte" };
         }
-        total = total * 10 + (b - 48);
+        let d = b - 48;
+        // `total * 10 - d` stays in range exactly when `total` is at least
+        // `(min + d) / 10`; `/` truncates toward zero, which for a negative
+        // quotient is the ceiling this needs.
+        if total < (int_min() + d) / 10 {
+            return Err { error: "integer value is out of range" };
+        }
+        total = total * 10 - d;
         i = i + 1;
     }
 
     if negative {
-        Ok { value: 0 - total }
-    } else {
         Ok { value: total }
+    } else if total == int_min() {
+        // The one magnitude that fits negatively but not positively.
+        Err { error: "integer value is out of range" }
+    } else {
+        Ok { value: 0 - total }
     }
+}
+
+/// The smallest `Int`, `-2^63` — spelled without a literal that would itself
+/// overflow.
+pub fn int_min() -> Int {
+    0 - 9223372036854775807 - 1
 }
 
 /// Decode an integer column, falling back to `fallback` when it does not parse.
@@ -271,7 +327,9 @@ pub fn as_int_or(in raw: Str, take fallback: Int) -> Int {
 /// optional `e`/`E` exponent — the full shape PostgreSQL emits for `float8`.
 /// The special renderings `NaN`, `Infinity`, and `-Infinity` are reported as
 /// `Err` rather than silently becoming a finite number; a caller that wants
-/// them can test `raw` directly.
+/// them can test `raw` directly. A finite rendering whose exponent exceeds
+/// what a double holds decodes to an infinity or to zero, as it would in the
+/// server; it never traps.
 ///
 /// # Example
 /// ```tuo
@@ -356,13 +414,18 @@ pub fn as_float(in raw: Str) -> Result[Float, Str] {
         if i >= n {
             return Err { error: "float value has an empty exponent" };
         }
+        // The exponent saturates rather than overflowing: anything past a few
+        // hundred already takes a double to infinity or zero, so more digits
+        // change nothing except whether the accumulator traps.
         var exp = 0;
         while i < n {
             let b = std::str::byte_at(raw, i);
             if b < 48 || b > 57 {
                 return Err { error: "float value has a non-digit exponent" };
             }
-            exp = exp * 10 + (b - 48);
+            if exp < exponent_cap() {
+                exp = exp * 10 + (b - 48);
+            }
             i = i + 1;
         }
         var k = 0;
@@ -383,6 +446,12 @@ pub fn as_float(in raw: Str) -> Result[Float, Str] {
     }
 }
 
+/// Where `as_float` stops accumulating exponent digits. A double's range is
+/// about `1e-324` to `1e308`, so any exponent this large already saturates.
+pub fn exponent_cap() -> Int {
+    400
+}
+
 /// Decode a float column, falling back to `fallback` when it does not parse.
 ///
 /// # Example
@@ -397,8 +466,209 @@ pub fn as_float_or(in raw: Str, take fallback: Float) -> Float {
 }
 
 // ----------------------------------------------------------------------------
+// Float sequences: PostgreSQL arrays and pgvector vectors.
+//
+// A `float8[]` column renders as `{0.1,0.2,0.3}`; a pgvector `vector` column
+// renders as `[0.1,0.2,0.3]`. The two differ only in their brackets, so one
+// decoder reads both and two one-line encoders write them. This is the seam
+// between the PostgreSQL adapter and the vector store: an embedding stored in
+// a table comes out of `as_floats` as the `Array[Float]` that `vec::db::add`
+// takes, and a query vector goes into a parameter through `vector_literal`
+// or `array_literal`.
+// ----------------------------------------------------------------------------
+
+/// Decode a PostgreSQL float array (`{…}`) or pgvector vector (`[…]`) text
+/// rendering into an `Array[Float]`.
+///
+/// Elements are comma-separated and decoded with `as_float`; spaces around
+/// them are tolerated. An empty `{}` or `[]` is an empty array. Anything else
+/// — a missing or mismatched bracket, a `NULL` element, a nested array, a
+/// non-numeric element — is an `Err`, so a malformed embedding never reaches
+/// the store as a shorter vector than it was.
+///
+/// # Example
+/// ```tuo
+/// let r = pg::value::as_floats("{0.1,0.2,0.3}");
+/// ```
+pub fn as_floats(in raw: Str) -> Result[Array[Float], Str] {
+    let n = std::str::len(raw);
+    if n < 2 {
+        return Err { error: "float array is too short to be bracketed" };
+    }
+    let open = std::str::byte_at(raw, 0);
+    let close = std::str::byte_at(raw, n - 1);
+    // `{` … `}` or `[` … `]`.
+    if !((open == 123 && close == 125) || (open == 91 && close == 93)) {
+        return Err { error: "float array is not bracketed with {} or []" };
+    }
+    var out = std::array::empty();
+    // The body, with an empty body meaning an empty array.
+    var i = 1;
+    let end = n - 1;
+    if i == end {
+        return Ok { value: out };
+    }
+    while i < end {
+        // One element runs to the next comma or the closing bracket.
+        var j = i;
+        while j < end && std::str::byte_at(raw, j) != 44 {
+            j = j + 1;
+        }
+        var from = i;
+        var to = j;
+        while from < to && std::str::byte_at(raw, from) == 32 {
+            from = from + 1;
+        }
+        while to > from && std::str::byte_at(raw, to - 1) == 32 {
+            to = to - 1;
+        }
+        if from == to {
+            return Err { error: "float array has an empty element" };
+        }
+        match as_float(std::str::slice(raw, from, to)) {
+            Ok { value } => std::array::push(out, value),
+            Err { error } => return Err { error: "float array has a non-numeric element" },
+        }
+        i = j + 1;
+    }
+    // A trailing comma leaves `i == end` with an element owed.
+    if std::str::byte_at(raw, end - 1) == 44 {
+        return Err { error: "float array has a trailing comma" };
+    }
+    Ok { value: out }
+}
+
+/// `as_floats`, or an empty array when it does not parse.
+///
+/// Empty rather than a caller-supplied fallback because an `Array` moved on
+/// one branch and dropped on the other has no known state at the join
+/// (O0008), and an empty vector is the one value every consumer already
+/// rejects: `vec::db::add` refuses it as the wrong width.
+///
+/// # Example
+/// ```tuo
+/// let xs = pg::value::as_floats_or_empty("{1.0,2.0}");
+/// ```
+pub fn as_floats_or_empty(in raw: Str) -> Array[Float] {
+    match as_floats(raw) {
+        Ok { value } => value,
+        Err { error } => std::array::empty(),
+    }
+}
+
+/// `xs` as the elements of a literal, comma-separated, rendered with
+/// `db::text::render_float` — plain decimal, never an exponent.
+///
+/// # Example
+/// ```tuo
+/// // let body = pg::value::floats_body(xs); // "0.1,0.2"
+/// ```
+pub fn floats_body(in xs: Array[Float]) -> String {
+    var out = std::string::empty();
+    var i = 0;
+    let n = std::array::len(xs);
+    while i < n {
+        if i > 0 {
+            std::string::push_byte(out, 44);
+        }
+        std::string::append(out, std::string::as_str(db::text::render_float(std::array::get(xs, i))));
+        i = i + 1;
+    }
+    out
+}
+
+/// `xs` as a PostgreSQL array literal, `{0.1,0.2}`, for a `float8[]` or
+/// `float4[]` parameter. Bind it as text and cast in the SQL:
+/// `$1::float8[]`.
+///
+/// # Example
+/// ```tuo
+/// // let lit = pg::value::array_literal(xs); // "{0.1,0.2}"
+/// ```
+pub fn array_literal(in xs: Array[Float]) -> String {
+    var out = std::string::from_str("{");
+    std::string::append(out, std::string::as_str(floats_body(xs)));
+    std::string::push_byte(out, 125);
+    out
+}
+
+/// `xs` as a pgvector literal, `[0.1,0.2]`, for a `vector` parameter. Bind
+/// it as text and cast in the SQL: `$1::vector`.
+///
+/// # Example
+/// ```tuo
+/// // let lit = pg::value::vector_literal(xs); // "[0.1,0.2]"
+/// ```
+pub fn vector_literal(in xs: Array[Float]) -> String {
+    var out = std::string::from_str("[");
+    std::string::append(out, std::string::as_str(floats_body(xs)));
+    std::string::push_byte(out, 93);
+    out
+}
+
+// ----------------------------------------------------------------------------
 // Specs — pinned to renderings a real PostgreSQL 16 server emits.
 // ----------------------------------------------------------------------------
+
+/// Spec helper: a 3-vector.
+pub fn f3(take a: Float, take b: Float, take c: Float) -> Array[Float] {
+    var xs = std::array::empty();
+    std::array::push(xs, a);
+    std::array::push(xs, b);
+    std::array::push(xs, c);
+    xs
+}
+
+/// Spec helper: `as_floats` decoded `raw` to exactly `count` elements.
+pub fn floats_len(in raw: Str) -> Int {
+    match as_floats(raw) {
+        Ok { value } => std::array::len(value),
+        Err { error } => 0 - 1,
+    }
+}
+
+/// Spec helper: element `i` of `as_floats(raw)` is near `expect`.
+pub fn floats_at_near(in raw: Str, take i: Int, take expect: Float) -> Bool {
+    match as_floats(raw) {
+        Ok { value } => db::math::near(std::array::get(value, i), expect),
+        Err { error } => false,
+    }
+}
+
+/// Spec helper: `as_floats` rejected `raw`.
+pub fn floats_reject(in raw: Str) -> Bool {
+    match as_floats(raw) {
+        Ok { value } => false,
+        Err { error } => true,
+    }
+}
+
+/// Spec helper: `array_literal` of a 3-vector as a comparable `Str`.
+pub fn array_literal_is(take a: Float, take b: Float, take c: Float, in expect: Str) -> Bool {
+    let lit = array_literal(f3(a, b, c));
+    std::string::as_str(lit) == expect
+}
+
+/// Spec helper: `vector_literal` of a 3-vector as a comparable `Str`.
+pub fn vector_literal_is(take a: Float, take b: Float, take c: Float, in expect: Str) -> Bool {
+    let lit = vector_literal(f3(a, b, c));
+    std::string::as_str(lit) == expect
+}
+
+/// Spec helper: a vector survives encode → decode, in both literal forms.
+pub fn floats_round_trip(take a: Float, take b: Float, take c: Float) -> Bool {
+    let arr = array_literal(f3(a, b, c));
+    let vec_lit = vector_literal(f3(a, b, c));
+    let back_a = as_floats_or_empty(std::string::as_str(arr));
+    let back_v = as_floats_or_empty(std::string::as_str(vec_lit));
+    std::array::len(back_a) == 3 && std::array::len(back_v) == 3 && db::math::near(std::array::get(back_a, 0), a) && db::math::near(std::array::get(back_a, 1), b) && db::math::near(std::array::get(back_a, 2), c) && db::math::near(std::array::get(back_v, 2), c)
+}
+
+/// Spec helper: the literal of an empty vector.
+pub fn empty_literal_is(in expect: Str) -> Bool {
+    let lit = array_literal(std::array::empty());
+    std::string::as_str(lit) == expect
+}
 
 /// Spec helper: `as_int` succeeded with exactly `expect`.
 pub fn int_is(in raw: Str, take expect: Int) -> Bool {
@@ -433,6 +703,14 @@ pub fn float_near(in raw: Str, take expect: Float) -> Bool {
     }
 }
 
+/// Spec helper: `as_float` produced an infinity.
+pub fn float_is_infinite(in raw: Str) -> Bool {
+    match as_float(raw) {
+        Ok { value } => db::math::is_infinite(value),
+        Err { error } => false,
+    }
+}
+
 /// Spec helper: `as_float` rejected the input.
 pub fn float_rejects(in raw: Str) -> Bool {
     match as_float(raw) {
@@ -460,6 +738,13 @@ spec as_int {
     // int8 extremes, which a PostgreSQL bigint really can hold.
     then int_is("9223372036854775807", 9223372036854775807);
     then int_is("-9223372036854775807", 0 - 9223372036854775807);
+    // int8's minimum: its magnitude does not fit a positive Int, so this is
+    // the value a magnitude-then-negate decoder traps on.
+    then int_is("-9223372036854775808", 0 - 9223372036854775807 - 1);
+    // One past either end, and far past, are errors — never a trap.
+    then int_rejects("9223372036854775808");
+    then int_rejects("-9223372036854775809");
+    then int_rejects("99999999999999999999");
     // Malformed input is an Err, never a silent zero.
     then int_rejects("");
     then int_rejects("-");
@@ -474,6 +759,8 @@ spec as_int_or {
     then as_int_or("42", 0) == 42;
     then as_int_or("bad", 7) == 7;
     then as_int_or("", 0 - 1) == 0 - 1;
+    // The fallback contract holds for out-of-range text too.
+    then as_int_or("99999999999999999999", 7) == 7;
 }
 
 spec as_float {
@@ -493,6 +780,9 @@ spec as_float {
     // The special renderings are reported rather than silently finite.
     then float_rejects("NaN");
     then float_rejects("Infinity");
+    // An absurd exponent saturates to infinity or zero instead of trapping.
+    then float_is_infinite("1e99999999999999999999");
+    then float_near("1e-99999999999999999999", 0.0);
 }
 
 spec as_float_or {
@@ -525,4 +815,46 @@ spec is_temporal {
     then is_temporal(oid_date());
     then is_temporal(oid_timestamptz());
     then !is_temporal(oid_text());
+}
+
+spec is_float_array {
+    then is_float_array(oid_float8_array());
+    then is_float_array(oid_float4_array());
+    then !is_float_array(oid_float8());
+}
+
+spec as_floats {
+    // The renderings a float8[] column and a pgvector column produce.
+    then floats_len("{0.1,0.2,0.3}") == 3;
+    then floats_len("[0.1,0.2,0.3]") == 3;
+    then floats_at_near("{0.1,0.2,0.3}", 1, 0.2);
+    then floats_at_near("[-1.5,2e2,0]", 1, 200.0);
+    then floats_at_near("[-1.5,2e2,0]", 0, 0.0 - 1.5);
+    then floats_len("{}") == 0;
+    then floats_len("[]") == 0;
+    then floats_len("{ 1.0 , 2.0 }") == 2;
+    // Malformed input is an Err, never a shorter vector.
+    then floats_reject("");
+    then floats_reject("{");
+    then floats_reject("{1,2");
+    then floats_reject("[1,2}");
+    then floats_reject("{1,,2}");
+    then floats_reject("{1,2,}");
+    then floats_reject("{1,NULL}");
+    then floats_reject("{{1,2},{3,4}}");
+    then floats_reject("{1,abc}");
+    then floats_reject("1,2,3");
+}
+
+spec array_literal {
+    then array_literal_is(0.1, 0.2, 0.3, "{0.1,0.2,0.3}");
+    then array_literal_is(1.0, 0.0 - 1.25, 0.5, "{1.0,-1.25,0.5}");
+    then empty_literal_is("{}");
+}
+
+spec vector_literal {
+    then vector_literal_is(0.1, 0.2, 0.3, "[0.1,0.2,0.3]");
+    // Encode then decode returns the same vector, in both bracket forms.
+    then floats_round_trip(0.1, 0.2, 0.3);
+    then floats_round_trip(0.0 - 0.031415927, 0.70710678, 0.0);
 }

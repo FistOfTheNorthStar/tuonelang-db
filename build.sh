@@ -47,7 +47,7 @@ FEATURES
   --postgresql      The PostgreSQL adapter (pg::*). Implies --core.
   --vector          The embedded vector store (vec::*). Implies --core.
   --core            The backend-neutral layer alone (db::bytes, db::error,
-                    db::math).
+                    db::math, db::text).
   --all             Every feature. The default when no feature flag is given.
 
 ACTIONS
@@ -167,6 +167,12 @@ if [ "$run_live" -eq 1 ] && [ "$failed" -eq 0 ]; then
   if [ "$want_vec" -eq 1 ]; then
     printf '\n=== live: vector oracle ===\n'
     "$TUO" run examples/vector_check.tuo "${SRC[@]}"; check $? "vector_check"
+  fi
+
+  # The bridge oracle needs both features and the server.
+  if [ "$want_pg" -eq 1 ] && [ "$want_vec" -eq 1 ]; then
+    printf '\n=== live: bridge oracle ===\n'
+    "$TUO" run examples/bridge_check.tuo "${SRC[@]}"; check $? "bridge_check"
   fi
 fi
 

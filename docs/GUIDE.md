@@ -133,6 +133,14 @@ let deleted = pg::query::execute(db, "DELETE FROM users WHERE id = 1", 30000);
 let total = pg::query::scalar_int(db, "SELECT count(*) FROM users", 0, 30000);
 ```
 
+`scalar` returns an error, not an empty string, when the query produced no
+rows **or the value is NULL** — so "nothing came back" is never mistaken for
+`''`, in either form it can take. Read a nullable column with `run` and
+`is_null`. `scalar_int` is the exception by design: it has a fallback to give,
+so a NULL yields that, which is what `SELECT max(x)` over an empty table
+wants. Each of `execute`, `scalar`, and `scalar_int` has a `_params` form that
+takes parameters after the SQL (§3).
+
 ---
 
 ## 3. Parameters, and why to always use them
@@ -161,6 +169,54 @@ convenient.
 Parameters are sent as text and the server infers their types, which is why
 `$1` works without the client knowing the column's type in advance. To force a
 type, say so in the SQL: `WHERE id = $1::int`.
+
+### Sending NULL
+
+An empty string is a value. SQL NULL has no text form at all — on the wire it
+is a parameter length of `-1` with no bytes — so it needs its own spelling: a
+second array of flags, index-aligned with the texts. Build both with the push
+helpers, which append to the two arrays together so they cannot drift apart:
+
+```tuo
+var params = std::array::empty();
+var nulls = std::array::empty();
+pg::query::push_param(params, nulls, "ada");
+pg::query::push_null(params, nulls);           // the note is NULL
+
+let r = pg::query::run_params_null(db, "INSERT INTO users (name, note) VALUES ($1, $2)", params, nulls, 30000);
+```
+
+A non-zero flag sends that parameter as NULL and ignores its text. `nulls` may
+be shorter than `params` — the missing tail counts as values — which is
+exactly what `run_params` does with an empty one.
+
+### How many parameters
+
+The protocol counts a query's parameters in sixteen bits, so one call carries
+at most 65535 of them (`pg::query::max_params()`). More is refused with
+`kind_unsupported` before a byte reaches the server, and the connection is
+untouched. A multi-row `INSERT` therefore batches at `rows × columns` under
+that limit.
+
+### The parameterized conveniences
+
+```tuo
+var ids = std::array::empty();
+std::array::push(ids, std::string::from_str("42"));
+
+let n = pg::query::execute_params(db, "DELETE FROM users WHERE id = $1::int", ids, 30000);
+let name = pg::query::scalar_params(db, "SELECT name FROM users WHERE id = $1::int", ids, 30000);
+let total = pg::query::scalar_int_params(db, "SELECT count(*) FROM users WHERE id > $1::int", ids, 0, 30000);
+```
+
+Same results as `execute`, `scalar`, and `scalar_int`, over the extended
+protocol. They are one-liners over two public reducers, `affected_of` and
+`first_cell`, so a query that needs NULL parameters composes the same way
+instead of needing yet another variant:
+
+```tuo
+let n = pg::query::affected_of(pg::query::run_params_null(db, sql, params, nulls, 30000));
+```
 
 ---
 
@@ -233,6 +289,22 @@ Any other code can be matched literally: `is_sqlstate(e, "22P02")`.
 
 `db::error::render(e)` produces `"server: syntax error … (SQLSTATE 42601)"`.
 
+### One result set per query
+
+`run` accepts several `;`-separated statements — `"BEGIN; UPDATE …; COMMIT"`
+runs as one implicit transaction, and the tag is the last statement's — but a
+`ResultSet` holds one result, so two row-returning statements in one call are
+refused with `kind_unsupported`. The stream is still drained, so the connection
+is fine afterwards; run them as two calls.
+
+### COPY is refused, not faked
+
+`COPY … TO STDOUT` and `COPY … FROM STDIN` both come back as
+`kind_unsupported`. The second is answered with a `CopyFail` on the wire so
+the server stops waiting for rows, and the connection is usable immediately
+afterwards. Bulk-load with parameterized `INSERT`s, or `COPY` to and from a
+file the server can reach.
+
 ### The connection survives an error
 
 An `ErrorResponse` is recorded, but the adapter keeps reading until
@@ -281,6 +353,8 @@ their human-readable renderings and one decoder serves both protocols.
 | `text` / `varchar` / `name` / `uuid` / `json` / `jsonb` | `cell` | Already text. |
 | `date` / `time` / `timestamp` / `timestamptz` | `cell` | ISO-8601 text; v0 has no date type. |
 | `bytea` | `cell` | Arrives in `\x…` hex form. |
+| `float8[]` / `float4[]` | `cell`, then `pg::value::as_floats` | `{0.1,0.2}` → `Array[Float]`; see below. |
+| pgvector `vector` | `cell`, then `pg::value::as_floats` | `[0.1,0.2]` → `Array[Float]`; the OID is per-install. |
 
 Classify a column by its OID when the shape is not known ahead of time:
 
@@ -292,6 +366,33 @@ if pg::value::is_integer(oid) {
     let s = pg::query::cell(rows, r, c);
 }
 ```
+
+### Vectors in and out
+
+A `float8[]` column renders as `{0.1,0.2,0.3}` and a pgvector column as
+`[0.1,0.2,0.3]`; `pg::value::as_floats` reads both into the `Array[Float]`
+the vector store takes, and refuses anything malformed rather than returning a
+shorter vector:
+
+```tuo
+let raw = pg::query::cell(rows, i, 2);
+let embedding = pg::value::as_floats_or_empty(std::string::as_str(raw));
+let _ = vec::db::add(store, embedding, id, body);
+```
+
+Going the other way, render a vector as a literal and bind it as text with a
+cast in the SQL:
+
+```tuo
+std::array::push(params, pg::value::array_literal(query_vector));   // "{0.1,0.2}" for $1::float8[]
+std::array::push(params, pg::value::vector_literal(query_vector));  // "[0.1,0.2]" for $1::vector
+```
+
+pgvector's `vector` type has no fixed OID; `pg::value::vector_oid_query()` is
+the query that finds it on a given server. `is_float_array(oid)` names the
+two built-in float array types. [`examples/bridge_check.tuo`](../examples/bridge_check.tuo)
+runs this whole round trip live and checks that search ranks decoded vectors
+exactly as it ranks the originals.
 
 Note the `numeric` caveat: `is_float(oid_numeric())` is true because its *text*
 form is a decimal literal, but decoding it through `cell_float` can lose
@@ -319,6 +420,11 @@ those operators exist and the hashes could now be written by hand. Stage B —
 `std::crypto` — has not: `std::crypto::sha256` still resolves to
 `R0002: no 'crypto' in 'std'`. So this is now a matter of implementation work,
 not a language limit.
+
+One thing to be plain about: this adapter speaks **no TLS**, so under
+`password` authentication the secret crosses the network in cleartext. Use it
+only over loopback or a link you already trust, and prefer `trust` scoped to
+the client's own address.
 
 To connect today, grant trust for your client host in `pg_hba.conf` and reload:
 
@@ -348,9 +454,9 @@ Effectful code cannot appear in a spec (`R0007`), so pin it the way this
 repository pins its own: a program that runs against a real server and exits
 non-zero on any disagreement. See
 [`examples/live_check.tuo`](../examples/live_check.tuo), which cross-checks
-eight properties and is the best worked example of the whole API in use.
+twelve properties and is the best worked example of the whole API in use.
 
 ```bash
-tuo verify src/db/*.tuo src/pg/*.tuo                       # 61 specs, no server needed
+tuo verify src/db/*.tuo src/pg/*.tuo                       # 87 specs, no server needed
 tuo run examples/live_check.tuo src/db/*.tuo src/pg/*.tuo  # the live oracle
 ```

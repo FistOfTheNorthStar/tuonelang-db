@@ -110,16 +110,40 @@ fails. **Use `connect`.** A connection is just the `Int` descriptor.
 fn run(take fd: Int, in sql: Str, take timeout_ms: Int) -> Result[ResultSet, PgError]
 fn run_params(take fd: Int, in sql: Str, in params: Array[String],
               take timeout_ms: Int) -> Result[ResultSet, PgError]
+fn run_params_null(take fd: Int, in sql: Str, in params: Array[String],
+                   in nulls: Array[Int], take timeout_ms: Int) -> Result[ResultSet, PgError]
 fn execute(take fd: Int, in sql: Str, take timeout_ms: Int) -> Result[Int, PgError]
+fn execute_params(take fd: Int, in sql: Str, in params: Array[String],
+                  take timeout_ms: Int) -> Result[Int, PgError]
 fn scalar(take fd: Int, in sql: Str, take timeout_ms: Int) -> Result[String, PgError]
+fn scalar_params(take fd: Int, in sql: Str, in params: Array[String],
+                 take timeout_ms: Int) -> Result[String, PgError]
 fn scalar_int(take fd: Int, in sql: Str, take fallback: Int,
               take timeout_ms: Int) -> Result[Int, PgError]
+fn scalar_int_params(take fd: Int, in sql: Str, in params: Array[String],
+                     take fallback: Int, take timeout_ms: Int) -> Result[Int, PgError]
+
+fn push_param(mut params: Array[String], mut nulls: Array[Int], in text: Str)
+fn push_null(mut params: Array[String], mut nulls: Array[Int])
+fn affected_of(take r: Result[ResultSet, PgError]) -> Result[Int, PgError]
+fn first_row(take r: Result[ResultSet, PgError]) -> Result[ResultSet, PgError]
+fn first_cell(take r: Result[ResultSet, PgError]) -> Result[String, PgError]
+fn first_cell_int(take r: Result[ResultSet, PgError], take fallback: Int) -> Result[Int, PgError]
 ```
 
 - `run` — you want the rows.
 - `run_params` — you have user input. **Always** for untrusted values.
-- `execute` — INSERT/UPDATE/DELETE/DDL; returns the affected-row count.
-- `scalar` / `scalar_int` — one value, e.g. `SELECT count(*)`.
+- `run_params_null` — `run_params` where some parameters are SQL NULL (§4).
+- `execute` / `execute_params` — INSERT/UPDATE/DELETE/DDL; returns the
+  affected-row count.
+- `scalar` / `scalar_int` and their `_params` forms — one value, e.g.
+  `SELECT count(*)`. `scalar` is an error (`kind_decode`), not `""`, when
+  there are no rows **or the value is NULL**; `scalar_int` gives its
+  `fallback` for NULL. For a nullable column use `run` + `is_null`.
+- `affected_of` / `first_cell` / `first_cell_int` — what the `_params` forms
+  are made of. Apply them to a `run_params_null` result to get the affected
+  count or one value of a query with NULL parameters.
+- `push_param` / `push_null` — build the `params` + `nulls` pair (§4).
 
 ### Reading a `ResultSet` — `pg::query`
 
@@ -158,7 +182,11 @@ fn kind_name(take k: Int) -> Str
 ```
 
 Kinds: `kind_connection` 1, `kind_timeout` 2, `kind_auth` 3, `kind_server` 4,
-`kind_protocol` 5, `kind_decode` 6, `kind_unsupported` 7.
+`kind_protocol` 5, `kind_decode` 6, `kind_unsupported` 7. Two things produce
+`kind_unsupported`, and the connection stays usable after both: two
+row-returning statements in one `run`, and any `COPY` to or from the client.
+Do not generate `COPY … FROM STDIN`; generate `INSERT … VALUES ($1, …)` in a
+loop or a multi-row `VALUES` list instead.
 
 Named SQLSTATEs: `sqlstate_unique_violation` (23505),
 `sqlstate_foreign_key_violation` (23503), `sqlstate_not_null_violation`
@@ -177,6 +205,12 @@ fn is_integer(take oid: Int) -> Bool
 fn is_float(take oid: Int) -> Bool
 fn is_text(take oid: Int) -> Bool
 fn is_temporal(take oid: Int) -> Bool
+fn is_float_array(take oid: Int) -> Bool     // float8[] 1022, float4[] 1021
+fn as_floats(in raw: Str) -> Result[Array[Float], Str]   // "{0.1,0.2}" or "[0.1,0.2]"
+fn as_floats_or_empty(in raw: Str) -> Array[Float]
+fn array_literal(in xs: Array[Float]) -> String          // "{0.1,0.2}"  for $1::float8[]
+fn vector_literal(in xs: Array[Float]) -> String         // "[0.1,0.2]"  for $1::vector
+fn vector_oid_query() -> Str                             // pgvector's OID is per-install
 ```
 
 Type OIDs: `oid_bool` 16, `oid_int8` 20, `oid_int2` 21, `oid_int4` 23,
@@ -185,6 +219,13 @@ Type OIDs: `oid_bool` 16, `oid_int8` 20, `oid_int2` 21, `oid_int4` 23,
 1700, `oid_uuid` 2950, `oid_jsonb` 3802.
 
 Dates/times/UUID/JSON come back as **text**; there is no date type in v0.
+
+**Embeddings.** A `float8[]` or pgvector `vector` cell is text; decode it
+with `as_floats` to get the `Array[Float]` that `vec::db::add` takes. Send a
+vector the other way as `array_literal(v)` bound to `$1::float8[]`, or
+`vector_literal(v)` bound to `$1::vector`. Never build the literal by
+string concatenation — the renderer guarantees plain decimal with no
+exponent, which is what the server's parser expects.
 
 ---
 
@@ -200,6 +241,37 @@ let r = pg::query::run_params(db, "SELECT * FROM users WHERE name = $1 AND age >
 
 Placeholders are `$1`, `$2`, … in push order. Every parameter is sent as text
 and the server infers its type.
+
+**To send SQL NULL**, use `run_params_null` with an `Array[Int]` of flags
+aligned to `params`: a non-zero flag means "send NULL, ignore the text". An
+empty string is a value, not NULL, so this is the only way to spell it. Build
+the pair with `push_param` / `push_null`, which append to both arrays at once:
+
+```tuo
+var params = std::array::empty();
+var nulls = std::array::empty();
+pg::query::push_param(params, nulls, "ada");
+pg::query::push_null(params, nulls);           // the note is NULL
+
+let r = pg::query::run_params_null(db, "INSERT INTO users (name, note) VALUES ($1, $2)", params, nulls, 30000);
+```
+
+A `nulls` array shorter than `params` treats the rest as values, so it may be
+left empty when nothing is NULL.
+
+One query carries at most `pg::query::max_params()` (65535) parameters; more
+is refused with `kind_unsupported` before anything is sent. For a bulk
+insert, batch the rows so `rows × columns` stays under that.
+
+**For a statement's affected count or a single value with parameters**, use
+`execute_params`, `scalar_params`, or `scalar_int_params` — the same shapes as
+`execute`, `scalar`, and `scalar_int`, taking `params` after `sql`. With NULL
+parameters, compose instead of looking for a `_null` variant (there is none):
+
+```tuo
+let n = pg::query::affected_of(pg::query::run_params_null(db, sql, params, nulls, 30000));
+let v = pg::query::first_cell(pg::query::run_params_null(db, sql, params, nulls, 30000));
+```
 
 **Never build SQL by concatenating values.** There is deliberately no helper in
 this library that would make that convenient.
@@ -314,7 +386,10 @@ landed the bitwise operators, so the hashes are expressible now; Stage B
 (`std::crypto`) has not, so nothing supplies them ready-made yet.
 
 The adapter returns a typed `kind_auth` error naming the fix rather than
-failing obscurely. To connect today, put this in `pg_hba.conf`:
+failing obscurely. **There is no TLS**, so under `password` the secret crosses
+the network in the clear: use it only on a loopback or otherwise trusted
+link, and prefer `trust` scoped to that host. To connect today, put this in
+`pg_hba.conf`:
 
 ```
 host  all  all  127.0.0.1/32  trust

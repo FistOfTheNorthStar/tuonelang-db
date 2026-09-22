@@ -163,9 +163,10 @@ pub fn save(in s: vec::store::Store, in path: Str) -> Int {
 
 /// Read `path` and decode it into a store.
 ///
-/// A missing, empty, or malformed file yields an **empty store**, because a
-/// vector database that cannot read its file is empty rather than broken.
-/// `load_error` is how a caller finds out which of those happened.
+/// A missing, empty, truncated, or malformed file yields an **empty store**,
+/// never a partial one, because a vector database that cannot read its file
+/// is empty rather than broken. `load_error` is how a caller finds out which
+/// of those happened.
 ///
 /// # Example
 /// ```tuo
@@ -185,7 +186,7 @@ pub fn load_error(in path: Str) -> String {
     if !exists(path) {
         std::string::from_str("no such file")
     } else {
-        vec::codec::header_error(read_bytes(path))
+        vec::codec::file_error(read_bytes(path))
     }
 }
 

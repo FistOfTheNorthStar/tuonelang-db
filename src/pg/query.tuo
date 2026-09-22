@@ -9,6 +9,13 @@
 //   * `scalar`   — run a statement, get the first column of the first row; and
 //   * `run`      — run a statement, get every row into a `ResultSet`.
 //
+// Each comes in a plain form and a `_params` form (`run_params`,
+// `execute_params`, `scalar_params`, `scalar_int_params`); `run_params_null`
+// is `run_params` with some parameters sent as SQL NULL. The `_params`
+// conveniences are one-liners over `affected_of` and `first_cell`, which are
+// public so that any result — including one from `run_params_null` — can be
+// reduced the same way without another family of functions.
+//
 // THE RESULT SET IS A FLAT ARRAY.
 //
 // v0 has no nested generic containers — no `Array[Array[String]]` — so a table
@@ -25,11 +32,17 @@
 //
 // PARAMETERS.
 //
-// `run_params` uses the **extended query protocol**, which sends parameter
-// values separately from the SQL text. That is not a convenience: it is the
-// only way to be safe against SQL injection, because a parameter can never be
-// parsed as SQL. String interpolation into a query is never the right answer,
-// and this module deliberately offers no helper that would encourage it.
+// `run_params` and everything built on it use the **extended query
+// protocol**, which sends parameter values separately from the SQL text. That
+// is not a convenience: it is the only way to be safe against SQL injection,
+// because a parameter can never be parsed as SQL. String interpolation into a
+// query is never the right answer, and this module deliberately offers no
+// helper that would encourage it.
+//
+// A parameter list is two index-aligned arrays — the texts and the NULL
+// flags — because v0 has no struct-in-array to hold a nullable value. Build
+// them with `push_param` / `push_null`, which append to both at once, so the
+// alignment is structural rather than something a caller keeps by hand.
 
 module pg::query;
 
@@ -226,6 +239,16 @@ pub fn cell_bool(in rs: ResultSet, take r: Int, take c: Int) -> Bool {
 /// **`sql` is sent verbatim**, so never build it by concatenating untrusted
 /// input — use `run_params` for that.
 ///
+/// `sql` may hold several statements separated by `;`, and the server runs
+/// them as one implicit transaction — `"BEGIN; UPDATE …; COMMIT"` is fine,
+/// and the tag and affected count are the last statement's. What a single
+/// `ResultSet` cannot hold is **two row-returning statements**: that is
+/// refused with `kind_unsupported` (see `multi_result_error`), the stream is
+/// still drained, and the connection stays usable. Run them separately.
+/// `COPY` to or from the client is refused the same way (see `copy_error`);
+/// a `COPY … FROM STDIN` is answered with `CopyFail` so the server does not
+/// wait for rows that will never come.
+///
 /// # Example
 /// ```tuo
 /// // let rs = pg::query::run(fd, "SELECT id, name FROM users", 30000);
@@ -245,20 +268,55 @@ pub fn run(take fd: Int, in sql: Str, take timeout_ms: Int) -> Result[ResultSet,
 /// any part of a query comes from outside the program.
 ///
 /// Placeholders in `sql` are `$1`, `$2`, … in parameter order. Every parameter
-/// is sent as text and its type inferred by the server; a NULL is spelled by
-/// passing an empty `Array[Int]` flag — see `run_params_null`.
+/// is sent as text and its type inferred by the server. Every parameter here
+/// is a value; to send SQL NULL for one, use `run_params_null`.
 ///
 /// # Example
 /// ```tuo
 /// // let rs = pg::query::run_params(fd, "SELECT * FROM users WHERE id = $1", ps, 30000);
 /// ```
 pub fn run_params(take fd: Int, in sql: Str, in params: Array[String], take timeout_ms: Int) -> Result[ResultSet, db::error::PgError] {
+    let no_nulls = std::array::empty();
+    run_params_null(fd, sql, params, no_nulls, timeout_ms)
+}
+
+/// EFFECT: `run_params`, with some parameters sent as **SQL NULL**.
+///
+/// `nulls` is index-aligned with `params`: where `nulls[i]` is non-zero,
+/// parameter `i` is sent as NULL and its text is ignored. A `nulls` shorter
+/// than `params` treats the missing tail as non-NULL, so an empty array means
+/// "no NULLs" and is what `run_params` passes. Build the pair with
+/// `push_param` / `push_null` rather than by hand, so the two arrays cannot
+/// drift out of step.
+///
+/// NULL has no text form, which is why this cannot be spelled through
+/// `params` alone: the protocol marks a NULL parameter with a length of `-1`
+/// and no bytes, and any string — including `""` — would arrive as a value.
+///
+/// For the affected count or a single value of such a query, reduce the
+/// result with `affected_of` or `first_cell` — that is all `execute_params`
+/// and `scalar_params` do.
+///
+/// # Example
+/// ```tuo
+/// // var ps = std::array::empty();
+/// // var ns = std::array::empty();
+/// // pg::query::push_param(ps, ns, "ada");
+/// // pg::query::push_null(ps, ns);
+/// // let rs = pg::query::run_params_null(fd, "INSERT INTO t (name, note) VALUES ($1, $2)", ps, ns, 30000);
+/// ```
+pub fn run_params_null(take fd: Int, in sql: Str, in params: Array[String], in nulls: Array[Int], take timeout_ms: Int) -> Result[ResultSet, db::error::PgError] {
+    // Refuse before anything is sent: a Parse with no Sync behind it would
+    // leave the server waiting and the connection out of step.
+    if !params_fit(std::array::len(params)) {
+        return Err { error: too_many_params_error() };
+    }
     // Parse the SQL into the unnamed statement.
     let a = pg::conn::write_message(fd, pg::proto::parse("", sql));
     if a < 0 {
         return Err { error: db::error::new(db::error::kind_connection(), "failed to send Parse") };
     }
-    let b = pg::conn::write_message(fd, bind_message(params));
+    let b = pg::conn::write_message(fd, bind_message_null(params, nulls));
     if b < 0 {
         return Err { error: db::error::new(db::error::kind_connection(), "failed to send Bind") };
     }
@@ -279,29 +337,126 @@ pub fn run_params(take fd: Int, in sql: Str, in params: Array[String], take time
     collect(fd, timeout_ms)
 }
 
+/// The most parameters one `Bind` can carry: its count is an Int16, so
+/// 65535 (PostgreSQL 16 §55.7).
+///
+/// # Example
+/// ```tuo
+/// let n = pg::query::max_params(); // 65535
+/// ```
+pub fn max_params() -> Int {
+    65535
+}
+
+/// Can `count` parameters be sent in one `Bind`?
+///
+/// `db::bytes::put_i16` would silently wrap a larger count, leaving the
+/// message declaring fewer parameters than it carries — the server then
+/// reads parameter bytes as the result-format section and the connection
+/// desynchronizes. So the count is checked here, not trusted there.
+///
+/// # Example
+/// ```tuo
+/// let ok = pg::query::params_fit(3); // true
+/// ```
+pub fn params_fit(take count: Int) -> Bool {
+    count >= 0 && count <= max_params()
+}
+
+/// The error for a query with more parameters than one `Bind` can carry.
+///
+/// # Example
+/// ```tuo
+/// let e = pg::query::too_many_params_error();
+/// ```
+pub fn too_many_params_error() -> db::error::PgError {
+    db::error::new(db::error::kind_unsupported(), "a query can carry at most 65535 parameters and this one has more; split it into batches")
+}
+
+/// Append a value to a parameter list: `text` to `params`, a `0` to `nulls`.
+///
+/// # Example
+/// ```tuo
+/// var ps = std::array::empty();
+/// var ns = std::array::empty();
+/// pg::query::push_param(ps, ns, "ada");
+/// ```
+pub fn push_param(mut params: Array[String], mut nulls: Array[Int], in text: Str) {
+    std::array::push(params, std::string::from_str(text));
+    std::array::push(nulls, 0);
+}
+
+/// Append SQL NULL to a parameter list: an empty placeholder to `params`
+/// (ignored on the wire) and a `1` to `nulls`.
+///
+/// # Example
+/// ```tuo
+/// var ps = std::array::empty();
+/// var ns = std::array::empty();
+/// pg::query::push_null(ps, ns);
+/// ```
+pub fn push_null(mut params: Array[String], mut nulls: Array[Int]) {
+    std::array::push(params, std::string::empty());
+    std::array::push(nulls, 1);
+}
+
 /// Build the `Bind` message for the unnamed statement and portal, sending
-/// every parameter as text.
+/// every parameter as text, with those flagged in `nulls` sent as SQL NULL.
 ///
 /// Format codes are omitted (a zero count), which tells the server "text for
-/// everything" — the same choice `pg::value` decodes against.
-pub fn bind_message(in params: Array[String]) -> String {
+/// everything" — the same choice `pg::value` decodes against. A NULL
+/// parameter is `pg::proto::null_len()` and no bytes (PostgreSQL 16 §55.7,
+/// `Bind`); `nulls` is read as `run_params_null` describes.
+pub fn bind_message_null(in params: Array[String], in nulls: Array[Int]) -> String {
     var body = std::string::empty();
     db::bytes::put_cstr(body, ""); // portal: unnamed
     db::bytes::put_cstr(body, ""); // statement: unnamed
     db::bytes::put_i16(body, 0); // parameter format codes: none => all text
 
     let n = std::array::len(params);
+    let flagged = std::array::len(nulls);
     db::bytes::put_i16(body, n);
     var i = 0;
     while i < n {
-        let p = std::array::get(params, i);
-        db::bytes::put_i32(body, std::string::len(p));
-        db::bytes::put_bytes(body, std::string::as_str(p));
+        if i < flagged && std::array::get(nulls, i) != 0 {
+            db::bytes::put_i32(body, pg::proto::null_len());
+        } else {
+            let p = std::array::get(params, i);
+            db::bytes::put_i32(body, std::string::len(p));
+            db::bytes::put_bytes(body, std::string::as_str(p));
+        }
         i = i + 1;
     }
 
     db::bytes::put_i16(body, 0); // result format codes: none => all text
     pg::proto::finish(pg::proto::msg_bind(), body)
+}
+
+/// The error `collect` reports for a query that produced more than one
+/// result set. Pure, so the policy has a spec even though `collect` cannot.
+///
+/// # Example
+/// ```tuo
+/// let e = pg::query::multi_result_error();
+/// ```
+pub fn multi_result_error() -> db::error::PgError {
+    db::error::new(db::error::kind_unsupported(), "the query returned more than one result set; a ResultSet holds one, so run row-returning statements separately")
+}
+
+/// The error `collect` reports for a statement that entered COPY mode.
+/// Pure, so the policy has a spec even though `collect` cannot.
+///
+/// # Example
+/// ```tuo
+/// let e = pg::query::copy_error();
+/// ```
+pub fn copy_error() -> db::error::PgError {
+    db::error::new(db::error::kind_unsupported(), "COPY is not supported by this adapter; use INSERT with parameters, or COPY to and from a server-side file")
+}
+
+/// The reason sent in `CopyFail`, which the server echoes in its own error.
+pub fn copy_fail_reason() -> Str {
+    "COPY is not supported by this client"
 }
 
 /// EFFECT: consume messages until `ReadyForQuery`, assembling a `ResultSet`.
@@ -319,6 +474,7 @@ pub fn collect(take fd: Int, take timeout_ms: Int) -> Result[ResultSet, db::erro
 
     var failed = false;
     var failure = db::error::new(db::error::kind_protocol(), "no error");
+    var saw_rows = false;
 
     var guard = 0;
     var done = false;
@@ -338,6 +494,16 @@ pub fn collect(take fd: Int, take timeout_ms: Int) -> Result[ResultSet, db::erro
         let payload = pg::conn::unwrap_ok_string(payload_result);
 
         if type_byte == pg::proto::be_row_description() {
+            // A second RowDescription means a second result set. There is
+            // only one ResultSet to fill, and merging two would leave a
+            // shape whose cells cannot be indexed; refuse it — but keep
+            // draining, exactly as for a server error, so the connection
+            // stays usable.
+            if saw_rows {
+                failed = true;
+                failure = multi_result_error();
+            }
+            saw_rows = true;
             cols = pg::message::field_count(payload);
             var i = 0;
             while i < cols {
@@ -363,14 +529,35 @@ pub fn collect(take fd: Int, take timeout_ms: Int) -> Result[ResultSet, db::erro
         } else if type_byte == pg::proto::be_error_response() {
             // Record the error but keep reading: the server still owes a
             // ReadyForQuery, and leaving it unread would desynchronize the
-            // next query on this connection.
+            // next query on this connection. The first error wins, so the
+            // ErrorResponse the server sends after a CopyFail does not hide
+            // the unsupported-COPY error that caused it.
+            if !failed {
+                failed = true;
+                failure = pg::conn::error_from_payload(payload);
+            }
+        } else if type_byte == pg::proto::be_copy_in() {
+            // The server is now waiting for rows from us. Nothing here will
+            // send any, so end the exchange at once: CopyFail makes the
+            // server error out and return to ready, whereas silence would
+            // wait out the whole timeout and leave the connection wedged.
+            let sent = pg::conn::write_message(fd, pg::proto::copy_fail(copy_fail_reason()));
+            if sent < 0 {
+                return Err { error: db::error::new(db::error::kind_connection(), "the connection failed while sending CopyFail") };
+            }
             failed = true;
-            failure = pg::conn::error_from_payload(payload);
+            failure = copy_error();
+        } else if type_byte == pg::proto::be_copy_out() {
+            // The server will stream CopyData and CopyDone, which the loop
+            // drains like any other message; refuse the result rather than
+            // hand back an empty ResultSet that looks like success.
+            failed = true;
+            failure = copy_error();
         } else if type_byte == pg::proto::be_ready_for_query() {
             done = true;
         }
-    // ParameterStatus, NoticeResponse, ParseComplete, BindComplete, and
-    // NoData carry nothing this layer must act on.
+    // ParameterStatus, NoticeResponse, ParseComplete, BindComplete, NoData,
+    // CopyData, and CopyDone carry nothing this layer must act on.
     }
 
     if failed {
@@ -390,32 +577,44 @@ pub fn collect(take fd: Int, take timeout_ms: Int) -> Result[ResultSet, db::erro
 /// // let n = pg::query::execute(fd, "DELETE FROM users WHERE id = 1", 30000);
 /// ```
 pub fn execute(take fd: Int, in sql: Str, take timeout_ms: Int) -> Result[Int, db::error::PgError] {
-    let r = run(fd, sql, timeout_ms);
-    if !is_ok_result(r) {
-        return Err { error: unwrap_err_result(r) };
-    }
-    Ok { value: affected(unwrap_ok_result(r)) }
+    affected_of(run(fd, sql, timeout_ms))
+}
+
+/// EFFECT: `execute` with out-of-band parameters — the injection-safe form
+/// for an `INSERT`, `UPDATE`, or `DELETE` whose values come from outside.
+///
+/// # Example
+/// ```tuo
+/// // let n = pg::query::execute_params(fd, "DELETE FROM users WHERE id = $1", ps, 30000);
+/// ```
+pub fn execute_params(take fd: Int, in sql: Str, in params: Array[String], take timeout_ms: Int) -> Result[Int, db::error::PgError] {
+    affected_of(run_params(fd, sql, params, timeout_ms))
 }
 
 /// EFFECT: run a query and return the first column of its first row as text.
 ///
-/// Returns an error when the query produced no rows, so a caller never
-/// mistakes "no result" for an empty string.
+/// Returns an error when the query produced no rows **or the cell is NULL**,
+/// so a caller never mistakes "no value" for an empty string — the same
+/// distinction `cell` and `is_null` keep. To read a nullable column, use
+/// `run` and `is_null`; to read a number with a default for NULL, use
+/// `scalar_int`.
 ///
 /// # Example
 /// ```tuo
 /// // let v = pg::query::scalar(fd, "SELECT count(*) FROM users", 30000);
 /// ```
 pub fn scalar(take fd: Int, in sql: Str, take timeout_ms: Int) -> Result[String, db::error::PgError] {
-    let r = run(fd, sql, timeout_ms);
-    if !is_ok_result(r) {
-        return Err { error: unwrap_err_result(r) };
-    }
-    let rs = unwrap_ok_result(r);
-    if row_count(rs) == 0 || column_count(rs) == 0 {
-        return Err { error: db::error::new(db::error::kind_decode(), "the query returned no rows") };
-    }
-    Ok { value: cell(rs, 0, 0) }
+    first_cell(run(fd, sql, timeout_ms))
+}
+
+/// EFFECT: `scalar` with out-of-band parameters.
+///
+/// # Example
+/// ```tuo
+/// // let v = pg::query::scalar_params(fd, "SELECT name FROM users WHERE id = $1", ps, 30000);
+/// ```
+pub fn scalar_params(take fd: Int, in sql: Str, in params: Array[String], take timeout_ms: Int) -> Result[String, db::error::PgError] {
+    first_cell(run_params(fd, sql, params, timeout_ms))
 }
 
 /// EFFECT: run a query and return the first cell as an `Int`.
@@ -425,7 +624,44 @@ pub fn scalar(take fd: Int, in sql: Str, take timeout_ms: Int) -> Result[String,
 /// // let n = pg::query::scalar_int(fd, "SELECT count(*) FROM users", 0, 30000);
 /// ```
 pub fn scalar_int(take fd: Int, in sql: Str, take fallback: Int, take timeout_ms: Int) -> Result[Int, db::error::PgError] {
-    let r = run(fd, sql, timeout_ms);
+    first_cell_int(run(fd, sql, timeout_ms), fallback)
+}
+
+/// EFFECT: `scalar_int` with out-of-band parameters.
+///
+/// # Example
+/// ```tuo
+/// // let n = pg::query::scalar_int_params(fd, "SELECT count(*) FROM users WHERE org = $1", ps, 0, 30000);
+/// ```
+pub fn scalar_int_params(take fd: Int, in sql: Str, in params: Array[String], take fallback: Int, take timeout_ms: Int) -> Result[Int, db::error::PgError] {
+    first_cell_int(run_params(fd, sql, params, timeout_ms), fallback)
+}
+
+/// The affected-row count of a result, or its error.
+///
+/// This is what `execute` and `execute_params` are; it is public so a result
+/// from `run_params_null` can be reduced the same way.
+///
+/// # Example
+/// ```tuo
+/// // let n = pg::query::affected_of(pg::query::run_params_null(fd, sql, ps, ns, 30000));
+/// ```
+pub fn affected_of(take r: Result[ResultSet, db::error::PgError]) -> Result[Int, db::error::PgError] {
+    if !is_ok_result(r) {
+        return Err { error: unwrap_err_result(r) };
+    }
+    Ok { value: affected(unwrap_ok_result(r)) }
+}
+
+/// A result that has at least one row and one column, or an error: the
+/// result's own, or `kind_decode` "no rows". The one place the no-rows
+/// policy lives; `first_cell` and `first_cell_int` both start here.
+///
+/// # Example
+/// ```tuo
+/// // let rs = pg::query::first_row(pg::query::run(fd, sql, 30000));
+/// ```
+pub fn first_row(take r: Result[ResultSet, db::error::PgError]) -> Result[ResultSet, db::error::PgError] {
     if !is_ok_result(r) {
         return Err { error: unwrap_err_result(r) };
     }
@@ -433,7 +669,48 @@ pub fn scalar_int(take fd: Int, in sql: Str, take fallback: Int, take timeout_ms
     if row_count(rs) == 0 || column_count(rs) == 0 {
         return Err { error: db::error::new(db::error::kind_decode(), "the query returned no rows") };
     }
-    Ok { value: cell_int(rs, 0, 0, fallback) }
+    Ok { value: rs }
+}
+
+/// The first cell of a result as text; an error when there are no rows or
+/// the cell is NULL; or the result's own error.
+///
+/// This is what `scalar` and `scalar_params` are; it is public so a result
+/// from `run_params_null` can be reduced the same way. A NULL first cell is
+/// `kind_decode` "returned NULL", not `""`: a NULL written with
+/// `run_params_null` must not read back as an empty string.
+///
+/// # Example
+/// ```tuo
+/// // let v = pg::query::first_cell(pg::query::run_params_null(fd, sql, ps, ns, 30000));
+/// ```
+pub fn first_cell(take r: Result[ResultSet, db::error::PgError]) -> Result[String, db::error::PgError] {
+    match first_row(r) {
+        Ok { value } => cell_or_null_error(value),
+        Err { error } => Err { error: error },
+    }
+}
+
+/// Cell `(0, 0)` of a non-empty result, or the NULL error.
+///
+/// A `match` arm takes an expression, so the branch is a named function.
+pub fn cell_or_null_error(take rs: ResultSet) -> Result[String, db::error::PgError] {
+    if is_null(rs, 0, 0) {
+        return Err { error: db::error::new(db::error::kind_decode(), "the query returned NULL where one value was expected") };
+    }
+    Ok { value: cell(rs, 0, 0) }
+}
+
+/// `first_cell`, decoded as an `Int` with `fallback` for NULL or bad text.
+///
+/// NULL is a `fallback` here rather than an error, because this is the form
+/// that has one to give — `SELECT max(x)` over no rows is NULL, and a caller
+/// asking for an `Int` with a default wants the default.
+pub fn first_cell_int(take r: Result[ResultSet, db::error::PgError], take fallback: Int) -> Result[Int, db::error::PgError] {
+    match first_row(r) {
+        Ok { value } => Ok { value: cell_int(value, 0, 0, fallback) },
+        Err { error } => Err { error: error },
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -541,21 +818,190 @@ pub fn fixture_name_is(take c: Int, in expect: Str) -> Bool {
     std::string::as_str(column_name(fixture_rs(), c)) == expect
 }
 
-/// Spec helper: the declared length of a Bind message matches its real size.
-pub fn bind_framing_ok(take count: Int) -> Bool {
+/// Spec helper: `count` one-byte parameter texts. One byte each, so the
+/// offset of any length word in the Bind message is easy to predict.
+pub fn n_params(take count: Int) -> Array[String] {
     var ps = std::array::empty();
     var i = 0;
     while i < count {
         std::array::push(ps, std::string::from_str("v"));
         i = i + 1;
     }
-    let m = bind_message(ps);
-    db::bytes::be_i32(m, 1) == std::string::len(m) - 1
+    ps
+}
+
+/// Spec helper: the Bind for `count` unflagged parameters frames correctly.
+pub fn bind_framing_ok(take count: Int) -> Bool {
+    pg::proto::framing_ok(bind_message_null(n_params(count), std::array::empty()))
 }
 
 /// Spec helper: the type byte of a Bind message.
 pub fn bind_type() -> Int {
-    std::string::byte_at(bind_message(std::array::empty()), 0)
+    pg::proto::type_of(bind_message_null(std::array::empty(), std::array::empty()))
+}
+
+/// Spec helper: the length word of parameter `read_index` in a Bind for
+/// `count` one-byte parameters where only `flag_index` carries `flag_value`
+/// (a negative `flag_index` means an empty flag array).
+///
+/// The flag array is built exactly `flag_index + 1` long, so any parameter
+/// past it exercises the "tail beyond the flags is a value" rule. The first
+/// length word sits after the type byte (1), the message length (4), two
+/// empty C strings (2), the format-code count (2) and the parameter count
+/// (2): offset 11. Each earlier parameter then adds its 4-byte length word
+/// plus its one byte of text — or nothing at all when it was sent as NULL.
+pub fn bind_len_at(take count: Int, take flag_index: Int, take flag_value: Int, take read_index: Int) -> Int {
+    var ns = std::array::empty();
+    var i = 0;
+    while i <= flag_index {
+        if i == flag_index {
+            std::array::push(ns, flag_value);
+        } else {
+            std::array::push(ns, 0);
+        }
+        i = i + 1;
+    }
+    let m = bind_message_null(n_params(count), ns);
+    var at = 11;
+    var j = 0;
+    while j < read_index {
+        if j == flag_index && flag_value != 0 {
+            at = at + 4;
+        } else {
+            at = at + 5;
+        }
+        j = j + 1;
+    }
+    db::bytes::be_i32(m, at)
+}
+
+/// Spec helper: a flag with no parameter behind it is ignored — the message
+/// declares zero parameters (the Int16 at offset 9) and frames correctly.
+pub fn bind_flag_without_param_ok() -> Bool {
+    var ns = std::array::empty();
+    std::array::push(ns, 1);
+    let m = bind_message_null(std::array::empty(), ns);
+    db::bytes::be_i16(m, 9) == 0 && pg::proto::framing_ok(m)
+}
+
+/// Spec helper: the framing invariant holds with every other one of `count`
+/// parameters sent as NULL.
+pub fn bind_null_framing_ok(take count: Int) -> Bool {
+    var ns = std::array::empty();
+    var i = 0;
+    while i < count {
+        std::array::push(ns, i % 2);
+        i = i + 1;
+    }
+    pg::proto::framing_ok(bind_message_null(n_params(count), ns))
+}
+
+/// Spec helper: a list built with the push helpers — value, NULL, value —
+/// keeps both arrays the same length.
+pub fn pushed_lengths_agree() -> Bool {
+    var ps = std::array::empty();
+    var ns = std::array::empty();
+    push_param(ps, ns, "a");
+    push_null(ps, ns);
+    push_param(ps, ns, "b");
+    std::array::len(ps) == 3 && std::array::len(ns) == 3
+}
+
+/// Spec helper: the flag the push helpers left at `i` of value, NULL, value.
+pub fn pushed_flag_at(take i: Int) -> Int {
+    var ps = std::array::empty();
+    var ns = std::array::empty();
+    push_param(ps, ns, "a");
+    push_null(ps, ns);
+    push_param(ps, ns, "b");
+    std::array::get(ns, i)
+}
+
+/// Spec helper: the text the push helpers left at `i` of value, NULL, value.
+pub fn pushed_text_is(take i: Int, in expect: Str) -> Bool {
+    var ps = std::array::empty();
+    var ns = std::array::empty();
+    push_param(ps, ns, "a");
+    push_null(ps, ns);
+    push_param(ps, ns, "b");
+    std::string::as_str(std::array::get(ps, i)) == expect
+}
+
+/// Spec helper: a one-cell result whose only cell is NULL.
+pub fn fixture_null_rs() -> ResultSet {
+    var columns = std::array::empty();
+    std::array::push(columns, std::string::from_str("note"));
+    var oids = std::array::empty();
+    std::array::push(oids, pg::value::oid_text());
+    var values = std::array::empty();
+    std::array::push(values, std::string::empty());
+    var nulls = std::array::empty();
+    std::array::push(nulls, 1);
+    ResultSet { columns: columns, values: values, nulls: nulls, oids: oids, row_count: 1, column_count: 1, tag: std::string::from_str("SELECT 1"), affected: 1 }
+}
+
+/// Spec helper: the error kind `first_cell` reports for a NULL first cell.
+pub fn first_cell_null_kind() -> Int {
+    match first_cell(Ok { value: fixture_null_rs() }) {
+        Ok { value: _ } => 0,
+        Err { error } => db::error::kind(error),
+    }
+}
+
+/// Spec helper: the message `first_cell` reports for a NULL first cell.
+pub fn first_cell_null_message_is(in expect: Str) -> Bool {
+    match first_cell(Ok { value: fixture_null_rs() }) {
+        Ok { value: _ } => false,
+        Err { error } => std::string::as_str(db::error::message(error)) == expect,
+    }
+}
+
+/// Spec helper: `first_cell_int` of a NULL first cell yields the fallback.
+pub fn first_cell_int_null() -> Int {
+    match first_cell_int(Ok { value: fixture_null_rs() }, 0 - 5) {
+        Ok { value } => value,
+        Err { error: _ } => 0 - 1,
+    }
+}
+
+/// Spec helper: `first_cell_int` of a fixture-backed `Ok` result.
+pub fn first_cell_int_of_fixture() -> Int {
+    match first_cell_int(Ok { value: fixture_rs() }, 0 - 9) {
+        Ok { value } => value,
+        Err { error: _ } => 0 - 1,
+    }
+}
+
+/// Spec helper: the error kind `first_cell_int` reports for an empty result.
+pub fn first_cell_int_empty_kind() -> Int {
+    match first_cell_int(Ok { value: empty_result() }, 0) {
+        Ok { value: _ } => 0,
+        Err { error } => db::error::kind(error),
+    }
+}
+
+/// Spec helper: `first_cell` of a fixture-backed `Ok` result.
+pub fn first_cell_of_fixture_is(in expect: Str) -> Bool {
+    match first_cell(Ok { value: fixture_rs() }) {
+        Ok { value } => std::string::as_str(value) == expect,
+        Err { error: _ } => false,
+    }
+}
+
+/// Spec helper: the error kind `first_cell` reports for an empty result.
+pub fn first_cell_empty_kind() -> Int {
+    match first_cell(Ok { value: empty_result() }) {
+        Ok { value: _ } => 0,
+        Err { error } => db::error::kind(error),
+    }
+}
+
+/// Spec helper: `affected_of` passes the tag's count through.
+pub fn affected_of_fixture() -> Int {
+    match affected_of(Ok { value: fixture_rs() }) {
+        Ok { value } => value,
+        Err { error: _ } => 0 - 1,
+    }
 }
 
 spec empty_result {
@@ -612,10 +1058,79 @@ spec row_count {
     then affected(fixture_rs()) == 2;
 }
 
-spec bind_message {
-    // The framing invariant, across parameter counts.
+spec bind_message_null {
+    // The framing invariant, across parameter counts, with and without NULLs.
     then bind_framing_ok(0);
     then bind_framing_ok(1);
     then bind_framing_ok(5);
+    then bind_null_framing_ok(1);
+    then bind_null_framing_ok(6);
     then bind_type() == pg::proto::msg_bind();
+    // A flagged parameter is the NULL length; an unflagged one is its byte
+    // count. Any non-zero flag means NULL, not only 1.
+    then bind_len_at(1, 0, 1, 0) == pg::proto::null_len();
+    then bind_len_at(1, 0, 7, 0) == pg::proto::null_len();
+    then bind_len_at(1, 0, 0, 0) == 1;
+    then bind_len_at(1, 0 - 1, 0, 0) == 1;
+    // Parameters past the end of the flag array are values, and the offsets
+    // after a NULL (which carries no bytes) still land on the right word.
+    then bind_len_at(3, 0, 1, 1) == 1;
+    then bind_len_at(3, 0, 1, 2) == 1;
+    then bind_len_at(3, 1, 1, 0) == 1;
+    then bind_len_at(3, 1, 1, 1) == pg::proto::null_len();
+    then bind_len_at(3, 1, 1, 2) == 1;
+    // A flag with nothing behind it is ignored.
+    then bind_flag_without_param_ok();
+}
+
+spec push_param {
+    then pushed_lengths_agree();
+    then pushed_text_is(0, "a");
+    then pushed_flag_at(0) == 0;
+    then pushed_text_is(2, "b");
+    then pushed_flag_at(2) == 0;
+}
+
+spec push_null {
+    then pushed_flag_at(1) == 1;
+    // The placeholder text is empty and, being flagged, never sent.
+    then pushed_text_is(1, "");
+}
+
+spec multi_result_error {
+    then db::error::kind(multi_result_error()) == db::error::kind_unsupported();
+}
+
+spec copy_error {
+    then db::error::kind(copy_error()) == db::error::kind_unsupported();
+}
+
+spec params_fit {
+    then params_fit(0);
+    then params_fit(1);
+    then params_fit(max_params());
+    // One past the Int16 count is exactly where `put_i16` would wrap to 0.
+    then !params_fit(max_params() + 1);
+    then !params_fit(0 - 1);
+    then db::error::kind(too_many_params_error()) == db::error::kind_unsupported();
+}
+
+spec first_cell {
+    then first_cell_of_fixture_is("1");
+    // No rows is a decode error, never an empty string — and so is NULL.
+    then first_cell_empty_kind() == db::error::kind_decode();
+    then first_cell_null_kind() == db::error::kind_decode();
+    then first_cell_null_message_is("the query returned NULL where one value was expected");
+}
+
+spec first_cell_int {
+    then first_cell_int_of_fixture() == 1;
+    // The no-rows policy is inherited from `first_row`, not duplicated.
+    then first_cell_int_empty_kind() == db::error::kind_decode();
+    // NULL is the fallback here, because this form has one to give.
+    then first_cell_int_null() == 0 - 5;
+}
+
+spec affected_of {
+    then affected_of_fixture() == 2;
 }

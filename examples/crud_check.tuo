@@ -7,7 +7,7 @@
 //
 // Run it (against the docker-compose Postgres in ../shallowflaws):
 //
-//     tuo run examples/crud_check.tuo src/pg/*.tuo
+//     tuo run examples/crud_check.tuo src/db/*.tuo src/pg/*.tuo
 //
 // Exit codes:
 //
@@ -19,7 +19,12 @@
 //     74  an int column was not classified as an integer type (GUIDE §6)
 //     75  a text column was not classified as a text type (GUIDE §6)
 //     76  scalar_int failed (GUIDE §2)
-//     77  the row count was not the expected 1
+//     77  the row count was not the expected 3
+//     78  execute_params did not report one affected row (GUIDE §3)
+//     79  scalar_params did not return the inserted name (GUIDE §3)
+//     80  a NULL parameter was stored as a value (GUIDE §3)
+//     81  scalar_int_params did not count the rows (GUIDE §3)
+//     82  a NULL read back through scalar_params was not an error, or scalar_int did not fall back (GUIDE §2)
 
 fn main() -> Int {
     let opened = pg::conn::connect("127.0.0.1", 5432, "shallowflaws", "deepflaws", "", 30000);
@@ -28,7 +33,7 @@ fn main() -> Int {
     }
     let dbh = pg::conn::unwrap_ok_int(opened);
 
-    let _ = pg::query::execute(dbh, "CREATE TEMP TABLE u (id int PRIMARY KEY, name text)", 30000);
+    let _ = pg::query::execute(dbh, "CREATE TEMP TABLE u (id int PRIMARY KEY, name text, note text)", 30000);
 
     // GUIDE §5 — transaction
     let _ = pg::query::execute(dbh, "BEGIN", 30000);
@@ -75,6 +80,86 @@ fn main() -> Int {
         return 75;
     }
 
+    // GUIDE §3 — the parameterized conveniences
+    var params2 = std::array::empty();
+    std::array::push(params2, std::string::from_str("bob"));
+    let inserted = pg::query::execute_params(dbh, "INSERT INTO u (id, name) VALUES (2, $1)", params2, 30000);
+    if !pg::conn::is_ok_int(inserted) {
+        let _ = pg::conn::shutdown(dbh);
+        return 78;
+    }
+    if pg::conn::unwrap_ok_int(inserted) != 1 {
+        let _ = pg::conn::shutdown(dbh);
+        return 78;
+    }
+    var params3 = std::array::empty();
+    std::array::push(params3, std::string::from_str("2"));
+    let named = pg::query::scalar_params(dbh, "SELECT name FROM u WHERE id = $1::int", params3, 30000);
+    if !pg::conn::is_ok_string(named) {
+        let _ = pg::conn::shutdown(dbh);
+        return 79;
+    }
+    let name = pg::conn::unwrap_ok_string(named);
+    if std::string::as_str(name) != "bob" {
+        let _ = pg::conn::shutdown(dbh);
+        return 79;
+    }
+
+    // GUIDE §3 — sending NULL, with the push helpers, reduced by affected_of
+    var np = std::array::empty();
+    var nn = std::array::empty();
+    pg::query::push_param(np, nn, "3");
+    pg::query::push_param(np, nn, "cy");
+    pg::query::push_null(np, nn);
+    let with_null = pg::query::affected_of(pg::query::run_params_null(dbh, "INSERT INTO u (id, name, note) VALUES ($1::int, $2, $3)", np, nn, 30000));
+    if !pg::conn::is_ok_int(with_null) {
+        let _ = pg::conn::shutdown(dbh);
+        return 80;
+    }
+    let back = pg::query::run(dbh, "SELECT note FROM u WHERE id = 3", 30000);
+    if !pg::query::is_ok_result(back) {
+        let _ = pg::conn::shutdown(dbh);
+        return 80;
+    }
+    let note = pg::query::unwrap_ok_result(back);
+    if pg::query::row_count(note) != 1 || !pg::query::is_null(note, 0, 0) {
+        let _ = pg::conn::shutdown(dbh);
+        return 80;
+    }
+
+    // GUIDE §2 — a NULL is not "" through scalar_params, and is the fallback
+    // through scalar_int. The note of id 3 was inserted as NULL above.
+    var id3 = std::array::empty();
+    std::array::push(id3, std::string::from_str("3"));
+    let null_note = pg::query::scalar_params(dbh, "SELECT note FROM u WHERE id = $1::int", id3, 30000);
+    if pg::conn::is_ok_string(null_note) {
+        let _ = pg::conn::shutdown(dbh);
+        return 82;
+    }
+    let null_err = pg::conn::unwrap_err_string(null_note);
+    if db::error::kind(null_err) != db::error::kind_decode() {
+        let _ = pg::conn::shutdown(dbh);
+        return 82;
+    }
+    let null_num = pg::query::scalar_int(dbh, "SELECT NULL::int", 0 - 4, 30000);
+    if !pg::conn::is_ok_int(null_num) || pg::conn::unwrap_ok_int(null_num) != 0 - 4 {
+        let _ = pg::conn::shutdown(dbh);
+        return 82;
+    }
+
+    // GUIDE §3 — scalar_int_params
+    var floor = std::array::empty();
+    std::array::push(floor, std::string::from_str("1"));
+    let above = pg::query::scalar_int_params(dbh, "SELECT count(*) FROM u WHERE id > $1::int", floor, 0, 30000);
+    if !pg::conn::is_ok_int(above) {
+        let _ = pg::conn::shutdown(dbh);
+        return 81;
+    }
+    if pg::conn::unwrap_ok_int(above) != 2 {
+        let _ = pg::conn::shutdown(dbh);
+        return 81;
+    }
+
     // GUIDE §2 — scalar_int
     let total = pg::query::scalar_int(dbh, "SELECT count(*) FROM u", 0, 30000);
     if !pg::conn::is_ok_int(total) {
@@ -84,7 +169,7 @@ fn main() -> Int {
     let n = pg::conn::unwrap_ok_int(total);
 
     let _ = pg::conn::shutdown(dbh);
-    if n == 1 {
+    if n == 3 {
         0
     } else {
         77

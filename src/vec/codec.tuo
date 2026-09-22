@@ -442,14 +442,94 @@ pub fn header_error(in buf: String) -> String {
     }
 }
 
-/// Is `buf` a well-formed file this build can load?
+/// The reason `buf`'s body does not match its header, or `""` when it does.
+///
+/// Valid only once `header_error` is empty. Walks every row the header
+/// promises and refuses a file that ends inside one (**truncated**) or that
+/// carries bytes past the last row (**corrupt**). A truncated file is refused
+/// rather than loaded as its intact prefix, because a store that silently
+/// holds fewer rows than were saved is exactly the failure a caller cannot
+/// detect from search results alone.
+///
+/// # Example
+/// ```tuo
+/// // let why = vec::codec::body_error(buf);
+/// ```
+pub fn body_error(in buf: String) -> String {
+    let dim = dim_of(buf);
+    let count = count_of(buf);
+    let total = std::string::len(buf);
+    var at = header_len();
+    var row = 0;
+    var going = true;
+    while going && row < count {
+        let end = row_end(buf, at, dim, total);
+        if end < 0 {
+            going = false;
+        } else {
+            at = end;
+            row = row + 1;
+        }
+    }
+    if row < count {
+        var msg = std::string::from_str("truncated: the header promises ");
+        std::string::append(msg, std::string::as_str(count_text(count)));
+        std::string::append(msg, " rows, but the file holds ");
+        std::string::append(msg, std::string::as_str(count_text(row)));
+        std::string::append(msg, " whole rows");
+        msg
+    } else if at < total {
+        var msg = std::string::from_str("corrupt: ");
+        std::string::append(msg, std::string::as_str(count_text(total - at)));
+        std::string::append(msg, " unexpected bytes after the last row");
+        msg
+    } else {
+        std::string::empty()
+    }
+}
+
+/// The reason `buf` is not a loadable file — header first, then body — or
+/// `""` when it is. This is the check `vec::db::open` and
+/// `vec::disk::load_error` make.
+///
+/// # Example
+/// ```tuo
+/// // let why = vec::codec::file_error(buf);
+/// ```
+pub fn file_error(in buf: String) -> String {
+    // The header result is not bound: a `String` moved out on one branch and
+    // dropped on the other has no known state at the join (O0008), and the
+    // header check is a handful of byte reads, so asking twice is the plain
+    // way to keep every path move-free.
+    if std::string::len(header_error(buf)) > 0 {
+        header_error(buf)
+    } else {
+        body_error(buf)
+    }
+}
+
+/// A non-negative count as decimal text, for the messages above. Negative
+/// input renders as `0`, since no count is negative.
+///
+/// # Example
+/// ```tuo
+/// let t = vec::codec::count_text(42); // "42"
+/// ```
+pub fn count_text(take n: Int) -> String {
+    if n <= 0 {
+        return std::string::from_str("0");
+    }
+    db::text::render_int(n)
+}
+
+/// Is `buf` a well-formed file this build can load — header **and** body?
 ///
 /// # Example
 /// ```tuo
 /// // let ok = vec::codec::is_valid(buf);
 /// ```
 pub fn is_valid(in buf: String) -> Bool {
-    std::string::len(header_error(buf)) == 0
+    std::string::len(file_error(buf)) == 0
 }
 
 /// The offset just past the row starting at `at`, or `-1` when the buffer does
@@ -484,12 +564,13 @@ pub fn row_end(in buf: String, take at: Int, take dim: Int, take total: Int) -> 
     }
 }
 
-/// Decode a store from `buf`, or an empty store when the header is bad.
+/// Decode a store from `buf`, or an empty store when `is_valid` is false —
+/// which covers a bad header, a truncated body, and trailing bytes alike.
 ///
-/// A truncated body stops the decode at the last whole row rather than
-/// trapping, so a partially written file loads as its intact prefix. `decode`
-/// therefore always returns a usable store; `header_error` is how a caller
-/// learns the file was not perfect.
+/// `decode` therefore always returns a usable store and never a partial one;
+/// `file_error` is how a caller learns why it came back empty. The row walk
+/// below still measures each row before building it, so even a buffer that
+/// slipped past validation cannot make it trap.
 ///
 /// # Example
 /// ```tuo
@@ -697,15 +778,47 @@ pub fn decode_garbage_count() -> Int {
     vec::store::count(decode(buf))
 }
 
-/// Spec helper: a truncated body decodes to the whole rows that survived.
-///
-/// The fixture is encoded and then cut to the header plus one complete row,
-/// which is `dim*8` of vector plus `4+1` of id plus `4+5` of payload.
-pub fn truncated_body_count() -> Int {
+/// Spec helper: the fixture, encoded and cut to the header plus one complete
+/// row — `dim*8` of vector plus `4+1` of id plus `4+5` of payload.
+pub fn one_row_cut() -> String {
     let full = encode(fixture());
     let one_row = header_len() + 2 * 8 + 4 + 1 + 4 + 5;
-    let cut = std::string::slice(full, 0, one_row);
+    std::string::slice(full, 0, one_row)
+}
+
+/// Spec helper: a truncated body decodes to **no** rows, not to its prefix.
+pub fn truncated_body_count() -> Int {
+    vec::store::count(decode(one_row_cut()))
+}
+
+/// Spec helper: the message for a body cut after one of three rows.
+pub fn truncated_body_error_is(in expect: Str) -> Bool {
+    let e = file_error(one_row_cut());
+    std::string::as_str(e) == expect
+}
+
+/// Spec helper: the message for a good file with `extra` bytes appended.
+pub fn trailing_bytes_error_is(take extra: Int, in expect: Str) -> Bool {
+    var buf = encode(fixture());
+    var i = 0;
+    while i < extra {
+        std::string::push_byte(buf, 0);
+        i = i + 1;
+    }
+    let e = file_error(buf);
+    std::string::as_str(e) == expect
+}
+
+/// Spec helper: a body cut inside a row's length word is still refused.
+pub fn cut_mid_word_count() -> Int {
+    let full = encode(fixture());
+    let cut = std::string::slice(full, 0, std::string::len(full) - 3);
     vec::store::count(decode(cut))
+}
+
+/// Spec helper: `count_text` renders `n` as `expect`.
+pub fn count_text_is(take n: Int, in expect: Str) -> Bool {
+    std::string::as_str(count_text(n)) == expect
 }
 
 spec to_fixed {
@@ -795,8 +908,22 @@ spec header_error {
 spec decode {
     // Garbage decodes to an empty store rather than trapping.
     then decode_garbage_count() == 0;
-    // A body cut mid-file yields the whole rows that survived it.
-    then truncated_body_count() == 1;
+    // A body cut mid-file is refused outright, never loaded as its prefix.
+    then truncated_body_count() == 0;
+    then cut_mid_word_count() == 0;
+}
+
+spec body_error {
+    // The fixture holds three rows; cut after one, the message says so.
+    then truncated_body_error_is("truncated: the header promises 3 rows, but the file holds 1 whole rows");
+    then trailing_bytes_error_is(0, "");
+    then trailing_bytes_error_is(7, "corrupt: 7 unexpected bytes after the last row");
+}
+
+spec count_text {
+    then count_text_is(0, "0");
+    then count_text_is(7, "7");
+    then count_text_is(1234, "1234");
 }
 
 /// Spec helper: a store holding a component past `max_magnitude`.

@@ -77,8 +77,15 @@ if [ "$live" -eq 1 ]; then
     step "Live: guide patterns"
     "$TUO" run examples/crud_check.tuo "${SRC[@]}"
     rc=$?
-    # crud_check exits with the row count on success paths it verifies; 0 is pass.
+    # crud_check exits 0 on success and a code naming the failed pattern otherwise.
     check $((rc == 0 ? 0 : 1)) "crud_check (exit $rc)"
+  fi
+
+  # The bridge oracle needs both features: it round-trips vectors through a
+  # PostgreSQL column and into the store.
+  if [ "$have_pg" -eq 1 ] && [ "$have_vec" -eq 1 ]; then
+    step "Live: bridge oracle"
+    "$TUO" run examples/bridge_check.tuo "${SRC[@]}"; check $? "bridge_check"
   fi
 
   # The vector oracle writes to /tmp and needs no server, so it runs wherever

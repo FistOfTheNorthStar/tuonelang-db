@@ -37,6 +37,19 @@ pub fn protocol_version() -> Int {
     196608
 }
 
+/// The column or parameter length that means **SQL NULL**: `-1`, with no
+/// bytes following. The same value serves both directions — a `DataRow`
+/// column the server sends and a `Bind` parameter the client sends — so it is
+/// named once here and both `pg::query` and `pg::message` refer to it.
+///
+/// # Example
+/// ```tuo
+/// let n = pg::proto::null_len(); // -1
+/// ```
+pub fn null_len() -> Int {
+    0 - 1
+}
+
 /// The magic code that requests an SSL/TLS upgrade before startup.
 ///
 /// The adapter **declines** TLS (ADR-0014 and ADR-0017 both exclude it, and
@@ -102,6 +115,12 @@ pub fn msg_password() -> Int {
 /// `C` — Close (extended query: drop a statement or portal).
 pub fn msg_close() -> Int {
     67
+}
+
+/// `f` — CopyFail: the client's way out of a `COPY … FROM STDIN` it will not
+/// feed. The server answers with an ErrorResponse and returns to ready.
+pub fn msg_copy_fail() -> Int {
+    102
 }
 
 // ----------------------------------------------------------------------------
@@ -191,10 +210,10 @@ pub fn be_notification() -> Int {
     65
 }
 
-/// `G` / `H` / `W` — the COPY-mode entries, which this adapter does not
-/// implement. Named so `pg::message` can report them by name rather than as a
-/// bare integer, which is the difference between an actionable error and a
-/// mystery.
+/// `G` — CopyInResponse: the server is waiting for the client to stream
+/// rows. This adapter does not implement COPY, so `pg::query::collect`
+/// answers with `copy_fail` and reports `kind_unsupported`; the server's
+/// side of the exchange (`H`, CopyOutResponse) is drained and refused too.
 pub fn be_copy_in() -> Int {
     71
 }
@@ -337,9 +356,10 @@ pub fn startup(in user: Str, in database: Str) -> String {
 /// A **Query** message — the simple query protocol.
 ///
 /// `sql` may contain several statements separated by `;`, which the server
-/// runs as an implicit transaction. Parameters are **not** supported here (the
-/// protocol has no place for them); use the extended protocol for those, which
-/// is also the only form that is safe against SQL injection.
+/// runs as an implicit transaction; `pg::query::run` accepts that as long as
+/// at most one of them returns rows. Parameters are **not** supported here
+/// (the protocol has no place for them); use the extended protocol for those,
+/// which is also the only form that is safe against SQL injection.
 ///
 /// # Example
 /// ```tuo
@@ -445,6 +465,20 @@ pub fn password(in secret: Str) -> String {
     var body = std::string::empty();
     db::bytes::put_cstr(body, secret);
     finish(msg_password(), body)
+}
+
+/// A **CopyFail** carrying `reason`, which the server echoes back in its
+/// ErrorResponse. Sending it is what turns a `COPY … FROM STDIN` the client
+/// cannot feed from a hung connection into an error and a ready one.
+///
+/// # Example
+/// ```tuo
+/// let m = pg::proto::copy_fail("COPY is not supported by this client");
+/// ```
+pub fn copy_fail(in reason: Str) -> String {
+    var body = std::string::empty();
+    db::bytes::put_cstr(body, reason);
+    finish(msg_copy_fail(), body)
 }
 
 /// A **SASLInitialResponse**: the mechanism name, then the client's first
@@ -568,6 +602,13 @@ spec terminate {
     then declared_len(terminate()) == 4;
 }
 
+spec copy_fail {
+    then framing_ok(copy_fail("no"));
+    then type_of(copy_fail("no")) == msg_copy_fail();
+    // Int32 length (4) + "no" (2) + NUL (1).
+    then declared_len(copy_fail("no")) == 7;
+}
+
 spec password {
     then framing_ok(password("hunter2"));
     then type_of(password("hunter2")) == msg_password();
@@ -581,6 +622,10 @@ spec sasl_initial {
 spec sasl_response {
     then framing_ok(sasl_response("c=biws,r=abc,p=xyz"));
     then type_of(sasl_response("c=biws,r=abc,p=xyz")) == msg_password();
+}
+
+spec null_len {
+    then null_len() == 0 - 1;
 }
 
 spec finish {
