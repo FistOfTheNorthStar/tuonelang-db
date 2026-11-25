@@ -18,17 +18,21 @@ module app;
 
 fn main() -> Int {
     // 1. Connect. The host MUST be numeric — v0 has no DNS.
-    let opened = pg::conn::connect("127.0.0.1", 5432, "postgres", "mydb", "", 30000);
+    //    The password is answered however the server asks: SCRAM, md5, cleartext.
+    let opened = pg::conn::connect("127.0.0.1", 5432, "postgres", "mydb", "secret", 30000);
     if !pg::conn::is_ok_int(opened) {
         return 1;
     }
-    let db = pg::conn::unwrap_ok_int(opened);
+    let conn = pg::conn::unwrap_ok_int(opened);
 
     // 2. Query.
-    let result = pg::query::run(db, "SELECT id, name FROM users", 30000);
+    let result = pg::query::run(conn, "SELECT id, name FROM users", 30000);
     if !pg::query::is_ok_result(result) {
-        let _ = std::rt::write_string(1, pg::query::render_error(result));
-        let _ = pg::conn::shutdown(db);
+        let e = pg::query::unwrap_err_result(result);
+        let _ = std::rt::write_string(1, db::error::render(e));
+        if !db::error::is_fatal(e) {
+            let _ = pg::conn::shutdown(conn); // a fatal error already closed it
+        }
         return 1;
     }
     let rows = pg::query::unwrap_ok_result(result);
@@ -42,7 +46,7 @@ fn main() -> Int {
     }
 
     // 4. Close.
-    let _ = pg::conn::shutdown(db);
+    let _ = pg::conn::shutdown(conn);
     0
 }
 ```
@@ -56,7 +60,7 @@ operator**, and a `match` on an owned value **moves it**. So the one correct
 shape is always:
 
 ```tuo
-let r = pg::query::run(db, sql, 30000);   // 1. call
+let r = pg::query::run(conn, sql, 30000);   // 1. call
 if !pg::query::is_ok_result(r) {          // 2. inspect  (BORROWS, binds nothing)
     let text = pg::query::render_error(r); // 3a. consume ONCE on the error path
     return 1;                              //     ... and never read `r` again
@@ -160,12 +164,16 @@ fn is_null(in rs: ResultSet, take r: Int, take c: Int) -> Bool
 fn cell_int(in rs: ResultSet, take r: Int, take c: Int, take fallback: Int) -> Int
 fn cell_float(in rs: ResultSet, take r: Int, take c: Int, take fallback: Float) -> Float
 fn cell_bool(in rs: ResultSet, take r: Int, take c: Int) -> Bool
+fn has_cell(in rs: ResultSet, take r: Int, take c: Int) -> Bool
+fn has_column(in rs: ResultSet, take c: Int) -> Bool
 fn empty_result() -> ResultSet
 ```
 
 Indices are **0-based**, `(row, column)`. A NULL cell reads as `""` from
 `cell`, so **check `is_null` first** whenever NULL and `''` mean different
-things.
+things. An index outside the result never traps: `cell` reads `""`,
+`is_null` reads `true`, the typed accessors give their fallback — so a `-1`
+from `column_index` behaves like a NULL. `has_cell` is the explicit check.
 
 ### Errors — `db::error`
 
@@ -176,10 +184,20 @@ fn sqlstate(in e: PgError) -> String
 fn render(in e: PgError) -> String          // "server: ... (SQLSTATE 42601)"
 fn is_sqlstate(in e: PgError, in code: Str) -> Bool
 fn is_retryable(in e: PgError) -> Bool      // 40001 / 40P01
+fn is_fatal(in e: PgError) -> Bool          // kind_timeout or kind_connection
 fn new(take kind: Int, in message: Str) -> PgError
 fn server(in message: Str, in sqlstate: Str) -> PgError
+fn with_sqlstate(take kind: Int, in message: Str, in sqlstate: Str) -> PgError
 fn kind_name(take k: Int) -> Str
 ```
+
+**A fatal error has already closed the descriptor.** `kind_timeout` and
+`kind_connection` from any `pg::conn` or `pg::query` call mean the adapter
+closed `fd` before returning (the stream's position was unknown). On that
+path **do not call `shutdown`/`close`** — the number may already belong to
+another descriptor — reconnect instead. Every other kind leaves the
+connection usable. A server that announced why it was closing keeps its
+SQLSTATE (`57P01`) on the `kind_connection` error.
 
 Kinds: `kind_connection` 1, `kind_timeout` 2, `kind_auth` 3, `kind_server` 4,
 `kind_protocol` 5, `kind_decode` 6, `kind_unsupported` 7. Two things produce
@@ -236,7 +254,7 @@ var params = std::array::empty();
 std::array::push(params, std::string::from_str("ada"));
 std::array::push(params, std::string::from_str("42"));
 
-let r = pg::query::run_params(db, "SELECT * FROM users WHERE name = $1 AND age > $2", params, 30000);
+let r = pg::query::run_params(conn, "SELECT * FROM users WHERE name = $1 AND age > $2", params, 30000);
 ```
 
 Placeholders are `$1`, `$2`, … in push order. Every parameter is sent as text
@@ -253,7 +271,7 @@ var nulls = std::array::empty();
 pg::query::push_param(params, nulls, "ada");
 pg::query::push_null(params, nulls);           // the note is NULL
 
-let r = pg::query::run_params_null(db, "INSERT INTO users (name, note) VALUES ($1, $2)", params, nulls, 30000);
+let r = pg::query::run_params_null(conn, "INSERT INTO users (name, note) VALUES ($1, $2)", params, nulls, 30000);
 ```
 
 A `nulls` array shorter than `params` treats the rest as values, so it may be
@@ -269,8 +287,8 @@ insert, batch the rows so `rows × columns` stays under that.
 parameters, compose instead of looking for a `_null` variant (there is none):
 
 ```tuo
-let n = pg::query::affected_of(pg::query::run_params_null(db, sql, params, nulls, 30000));
-let v = pg::query::first_cell(pg::query::run_params_null(db, sql, params, nulls, 30000));
+let n = pg::query::affected_of(pg::query::run_params_null(conn, sql, params, nulls, 30000));
+let v = pg::query::first_cell(pg::query::run_params_null(conn, sql, params, nulls, 30000));
 ```
 
 **Never build SQL by concatenating values.** There is deliberately no helper in
@@ -283,9 +301,9 @@ this library that would make that convenient.
 There is no transaction object — send the SQL, which is all any client does:
 
 ```tuo
-let _ = pg::query::execute(db, "BEGIN", 30000);
+let _ = pg::query::execute(conn, "BEGIN", 30000);
 // ... work ...
-let _ = pg::query::execute(db, "COMMIT", 30000);   // or "ROLLBACK"
+let _ = pg::query::execute(conn, "COMMIT", 30000);   // or "ROLLBACK"
 ```
 
 After an error inside a transaction the server rejects everything until you
@@ -306,53 +324,29 @@ inspect a borrow; bind a name only when you mean to consume.
 `Int`/`Bool`/`Float` are `Copy`; `String`, `Array[T]`, and structs are not. This
 is why the inspect/consume split exists at all.
 
-**No `break`.** Carry an explicit flag in the loop condition:
-
-```tuo
-var scanning = true;
-while scanning && i < n {
-    if done { scanning = false; } else { i = i + 1; }
-}
-```
-
-**Bind a `String` temporary before comparing it inside `||` or `&&`.**
-This lowers to MIR that fails verification:
-
-```tuo
-// WRONG — the temporary is dropped on one arm and read on the other
-if row_count(rs) != 1 || std::string::as_str(pg::query::cell(rs, 0, 0)) != "x" { }
-
-// RIGHT
-let v = pg::query::cell(rs, 0, 0);
-if row_count(rs) != 1 || std::string::as_str(v) != "x" { }
-```
-
-**No block-bodied `match` arms in this compiler build.** An arm takes an
-expression; move multi-step logic into a named function.
+**Never name a local `db`, `pg`, `vec`, or `std`.** A local shadows the
+module namespace of the same name: `tuo check` still passes, and then the
+build fails with `lowering: 'main' was not lowered`. With `let db = …` in
+scope, `db::error::render(e)` is that failure — so the handle is `conn` in
+every example here.
 
 **`mut` is declared, never written at the call site.**
 `std::string::push_byte(buf, 0)` — not `push_byte(mut buf, 0)`.
 
-**No compound assignment, no `const` items.** Write `x = x + 1`.
-Integer overflow **traps**; it does not wrap.
-
-**Bitwise operators DO exist** (ADR-0019 Stage A): `|`, `^`, `&`, `<<`, `>>`,
-and `~` all work on `Int`. Mask to 32 bits with `& 4294967295`; there is no
-integer literal `0x` form and no `std::bits`, so build a rotate by hand as
-`((x << 7) | (x >> 25)) & mask`.
+**No compound assignment.** Write `x = x + 1`. Integer overflow **traps**; it
+does not wrap — `std::int::wrapping_add` and friends are the explicit form.
 
 **`Str` vs `String`.** `Str` is a borrowed view (literals, slices); `String` is
 an owned heap buffer. Convert with `std::string::from_str(s)` and
 `std::string::as_str(owned)`. Compare with `==` only between two `Str`.
 
-**Only these `std::` builtins exist** — the stdlib `.tuo` modules are compiler
-input, not a library you can import:
-`std::str::{len,byte_at,slice}`,
-`std::string::{empty,from_str,push_byte,append,concat,len,byte_at,slice,as_str}`,
-`std::array::{empty,push,pop,len,get,set}`,
-`std::map::{empty,insert,get,contains_key,remove,len,keys}`,
-`std::rt::*`. There is no `std::str::parse_int` or `std::io::println` available
-to a user package.
+**The whole standard library is in scope by full path, with no `import`:**
+`std::str` (including `parse_int`, `to_string`, `split`, `find`),
+`std::string`, `std::array`, `std::map`, `std::io::println`, `std::math`,
+`std::bits`, `std::crypto`, `std::process::arg`, `std::time`. Run
+`tuo cheatsheet` for every signature — if a function is not listed there, it
+does not exist. The examples here write output with `std::rt::write(1, s)` /
+`std::rt::write_string(1, owned)`; `std::io::println` works equally.
 
 ---
 
@@ -361,7 +355,7 @@ to a user package.
 ```
 WRONG                                    RIGHT
 ─────────────────────────────────────    ──────────────────────────────────────
-conn.query("SELECT 1")                   pg::query::run(db, "SELECT 1", 30000)
+conn.query("SELECT 1")                   pg::query::run(conn, "SELECT 1", 30000)
 rs.rows[0]["name"]                       pg::query::cell(rs, 0, c)
 let r = try run(...)                     inspect with is_ok_result, then unwrap
 "WHERE id = " + user_input               run_params with $1
@@ -373,31 +367,40 @@ for row in rows { }                      while i < row_count(rs) { }
 xs.len()                                 std::array::len(xs)
 if a < b < c                             if a < b && b < c
 match r { Ok(v) => ... }                 match r { Ok { value } => ... }
-defer conn.close()                       let _ = pg::conn::shutdown(db);
+defer conn.close()                       let _ = pg::conn::shutdown(conn);
 ```
 
 ---
 
-## 8. AUTHENTICATION — what will and will not work
+## 8. AUTHENTICATION — nothing to write
 
-`trust` and `password` (cleartext) work. **`md5` and `scram-sha-256` do not**,
-because this adapter does not implement MD5 or SHA-256. ADR-0019 Stage A has
-landed the bitwise operators, so the hashes are expressible now; Stage B
-(`std::crypto`) has not, so nothing supplies them ready-made yet.
+Pass the password to `connect`. The adapter answers whichever method the
+server's `pg_hba.conf` demands — **`scram-sha-256`, `md5`, `password`
+(cleartext), or `trust`** — and you write no authentication code at all.
 
-The adapter returns a typed `kind_auth` error naming the fix rather than
-failing obscurely. **There is no TLS**, so under `password` the secret crosses
-the network in the clear: use it only on a loopback or otherwise trusted
-link, and prefer `trust` scoped to that host. To connect today, put this in
-`pg_hba.conf`:
-
+```tuo
+let opened = pg::conn::connect("127.0.0.1", 5432, "app", "appdb", "secret", 30000);
+if !pg::conn::is_ok_int(opened) {
+    let e = pg::conn::unwrap_err_int(opened);
+    if db::error::is_sqlstate(e, "28P01") {
+        // wrong password — the server's own error, kind_server
+    } else if db::error::kind(e) == db::error::kind_auth() {
+        // the adapter refused: an unimplemented method (Kerberos, GSSAPI),
+        // or a server that failed to prove itself under SCRAM
+    }
+    return 1;
+}
 ```
-host  all  all  127.0.0.1/32  trust
-```
 
-Do not write code that tries to compute an MD5 or SCRAM response — there is no
-primitive to do it with, and `pg::auth::md5_response` / `scram_client_first`
-already hold the final signatures for when there is.
+Do not call `pg::auth::*` yourself; `connect` drives it. Under SCRAM the
+server must prove it knows the password too, and `connect` fails with
+`kind_auth` if it does not.
+
+**There is no TLS.** Authentication does not encrypt the session: SQL and
+results cross the network in the clear, and under `password` so does the
+secret. A server that requires `hostssl` cannot be reached. Do not write
+`sslmode`, a connection URL, or a host name — none exists; the host is a
+numeric address.
 
 ---
 
@@ -409,31 +412,37 @@ This compiles and runs against a live server.
 module report;
 
 fn main() -> Int {
-    let opened = pg::conn::connect("127.0.0.1", 5432, "postgres", "app", "", 30000);
+    let opened = pg::conn::connect("127.0.0.1", 5432, "postgres", "app", "secret", 30000);
     if !pg::conn::is_ok_int(opened) {
         let _ = std::rt::write(1, "cannot connect\n");
         return 1;
     }
-    let db = pg::conn::unwrap_ok_int(opened);
+    let conn = pg::conn::unwrap_ok_int(opened);
 
     // Create and populate a table.
-    let _ = pg::query::execute(db, "CREATE TEMP TABLE t (id int, name text)", 30000);
+    let _ = pg::query::execute(conn, "CREATE TEMP TABLE t (id int, name text)", 30000);
 
     var params = std::array::empty();
     std::array::push(params, std::string::from_str("ada"));
-    let ins = pg::query::run_params(db, "INSERT INTO t VALUES (1, $1)", params, 30000);
+    let ins = pg::query::run_params(conn, "INSERT INTO t VALUES (1, $1)", params, 30000);
     if !pg::query::is_ok_result(ins) {
-        let _ = std::rt::write_string(1, pg::query::render_error(ins));
-        let _ = pg::conn::shutdown(db);
+        let e = pg::query::unwrap_err_result(ins);
+        let _ = std::rt::write_string(1, db::error::render(e));
+        if !db::error::is_fatal(e) {
+            let _ = pg::conn::shutdown(conn); // a fatal error already closed it
+        }
         return 1;
     }
     let _ = pg::query::unwrap_ok_result(ins);
 
     // Read it back.
-    let sel = pg::query::run(db, "SELECT id, name FROM t ORDER BY id", 30000);
+    let sel = pg::query::run(conn, "SELECT id, name FROM t ORDER BY id", 30000);
     if !pg::query::is_ok_result(sel) {
-        let _ = std::rt::write_string(1, pg::query::render_error(sel));
-        let _ = pg::conn::shutdown(db);
+        let e = pg::query::unwrap_err_result(sel);
+        let _ = std::rt::write_string(1, db::error::render(e));
+        if !db::error::is_fatal(e) {
+            let _ = pg::conn::shutdown(conn); // a fatal error already closed it
+        }
         return 1;
     }
     let rows = pg::query::unwrap_ok_result(sel);
@@ -448,7 +457,7 @@ fn main() -> Int {
         i = i + 1;
     }
 
-    let _ = pg::conn::shutdown(db);
+    let _ = pg::conn::shutdown(conn);
     pg::query::row_count(rows)
 }
 ```

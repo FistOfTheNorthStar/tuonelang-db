@@ -5,7 +5,7 @@
 // away from what the library actually does. Each section corresponds to a
 // section of the guide, and each failure has its own exit code.
 //
-// Run it (against the docker-compose Postgres in ../shallowflaws):
+// Run it against the throwaway server `examples/test-server.sh start` brings up:
 //
 //     tuo run examples/crud_check.tuo src/db/*.tuo src/pg/*.tuo
 //
@@ -27,7 +27,7 @@
 //     82  a NULL read back through scalar_params was not an error, or scalar_int did not fall back (GUIDE §2)
 
 fn main() -> Int {
-    let opened = pg::conn::connect("127.0.0.1", 5432, "shallowflaws", "deepflaws", "", 30000);
+    let opened = pg::conn::connect("127.0.0.1", 54320, "tuo", "tuo_test", "tuo-test-only", 30000);
     if !pg::conn::is_ok_int(opened) {
         return 70;
     }

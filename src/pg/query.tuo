@@ -30,6 +30,23 @@
 // sentinel string, so a NULL and an empty string stay distinguishable — SQL
 // requires that, and a client that blurs them silently corrupts data.
 //
+// OUT OF RANGE IS A VALUE, NOT A TRAP.
+//
+// An index outside the result — a row past the end, a column that
+// `column_index` reported as `-1` — reads as SQL NULL: `cell` gives `""`,
+// `is_null` gives `true`, the typed accessors give their fallback. An array
+// index trap would end the process over a misspelled column name, which no
+// server program can afford; `has_cell` is the explicit form of the check.
+//
+// A LOST CONNECTION IS A CLOSED ONE.
+//
+// A timeout, an end-of-input, or a failed write in the middle of a query
+// leaves the stream at an unknown position, so the adapter closes the
+// descriptor and returns an error `db::error::is_fatal` recognizes. The
+// caller reconnects; it does not `shutdown` that descriptor. A server error
+// is different: the stream is drained to `ReadyForQuery` and the connection
+// stays usable (see `pg::conn`).
+//
 // PARAMETERS.
 //
 // `run_params` and everything built on it use the **extended query
@@ -127,6 +144,9 @@ pub fn tag(in rs: ResultSet) -> String {
 /// // let name = pg::query::column_name(rs, 0);
 /// ```
 pub fn column_name(in rs: ResultSet, take c: Int) -> String {
+    if !has_column(rs, c) {
+        return std::string::empty();
+    }
     std::string::from_str(std::string::as_str(std::array::get(rs.columns, c)))
 }
 
@@ -137,7 +157,32 @@ pub fn column_name(in rs: ResultSet, take c: Int) -> String {
 /// // let oid = pg::query::column_oid(rs, 0);
 /// ```
 pub fn column_oid(in rs: ResultSet, take c: Int) -> Int {
+    if !has_column(rs, c) {
+        return 0;
+    }
     std::array::get(rs.oids, c)
+}
+
+/// Is `c` a column of this result?
+///
+/// # Example
+/// ```tuo
+/// let ok = pg::query::has_column(pg::query::empty_result(), 0); // false
+/// ```
+pub fn has_column(in rs: ResultSet, take c: Int) -> Bool {
+    c >= 0 && c < rs.column_count
+}
+
+/// Is `(r, c)` a cell of this result? False for a negative index, a row past
+/// the end, or a column that is not there — including the `-1` that
+/// `column_index` returns for an absent name.
+///
+/// # Example
+/// ```tuo
+/// let ok = pg::query::has_cell(pg::query::empty_result(), 0, 0); // false
+/// ```
+pub fn has_cell(in rs: ResultSet, take r: Int, take c: Int) -> Bool {
+    r >= 0 && r < rs.row_count && has_column(rs, c)
 }
 
 /// The index of column `name`, or `-1` when there is no such column.
@@ -163,22 +208,32 @@ pub fn column_index(in rs: ResultSet, in name: Str) -> Int {
 /// The raw text of cell `(r, c)`.
 ///
 /// A NULL cell reads as the empty string; use `is_null` to tell the two apart.
+/// So does a cell that is not there (`has_cell` is false): out of range is a
+/// value, never a trap.
 ///
 /// # Example
 /// ```tuo
 /// // let v = pg::query::cell(rs, 0, 0);
 /// ```
 pub fn cell(in rs: ResultSet, take r: Int, take c: Int) -> String {
+    if !has_cell(rs, r, c) {
+        return std::string::empty();
+    }
     std::string::from_str(std::string::as_str(std::array::get(rs.values, r * rs.column_count + c)))
 }
 
-/// Is cell `(r, c)` SQL NULL?
+/// Is cell `(r, c)` SQL NULL? A cell that is not there reads as NULL too, so
+/// a row past the end or an absent column is handled by the same branch a
+/// NULL is.
 ///
 /// # Example
 /// ```tuo
 /// // let n = pg::query::is_null(rs, 0, 0);
 /// ```
 pub fn is_null(in rs: ResultSet, take r: Int, take c: Int) -> Bool {
+    if !has_cell(rs, r, c) {
+        return true;
+    }
     std::array::get(rs.nulls, r * rs.column_count + c) == 1
 }
 
@@ -256,7 +311,7 @@ pub fn cell_bool(in rs: ResultSet, take r: Int, take c: Int) -> Bool {
 pub fn run(take fd: Int, in sql: Str, take timeout_ms: Int) -> Result[ResultSet, db::error::PgError] {
     let sent = pg::conn::write_message(fd, pg::proto::query(sql));
     if sent < 0 {
-        return Err { error: db::error::new(db::error::kind_connection(), "the connection failed while sending the query") };
+        return Err { error: pg::conn::lose(fd, db::error::new(db::error::kind_connection(), "the connection failed while sending the query")) };
     }
     collect(fd, timeout_ms)
 }
@@ -314,25 +369,25 @@ pub fn run_params_null(take fd: Int, in sql: Str, in params: Array[String], in n
     // Parse the SQL into the unnamed statement.
     let a = pg::conn::write_message(fd, pg::proto::parse("", sql));
     if a < 0 {
-        return Err { error: db::error::new(db::error::kind_connection(), "failed to send Parse") };
+        return Err { error: pg::conn::lose(fd, db::error::new(db::error::kind_connection(), "failed to send Parse")) };
     }
     let b = pg::conn::write_message(fd, bind_message_null(params, nulls));
     if b < 0 {
-        return Err { error: db::error::new(db::error::kind_connection(), "failed to send Bind") };
+        return Err { error: pg::conn::lose(fd, db::error::new(db::error::kind_connection(), "failed to send Bind")) };
     }
     let c = pg::conn::write_message(fd, pg::proto::describe_statement(""));
     if c < 0 {
-        return Err { error: db::error::new(db::error::kind_connection(), "failed to send Describe") };
+        return Err { error: pg::conn::lose(fd, db::error::new(db::error::kind_connection(), "failed to send Describe")) };
     }
     let d = pg::conn::write_message(fd, pg::proto::execute("", 0));
     if d < 0 {
-        return Err { error: db::error::new(db::error::kind_connection(), "failed to send Execute") };
+        return Err { error: pg::conn::lose(fd, db::error::new(db::error::kind_connection(), "failed to send Execute")) };
     }
     // Sync ends the pipeline; without it the server never sends ReadyForQuery
     // and the read loop below would wait out its whole timeout.
     let e = pg::conn::write_message(fd, pg::proto::sync());
     if e < 0 {
-        return Err { error: db::error::new(db::error::kind_connection(), "failed to send Sync") };
+        return Err { error: pg::conn::lose(fd, db::error::new(db::error::kind_connection(), "failed to send Sync")) };
     }
     collect(fd, timeout_ms)
 }
@@ -463,6 +518,12 @@ pub fn copy_fail_reason() -> Str {
 ///
 /// Shared by `run` and `run_params`, because after the request differs the
 /// reply sequence is the same.
+///
+/// The loop has no message cap: every read is already bounded by
+/// `timeout_ms`, and a cap would have to be a number of rows a query may not
+/// return — an earlier one silently cut a result off at a million messages
+/// and left the rest on the stream for the next query. A read failure or a
+/// timeout closes the descriptor (see `pg::conn::lose`).
 pub fn collect(take fd: Int, take timeout_ms: Int) -> Result[ResultSet, db::error::PgError] {
     var columns = std::array::empty();
     var oids = std::array::empty();
@@ -476,20 +537,20 @@ pub fn collect(take fd: Int, take timeout_ms: Int) -> Result[ResultSet, db::erro
     var failure = db::error::new(db::error::kind_protocol(), "no error");
     var saw_rows = false;
 
-    var guard = 0;
     var done = false;
-    while !done && guard < 1000000 {
-        guard = guard + 1;
-
+    while !done {
+        // A read that fails ends the connection, and if the server had
+        // already said why (an ErrorResponse before it closed), its words
+        // are what the caller sees.
         let type_result = pg::conn::read_type(fd, timeout_ms);
         if !pg::conn::is_ok_int(type_result) {
-            return Err { error: pg::conn::unwrap_err_int(type_result) };
+            return Err { error: pg::conn::lose(fd, pg::conn::lost_after(pg::conn::unwrap_err_int(type_result), failure, failed)) };
         }
         let type_byte = pg::conn::unwrap_ok_int(type_result);
 
         let payload_result = pg::conn::read_message_payload(fd, timeout_ms);
         if !pg::conn::is_ok_string(payload_result) {
-            return Err { error: pg::conn::unwrap_err_string(payload_result) };
+            return Err { error: pg::conn::lose(fd, pg::conn::lost_after(pg::conn::unwrap_err_string(payload_result), failure, failed)) };
         }
         let payload = pg::conn::unwrap_ok_string(payload_result);
 
@@ -543,7 +604,7 @@ pub fn collect(take fd: Int, take timeout_ms: Int) -> Result[ResultSet, db::erro
             // wait out the whole timeout and leave the connection wedged.
             let sent = pg::conn::write_message(fd, pg::proto::copy_fail(copy_fail_reason()));
             if sent < 0 {
-                return Err { error: db::error::new(db::error::kind_connection(), "the connection failed while sending CopyFail") };
+                return Err { error: pg::conn::lose(fd, db::error::new(db::error::kind_connection(), "the connection failed while sending CopyFail")) };
             }
             failed = true;
             failure = copy_error();
@@ -1017,6 +1078,12 @@ spec cell {
     then fixture_cell_is(1, 0, "2");
     // The NULL cell reads as empty; `is_null` is what distinguishes it.
     then fixture_cell_is(1, 1, "");
+    // Out of range is empty, not a trap: a row past the end, a column past
+    // the end, the -1 of an absent name, and a negative row.
+    then fixture_cell_is(2, 0, "");
+    then fixture_cell_is(0, 2, "");
+    then fixture_cell_is(1, 0 - 1, "");
+    then fixture_cell_is(0 - 1, 0, "");
 }
 
 spec is_null {
@@ -1024,6 +1091,23 @@ spec is_null {
     then !is_null(fixture_rs(), 0, 1);
     then !is_null(fixture_rs(), 1, 0);
     then is_null(fixture_rs(), 1, 1);
+    // A cell that is not there is NULL, so one branch handles both.
+    then is_null(fixture_rs(), 2, 0);
+    then is_null(fixture_rs(), 0, 2);
+    then is_null(fixture_rs(), 1, 0 - 1);
+    then is_null(empty_result(), 0, 0);
+}
+
+spec has_cell {
+    then has_cell(fixture_rs(), 0, 0);
+    then has_cell(fixture_rs(), 1, 1);
+    then !has_cell(fixture_rs(), 2, 0);
+    then !has_cell(fixture_rs(), 0, 2);
+    then !has_cell(fixture_rs(), 0, 0 - 1);
+    then !has_cell(fixture_rs(), 0 - 1, 0);
+    then !has_cell(empty_result(), 0, 0);
+    then has_column(fixture_rs(), 1);
+    then !has_column(fixture_rs(), 2);
 }
 
 spec cell_int {
@@ -1033,11 +1117,18 @@ spec cell_int {
     then cell_int(fixture_rs(), 1, 1, 0 - 99) == 0 - 99;
     // A non-numeric cell also yields the fallback.
     then cell_int(fixture_rs(), 0, 1, 0 - 7) == 0 - 7;
+    // So does a cell that is not there.
+    then cell_int(fixture_rs(), 5, 0, 0 - 3) == 0 - 3;
+    then cell_float(fixture_rs(), 5, 0, 2.5) == 2.5;
+    then !cell_bool(fixture_rs(), 5, 0);
 }
 
 spec column_name {
     then fixture_name_is(0, "id");
     then fixture_name_is(1, "name");
+    // Past the end is empty, not a trap.
+    then fixture_name_is(2, "");
+    then fixture_name_is(0 - 1, "");
 }
 
 spec column_index {
@@ -1050,6 +1141,8 @@ spec column_index {
 spec column_oid {
     then column_oid(fixture_rs(), 0) == pg::value::oid_int4();
     then column_oid(fixture_rs(), 1) == pg::value::oid_text();
+    // Past the end is 0, which no real type carries.
+    then column_oid(fixture_rs(), 2) == 0;
 }
 
 spec row_count {

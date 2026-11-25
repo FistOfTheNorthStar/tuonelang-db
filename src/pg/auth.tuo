@@ -1,4 +1,4 @@
-// pg::auth — the authentication handshake, and the ADR-0019 crypto seam.
+// pg::auth — the authentication handshake's policy and its cryptography.
 //
 // A server's first reply to a startup packet is an `AuthenticationRequest`
 // whose Int32 sub-kind says what it wants. This module turns that sub-kind
@@ -6,36 +6,38 @@
 // names precisely why the adapter cannot proceed and what the operator should
 // do about it.
 //
-// THE CRYPTO BOUNDARY — the one thing to understand here.
+// EVERYTHING HERE IS PURE.
 //
-// Two of the three realistic methods need hashing this adapter does not yet
-// implement:
+// The three realistic methods — cleartext, `md5`, and SASL/`SCRAM-SHA-256` —
+// are all computed in this module, over `std::crypto` (ADR-0019 Stage B).
+// Nothing in it touches a socket or draws entropy: the one random input a
+// SCRAM exchange needs, the client nonce, is handed in by `pg::conn`. That is
+// what lets a whole exchange be spec-checked against a fixed nonce, and
+// against RFC 7677's published vector in `examples/scram_check.tuo`.
 //
-//   * `AuthenticationMD5Password` needs `md5(md5(password + user) + salt)`;
-//   * SASL/`SCRAM-SHA-256` needs SHA-256, HMAC-SHA-256, and PBKDF2.
+// SCRAM IN ONE PARAGRAPH.
 //
-// This was once a *language* limit: SHA-256 is defined in terms of `^`, `>>`,
-// and `&`, and v0 had none of them. **ADR-0019 Stage A has since landed**, so
-// all six bitwise operators work and the hashes are expressible today. Stage B
-// has not: `std::crypto` (`md5`, `sha256`, `hmac_sha256`, `pbkdf2_sha256`,
-// `base64_*`) still resolves to `R0002: no 'crypto' in 'std'`. So what remains
-// is implementation work — write the digests over the new operators, or wait
-// for the stdlib — not an impossibility.
+// The client sends a nonce (`scram_client_first`). The server answers with
+// the combined nonce, a salt, and an iteration count. The client stretches
+// the password with PBKDF2 and sends a proof that it knows it — never the
+// password — and keeps the signature the server must answer with
+// (`scram_respond`). The server's last message carries that signature, and
+// the client checks it in constant time (`scram_server_ok`): a server that
+// cannot produce it never knew the password, so the connection is refused.
 //
-// So this module is written as a **seam**, not a stub:
+// WHAT IS NOT DONE.
 //
-//   * every decision, message shape, and error is implemented and spec-checked
-//     **today** — `plan` returns the right answer for all eight sub-kinds, and
-//     `pg::proto` already encodes the SASL framing byte-exactly;
-//   * the two crypto-dependent branches return a `kind_auth` error whose
-//     message names the method, the blocking primitive, and the operator's
-//     immediate fix; and
-//   * `md5_response` and `scram_client_first` are present with their **final
-//     signatures**, so when Stage B lands the change is a body swap behind an
-//     unchanged interface — no caller and no spec moves.
+//   * No channel binding (`SCRAM-SHA-256-PLUS`): it binds the exchange to a
+//     TLS channel, and this adapter speaks no TLS.
+//   * No SASLprep: the password is used as the bytes it was given. That is
+//     exactly right for ASCII, and for any password already in the form the
+//     server stored; a password whose Unicode normalization differs from its
+//     spelling will not authenticate.
+//   * Kerberos, GSSAPI, SSPI: refused with a typed error naming the fix.
 //
-// This is the "refuse rather than mis-compile" rule the language applies to
-// itself, applied to a library: the adapter never pretends to authenticate.
+// HOSTILE INPUT. Every reader here is total: the server's messages arrive
+// before it has proven anything, so a short, malformed, or absurd one (an
+// iteration count of a billion) is an error value, never a trap.
 
 module pg::auth;
 
@@ -53,13 +55,12 @@ pub fn plan_cleartext() -> Int {
     1
 }
 
-/// Send a `PasswordMessage` containing the MD5 digest. **Blocked** until
-/// ADR-0019 Stage B; see `md5_response`.
+/// Send a `PasswordMessage` containing the MD5 digest; see `md5_response`.
 pub fn plan_md5() -> Int {
     2
 }
 
-/// Begin a SASL/SCRAM-SHA-256 exchange. **Blocked** until ADR-0019 Stage B.
+/// Run a SASL/SCRAM-SHA-256 exchange; see `scram_respond`.
 pub fn plan_sasl() -> Int {
     3
 }
@@ -93,32 +94,17 @@ pub fn plan(take auth_kind: Int) -> Int {
     }
 }
 
-/// Can the adapter carry out `plan` in this build?
+/// Can the adapter carry out `plan`?
 ///
-/// `plan_ok` and `plan_cleartext` are executable today. The other two become
-/// executable when ADR-0019 Stage B lands `std::crypto`, at which point this
-/// function is the single place that flips.
+/// Everything but `plan_unsupported`: trust, cleartext, `md5`, and
+/// SCRAM-SHA-256.
 ///
 /// # Example
 /// ```tuo
-/// let ok = pg::auth::is_supported(pg::auth::plan_ok()); // true
+/// let ok = pg::auth::is_supported(pg::auth::plan_sasl()); // true
 /// ```
 pub fn is_supported(take p: Int) -> Bool {
-    p == plan_ok() || p == plan_cleartext()
-}
-
-/// Does this method require crypto the language does not yet have?
-///
-/// Distinguishes "blocked on ADR-0019" from "not implemented at all"
-/// (Kerberos, GSSAPI), because those two want different answers from an
-/// operator: wait for a language feature, versus change the server's config.
-///
-/// # Example
-/// ```tuo
-/// let b = pg::auth::needs_crypto(pg::auth::plan_md5()); // true
-/// ```
-pub fn needs_crypto(take p: Int) -> Bool {
-    p == plan_md5() || p == plan_sasl()
+    p == plan_ok() || p == plan_cleartext() || p == plan_md5() || p == plan_sasl()
 }
 
 /// A human-readable name for an authentication sub-kind, for diagnostics.
@@ -151,49 +137,37 @@ pub fn method_name(take auth_kind: Int) -> Str {
 
 /// The error the adapter reports when it cannot satisfy a demanded method.
 ///
-/// The message names the method, the reason, and the **operator's fix**, which
-/// is what turns an error into something actionable rather than a dead end.
+/// The message names the method and the **operator's fix**, which is what
+/// turns an error into something actionable rather than a dead end.
 ///
 /// # Example
 /// ```tuo
-/// // let e = pg::auth::unsupported_error(5);
+/// // let e = pg::auth::unsupported_error(2);
 /// ```
 pub fn unsupported_error(take auth_kind: Int) -> db::error::PgError {
-    let p = plan(auth_kind);
     var m = std::string::empty();
     std::string::append(m, "server requested ");
     std::string::append(m, method_name(auth_kind));
-    std::string::append(m, " authentication, which this adapter cannot perform: ");
-
-    if needs_crypto(p) {
-        std::string::append(m, "it needs hashing that this adapter does not yet implement. ");
-        std::string::append(m, "ADR-0019 Stage A landed the bitwise operators, but std::crypto ");
-        std::string::append(m, "(Stage B) is not available yet; until then, either use trust or ");
-        std::string::append(m, "password authentication for this host in pg_hba.conf, ");
-        std::string::append(m, "or connect over a channel that has already authenticated.");
-    } else {
-        std::string::append(m, "the method is not implemented. Configure the server to offer ");
-        std::string::append(m, "scram-sha-256, password, or trust for this host in pg_hba.conf.");
-    }
-
+    std::string::append(m, " authentication, which this adapter does not implement. Configure the ");
+    std::string::append(m, "server to offer scram-sha-256, md5, password, or trust for this host in pg_hba.conf.");
     db::error::new(db::error::kind_auth(), std::string::as_str(m))
 }
 
+/// An authentication error with `message`. Every failure below is one of
+/// these, so a caller branches on `kind_auth` for all of them.
+pub fn auth_error(in message: Str) -> db::error::PgError {
+    db::error::new(db::error::kind_auth(), message)
+}
+
 // ----------------------------------------------------------------------------
-// The crypto-dependent responses — final signatures, bodies pending Stage B.
+// md5.
 // ----------------------------------------------------------------------------
 
 /// The `PasswordMessage` body for `AuthenticationMD5Password`:
 /// `"md5" + md5(md5(password + user) + salt)`, lowercase hex.
 ///
-/// **Not yet computable.** Returns `Err` until ADR-0019 Stage B lands
-/// `std::crypto::md5`; the signature is final, so the body becomes:
-///
-/// ```text
-/// let inner = std::crypto::md5(concat(password, user));
-/// let outer = std::crypto::md5(concat(inner, salt_bytes));
-/// Ok { value: concat("md5", outer) }
-/// ```
+/// `salt` is the four bytes the server sent (`pg::message::auth_md5_salt`);
+/// any other length is a malformed request and is refused rather than hashed.
 ///
 /// MD5 is cryptographically broken and PostgreSQL has deprecated it in favor
 /// of SCRAM; it is here only because servers still offer it.
@@ -203,54 +177,335 @@ pub fn unsupported_error(take auth_kind: Int) -> db::error::PgError {
 /// // let r = pg::auth::md5_response("secret", "postgres", salt);
 /// ```
 pub fn md5_response(in password: Str, in user: Str, in salt: Array[Int]) -> Result[String, db::error::PgError] {
-    var m = std::string::empty();
-    std::string::append(m, "md5 authentication needs an MD5 implementation (std::crypto, ADR-0019 Stage B); ");
-    std::string::append(m, "use trust or password authentication for this host meanwhile");
-    Err { error: db::error::new(db::error::kind_auth(), std::string::as_str(m)) }
+    if std::array::len(salt) != 4 {
+        return Err { error: db::error::new(db::error::kind_protocol(), "the server's md5 authentication request did not carry a 4-byte salt") };
+    }
+    Ok { value: std::crypto::md5_password(password, user, salt) }
 }
 
-/// The SCRAM-SHA-256 `client-first-message` — `"n,,n=,r=" + nonce`.
+// ----------------------------------------------------------------------------
+// SCRAM-SHA-256 (RFC 5802, RFC 7677).
+// ----------------------------------------------------------------------------
+
+/// The one SASL mechanism this adapter speaks.
+pub fn scram_mechanism() -> Str {
+    "SCRAM-SHA-256"
+}
+
+/// How many random bytes `pg::conn` draws for the client nonce. Eighteen
+/// bytes is 144 bits, and base64-encodes to 24 characters with no padding.
+pub fn scram_nonce_bytes() -> Int {
+    18
+}
+
+/// The largest iteration count `scram_respond` will run.
 ///
-/// **Not yet usable.** The framing is already encodable (see
-/// `pg::proto::sasl_initial`), but a SCRAM exchange cannot complete without
-/// HMAC-SHA-256 and PBKDF2 for the client proof, so this reports the same
-/// typed error rather than starting an exchange it cannot finish — which would
-/// leave the connection wedged mid-handshake.
+/// The count comes from a server that has not authenticated yet, and each
+/// iteration is real work on this side, so an unbounded one is a way to stall
+/// a client. PostgreSQL's default is 4096; a million leaves room for the
+/// hardened settings in use (OWASP suggests 600,000) and refuses the rest.
+pub fn scram_max_iterations() -> Int {
+    1000000
+}
+
+/// Does a mechanism list — the NUL-separated names in an
+/// `AuthenticationSASL` body — offer `SCRAM-SHA-256`?
+///
+/// A server that offers only `SCRAM-SHA-256-PLUS` wants channel binding,
+/// which needs TLS, so that does not count.
 ///
 /// # Example
 /// ```tuo
-/// // let r = pg::auth::scram_client_first("nonce");
+/// // let ok = pg::auth::offers_scram(pg::message::auth_sasl_body(payload));
+/// ```
+pub fn offers_scram(in mechanisms: String) -> Bool {
+    let stop = std::string::len(mechanisms);
+    var at = 0;
+    while at < stop {
+        let name = db::bytes::cstr_at(mechanisms, at);
+        if std::string::len(name) == 0 {
+            return false;
+        }
+        if std::string::as_str(name) == scram_mechanism() {
+            return true;
+        }
+        at = db::bytes::cstr_end(mechanisms, at);
+    }
+    false
+}
+
+/// The `client-first-message-bare`: `"n=,r=" + nonce`.
+///
+/// The user name is left empty, as libpq leaves it: PostgreSQL takes the
+/// user from the startup packet and ignores this field.
+///
+/// # Example
+/// ```tuo
+/// let bare = pg::auth::scram_client_first_bare("fyko+d2lbbFgONRv9qkxdawL");
+/// ```
+pub fn scram_client_first_bare(in nonce: Str) -> String {
+    var m = std::string::from_str("n=,r=");
+    std::string::append(m, nonce);
+    m
+}
+
+/// The SCRAM-SHA-256 `client-first-message` — `"n,,n=,r=" + nonce` — which
+/// `pg::proto::sasl_initial` frames. The leading `n,,` says "no channel
+/// binding".
+///
+/// An empty nonce is refused: `std::crypto::nonce` returns one when the
+/// platform has no entropy, and an exchange opened with it would be
+/// replayable.
+///
+/// # Example
+/// ```tuo
+/// // let r = pg::auth::scram_client_first("fyko+d2lbbFgONRv9qkxdawL");
 /// ```
 pub fn scram_client_first(in nonce: Str) -> Result[String, db::error::PgError] {
-    var m = std::string::empty();
-    std::string::append(m, "SCRAM-SHA-256 needs sha256/hmac/pbkdf2 (std::crypto, ADR-0019 ");
-    std::string::append(m, "Stage B); use trust or password authentication for this host meanwhile");
-    Err { error: db::error::new(db::error::kind_auth(), std::string::as_str(m)) }
+    if std::str::len(nonce) == 0 {
+        return Err { error: auth_error("SCRAM-SHA-256 needs a random nonce, and the platform's entropy source was unavailable") };
+    }
+    var m = std::string::from_str("n,,");
+    std::string::append(m, std::string::as_str(scram_client_first_bare(nonce)));
+    Ok { value: m }
+}
+
+/// The value of attribute `key` (a letter's byte, `114` for `r`) in a SCRAM
+/// message such as `r=…,s=…,i=4096`, or the empty string when it is absent.
+///
+/// Total: any bytes at all yield a value or `""`, never a trap.
+///
+/// # Example
+/// ```tuo
+/// let salt = pg::auth::scram_attr("r=abc,s=c2FsdA==,i=4096", 115); // "c2FsdA=="
+/// ```
+pub fn scram_attr(in message: Str, take key: Int) -> String {
+    let stop = std::str::len(message);
+    var at = 0;
+    while at < stop {
+        // One attribute runs from `at` to the next comma.
+        var end = at;
+        while end < stop && std::str::byte_at(message, end) != 44 {
+            end = end + 1;
+        }
+        if end - at >= 2 && std::str::byte_at(message, at) == key && std::str::byte_at(message, at + 1) == 61 {
+            return std::string::from_str(std::str::slice(message, at + 2, end));
+        }
+        at = end + 1;
+    }
+    std::string::empty()
+}
+
+/// The iteration count a decimal string names, or `-1` when it is not a
+/// count this adapter will run: empty, not all digits, zero, or above
+/// `scram_max_iterations`.
+///
+/// # Example
+/// ```tuo
+/// let n = pg::auth::scram_iterations("4096"); // 4096
+/// ```
+pub fn scram_iterations(in text: Str) -> Int {
+    let n = std::str::len(text);
+    // Seven digits covers the maximum, and keeps the sum far from overflow.
+    if n == 0 || n > 7 {
+        return 0 - 1;
+    }
+    var value = 0;
+    var i = 0;
+    while i < n {
+        let b = std::str::byte_at(text, i);
+        if b < 48 || b > 57 {
+            return 0 - 1;
+        }
+        value = value * 10 + (b - 48);
+        i = i + 1;
+    }
+    if value < 1 || value > scram_max_iterations() {
+        return 0 - 1;
+    }
+    value
+}
+
+/// What the client holds after answering the server's first message: the
+/// `client-final-message` to send, and the signature the server must answer
+/// with.
+pub struct Scram {
+    client_final: String,
+    server_signature: String,
+}
+
+/// The `client-final-message` to send in a `SASLResponse`.
+pub fn scram_client_final(in s: Scram) -> String {
+    std::string::from_str(std::string::as_str(s.client_final))
+}
+
+/// The base64 signature the server's final message must carry.
+pub fn scram_server_signature(in s: Scram) -> String {
+    std::string::from_str(std::string::as_str(s.server_signature))
+}
+
+/// Answer the server's first message.
+///
+/// `client_first_bare` is what `scram_client_first_bare` returned for this
+/// exchange, and `server_first` is the `SASLContinue` body. The result
+/// carries the message that proves knowledge of `password` without revealing
+/// it, and the signature that will prove the server knew it too.
+///
+/// Refused, as `kind_auth`, when the server's message is not one an honest
+/// server sends: a nonce that does not extend the client's (a replay), a
+/// missing or empty salt, or an iteration count outside
+/// `1..=scram_max_iterations()`.
+///
+/// The cost is the point: this runs PBKDF2 for as many iterations as the
+/// server asked, which is what makes a stolen verifier expensive to attack.
+///
+/// # Example
+/// ```tuo
+/// // let r = pg::auth::scram_respond("secret", bare, server_first);
+/// ```
+pub fn scram_respond(in password: Str, in client_first_bare: Str, in server_first: Str) -> Result[Scram, db::error::PgError] {
+    let client_nonce = scram_attr(client_first_bare, 114);
+    let nonce = scram_attr(server_first, 114);
+    let salt_text = scram_attr(server_first, 115);
+    let iterations = scram_iterations(std::string::as_str(scram_attr(server_first, 105)));
+
+    // The server's nonce must be the client's with something appended;
+    // otherwise this is an answer to some other exchange.
+    let own = std::string::len(client_nonce);
+    if own == 0 || std::string::len(nonce) <= own || !std::str::starts_with(std::string::as_str(nonce), std::string::as_str(client_nonce)) {
+        return Err { error: auth_error("the server's SCRAM message does not continue this client's nonce") };
+    }
+    let salt = std::crypto::base64_decode(std::string::as_str(salt_text));
+    if std::array::len(salt) == 0 {
+        return Err { error: auth_error("the server's SCRAM message carries no salt") };
+    }
+    if iterations < 0 {
+        return Err { error: auth_error("the server's SCRAM iteration count is missing, malformed, or above the limit this adapter will run") };
+    }
+
+    // client-final-without-proof: "biws" is base64("n,,"), the header again.
+    var without_proof = std::string::from_str("c=biws,r=");
+    std::string::append(without_proof, std::string::as_str(nonce));
+
+    var auth_message = std::string::from_str(client_first_bare);
+    std::string::append(auth_message, ",");
+    std::string::append(auth_message, server_first);
+    std::string::append(auth_message, ",");
+    std::string::append(auth_message, std::string::as_str(without_proof));
+
+    let salted = std::crypto::scram_salted_password(password, salt, iterations);
+    let proof = std::crypto::scram_client_proof(salted, std::string::as_str(auth_message));
+    let signature = std::crypto::scram_server_signature(salted, std::string::as_str(auth_message));
+
+    var client_final = without_proof;
+    std::string::append(client_final, ",p=");
+    std::string::append(client_final, std::string::as_str(proof));
+    Ok { value: Scram { client_final: client_final, server_signature: signature } }
+}
+
+/// Does the server's final message (`v=…`) carry `expected_signature`?
+///
+/// This is the half of SCRAM that authenticates the *server*, and skipping
+/// it would let anything that can answer a socket pose as the database. The
+/// comparison is constant-time, over the decoded 32 bytes; an `e=…` message
+/// (the server reporting failure) has no `v` and is simply false.
+///
+/// # Example
+/// ```tuo
+/// // let ok = pg::auth::scram_server_ok(server_final, expected);
+/// ```
+pub fn scram_server_ok(in server_final: Str, in expected_signature: Str) -> Bool {
+    let got = std::crypto::base64_decode(std::string::as_str(scram_attr(server_final, 118)));
+    let want = std::crypto::base64_decode(expected_signature);
+    std::array::len(want) == 32 && std::crypto::verify(got, want)
+}
+
+/// The error for a server whose final message failed `scram_server_ok`.
+pub fn scram_server_error() -> db::error::PgError {
+    auth_error("the server did not prove it knows the password (its SCRAM signature is wrong or missing); refusing the connection")
 }
 
 // ----------------------------------------------------------------------------
 // Specs — the whole policy, proven without a server.
 // ----------------------------------------------------------------------------
 
-/// Spec helper: does `md5_response` currently report an auth error?
-pub fn md5_blocked() -> Bool {
+/// Spec helper: a salt of `n` bytes, 1, 2, 3, …
+pub fn fixture_salt(take n: Int) -> Array[Int] {
     var salt = std::array::empty();
-    std::array::push(salt, 1);
-    std::array::push(salt, 2);
-    std::array::push(salt, 3);
-    std::array::push(salt, 4);
-    match md5_response("secret", "postgres", salt) {
-        Ok { value } => false,
+    var i = 0;
+    while i < n {
+        std::array::push(salt, i + 1);
+        i = i + 1;
+    }
+    salt
+}
+
+/// Spec helper: is the md5 response for a salt of `n` bytes `expect`? An
+/// error reads as the empty string.
+pub fn md5_is(take n: Int, in expect: Str) -> Bool {
+    match md5_response("secret", "postgres", fixture_salt(n)) {
+        Ok { value } => std::string::as_str(value) == expect,
+        Err { error: _ } => std::str::len(expect) == 0,
+    }
+}
+
+/// Spec helper: is the client-first message for `nonce` `expect`? An error
+/// reads as the empty string.
+pub fn client_first_is(in nonce: Str, in expect: Str) -> Bool {
+    match scram_client_first(nonce) {
+        Ok { value } => std::string::as_str(value) == expect,
+        Err { error: _ } => std::str::len(expect) == 0,
+    }
+}
+
+/// Spec helper: is attribute `key` of `message` equal to `expect`?
+pub fn attr_is(in message: Str, take key: Int, in expect: Str) -> Bool {
+    std::string::as_str(scram_attr(message, key)) == expect
+}
+
+/// Spec helper: a mechanism list as the server frames it — each name
+/// NUL-terminated, and one more NUL to end the list.
+pub fn fixture_mechanisms(in first: Str, in second: Str) -> String {
+    var body = std::string::empty();
+    db::bytes::put_cstr(body, first);
+    if std::str::len(second) > 0 {
+        db::bytes::put_cstr(body, second);
+    }
+    std::string::push_byte(body, 0);
+    body
+}
+
+/// Spec helper: the client-final message `scram_respond` builds, or the
+/// empty string when it refuses.
+pub fn respond_final(in password: Str, in bare: Str, in server_first: Str) -> String {
+    match scram_respond(password, bare, server_first) {
+        Ok { value } => scram_client_final(value),
+        Err { error: _ } => std::string::empty(),
+    }
+}
+
+/// Spec helper: the server signature `scram_respond` expects, or the empty
+/// string when it refuses.
+pub fn respond_signature(in password: Str, in bare: Str, in server_first: Str) -> String {
+    match scram_respond(password, bare, server_first) {
+        Ok { value } => scram_server_signature(value),
+        Err { error: _ } => std::string::empty(),
+    }
+}
+
+/// Spec helper: does `scram_respond` refuse `server_first` with an auth error?
+pub fn respond_refuses(in server_first: Str) -> Bool {
+    match scram_respond("pencil", "n=,r=clientnonce", server_first) {
+        Ok { value: _ } => false,
         Err { error } => db::error::kind(error) == db::error::kind_auth(),
     }
 }
 
-/// Spec helper: does `scram_client_first` currently report an auth error?
-pub fn scram_blocked() -> Bool {
-    match scram_client_first("nonce") {
-        Ok { value } => false,
-        Err { error } => db::error::kind(error) == db::error::kind_auth(),
-    }
+/// Spec helper: the server-first message every SCRAM spec answers. Two
+/// iterations, because the spec sandbox's fuel does not stretch to 4096 —
+/// RFC 7677's full vector runs natively, in `examples/scram_check.tuo`.
+pub fn fixture_server_first() -> Str {
+    "r=clientnonceSERVER,s=c2FsdHNhbHQ=,i=2"
 }
 
 /// Spec helper: the kind of the error for an unsupported method.
@@ -271,25 +526,11 @@ spec plan {
 }
 
 spec is_supported {
-    // What works today, with no crypto at all.
     then is_supported(plan_ok());
     then is_supported(plan_cleartext());
-    // What ADR-0019 Stage B unblocks. These two flip to `true` when
-    // `std::crypto` lands and this function is updated — and this spec is the
-    // reminder that they are the only two that should.
-    then !is_supported(plan_md5());
-    then !is_supported(plan_sasl());
+    then is_supported(plan_md5());
+    then is_supported(plan_sasl());
     then !is_supported(plan_unsupported());
-}
-
-spec needs_crypto {
-    then needs_crypto(plan_md5());
-    then needs_crypto(plan_sasl());
-    // Kerberos is unsupported for a different reason: it is not blocked on
-    // crypto, so the operator's fix differs.
-    then !needs_crypto(plan_unsupported());
-    then !needs_crypto(plan_ok());
-    then !needs_crypto(plan_cleartext());
 }
 
 spec method_name {
@@ -303,16 +544,91 @@ spec method_name {
 }
 
 spec unsupported_error {
-    then unsupported_kind(pg::proto::auth_md5()) == db::error::kind_auth();
-    then unsupported_kind(pg::proto::auth_sasl()) == db::error::kind_auth();
     then unsupported_kind(pg::proto::auth_kerberos()) == db::error::kind_auth();
+    then unsupported_kind(pg::proto::auth_gss()) == db::error::kind_auth();
+    then unsupported_kind(99) == db::error::kind_auth();
 }
 
 spec md5_response {
-    // Blocked today, and honestly so — never a wrong digest.
-    then md5_blocked();
+    // md5(md5("secret" + "postgres") + 01 02 03 04), computed independently
+    // (Python's hashlib), not read back from this implementation.
+    then md5_is(4, "md5bb41a296aab6baccb36ff243a562abff");
+    // A salt that is not four bytes is a malformed request, not an input.
+    then md5_is(3, "");
+    then md5_is(0, "");
+    then md5_is(5, "");
 }
 
 spec scram_client_first {
-    then scram_blocked();
+    then client_first_is("abc", "n,,n=,r=abc");
+    then std::string::as_str(scram_client_first_bare("abc")) == "n=,r=abc";
+    // No entropy, no exchange.
+    then client_first_is("", "");
+}
+
+spec offers_scram {
+    then offers_scram(fixture_mechanisms("SCRAM-SHA-256", ""));
+    then offers_scram(fixture_mechanisms("SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"));
+    // Channel binding alone is not something this adapter can do.
+    then !offers_scram(fixture_mechanisms("SCRAM-SHA-256-PLUS", ""));
+    then !offers_scram(fixture_mechanisms("OAUTHBEARER", ""));
+    then !offers_scram(std::string::empty());
+}
+
+spec scram_attr {
+    then attr_is("r=abc,s=c2FsdA==,i=4096", 114, "abc");
+    // A base64 value keeps its own `=` padding.
+    then attr_is("r=abc,s=c2FsdA==,i=4096", 115, "c2FsdA==");
+    then attr_is("r=abc,s=c2FsdA==,i=4096", 105, "4096");
+    then attr_is("v=sig", 118, "sig");
+    // Absent, empty, and malformed all read as empty — never a trap.
+    then attr_is("r=abc", 115, "");
+    then attr_is("", 114, "");
+    then attr_is("r", 114, "");
+    then attr_is(",,r=x,", 114, "x");
+    // Only a key at the start of an attribute counts.
+    then attr_is("s=r=1", 114, "");
+}
+
+spec scram_iterations {
+    then scram_iterations("4096") == 4096;
+    then scram_iterations("1") == 1;
+    then scram_iterations("1000000") == scram_max_iterations();
+    then scram_iterations("1000001") == 0 - 1;
+    then scram_iterations("0") == 0 - 1;
+    then scram_iterations("") == 0 - 1;
+    then scram_iterations("-5") == 0 - 1;
+    then scram_iterations("40x6") == 0 - 1;
+    // Long enough to overflow an Int if it were summed.
+    then scram_iterations("99999999999999999999") == 0 - 1;
+}
+
+spec scram_respond {
+    // Proof and signature computed independently (Python's hashlib/hmac) for
+    // password "pencil" against the fixture message.
+    then std::string::as_str(respond_final("pencil", "n=,r=clientnonce", fixture_server_first())) == "c=biws,r=clientnonceSERVER,p=d1BtWpCvSnp2gXKRPDOV9BxnsNux6p7dhgdH/tEdlKU=";
+    then std::string::as_str(respond_signature("pencil", "n=,r=clientnonce", fixture_server_first())) == "hJ2f2pjXZXLJ18V4AONBuG34Zwv9mPyYZtqrwSV0YwA=";
+    // A different password is a different proof.
+    then std::string::as_str(respond_final("pencil2", "n=,r=clientnonce", fixture_server_first())) != "c=biws,r=clientnonceSERVER,p=d1BtWpCvSnp2gXKRPDOV9BxnsNux6p7dhgdH/tEdlKU=";
+    // A nonce that does not extend the client's is someone else's exchange.
+    then respond_refuses("r=othernonceSERVER,s=c2FsdHNhbHQ=,i=2");
+    then respond_refuses("r=clientnonce,s=c2FsdHNhbHQ=,i=2");
+    then respond_refuses("s=c2FsdHNhbHQ=,i=2");
+    // No salt, and iteration counts no honest server sends.
+    then respond_refuses("r=clientnonceSERVER,i=2");
+    then respond_refuses("r=clientnonceSERVER,s=c2FsdHNhbHQ=");
+    then respond_refuses("r=clientnonceSERVER,s=c2FsdHNhbHQ=,i=0");
+    then respond_refuses("r=clientnonceSERVER,s=c2FsdHNhbHQ=,i=999999999");
+    then respond_refuses("");
+}
+
+spec scram_server_ok {
+    then scram_server_ok("v=hJ2f2pjXZXLJ18V4AONBuG34Zwv9mPyYZtqrwSV0YwA=", "hJ2f2pjXZXLJ18V4AONBuG34Zwv9mPyYZtqrwSV0YwA=");
+    // One character off, a server-reported error, and nothing at all.
+    then !scram_server_ok("v=iJ2f2pjXZXLJ18V4AONBuG34Zwv9mPyYZtqrwSV0YwA=", "hJ2f2pjXZXLJ18V4AONBuG34Zwv9mPyYZtqrwSV0YwA=");
+    then !scram_server_ok("e=invalid-proof", "hJ2f2pjXZXLJ18V4AONBuG34Zwv9mPyYZtqrwSV0YwA=");
+    then !scram_server_ok("", "hJ2f2pjXZXLJ18V4AONBuG34Zwv9mPyYZtqrwSV0YwA=");
+    // An empty expectation must never match an empty answer.
+    then !scram_server_ok("v=", "");
+    then db::error::kind(scram_server_error()) == db::error::kind_auth();
 }

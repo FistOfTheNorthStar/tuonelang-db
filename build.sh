@@ -153,9 +153,13 @@ case "$command" in
 esac
 
 # --- live oracles ------------------------------------------------------------
-# These are PostgreSQL-specific by construction: they talk to a real server.
+# The PostgreSQL ones talk to a real server, except scram_check.
 if [ "$run_live" -eq 1 ] && [ "$failed" -eq 0 ]; then
   if [ "$want_pg" -eq 1 ]; then
+    # Needs no server: SCRAM-SHA-256 against RFC 7677's published exchange.
+    printf '\n=== live: SCRAM against RFC 7677 ===\n'
+    "$TUO" run examples/scram_check.tuo "${SRC[@]}"; check $? "scram_check"
+
     printf '\n=== live: protocol oracle ===\n'
     "$TUO" run examples/live_check.tuo "${SRC[@]}"; check $? "live_check"
 

@@ -52,10 +52,11 @@ pub fn null_len() -> Int {
 
 /// The magic code that requests an SSL/TLS upgrade before startup.
 ///
-/// The adapter **declines** TLS (ADR-0014 and ADR-0017 both exclude it, and
-/// ADR-0019 explicitly does not reverse that), so this exists to name the
-/// constant a server may see from other clients, and to document why the
-/// adapter never sends it. Kept so the value is written down once, correctly.
+/// The adapter **declines** TLS: `std::tls` (ADR-0036) is the server side of
+/// a handshake, and a client that verifies a certificate chain is not
+/// expressible yet. So this exists to name the constant a server may see
+/// from other clients, and to document why the adapter never sends it. Kept
+/// so the value is written down once, correctly.
 ///
 /// # Example
 /// ```tuo
@@ -453,9 +454,9 @@ pub fn terminate() -> String {
 
 /// A **PasswordMessage** carrying `secret` verbatim.
 ///
-/// Used for `AuthenticationCleartextPassword`, and — once ADR-0019 Stage B
-/// lands `std::crypto::md5` — for the `md5...` digest string too, since both
-/// are the same `p` message with different contents.
+/// Used for `AuthenticationCleartextPassword`, and for the `md5...` digest
+/// string `pg::auth::md5_response` computes, since both are the same `p`
+/// message with different contents.
 ///
 /// # Example
 /// ```tuo
@@ -484,10 +485,9 @@ pub fn copy_fail(in reason: Str) -> String {
 /// A **SASLInitialResponse**: the mechanism name, then the client's first
 /// message with an Int32 length.
 ///
-/// This is the SCRAM-SHA-256 entry point. It is encodable today — the framing
-/// needs no crypto — but the `client_first` content it carries must come from
-/// `pg::auth`, which needs ADR-0019 Stage B. Encoding it here means the moment
-/// crypto lands, only the payload changes and never the framing.
+/// This is the SCRAM-SHA-256 entry point. The framing is here; the
+/// `client_first` content it carries comes from
+/// `pg::auth::scram_client_first`.
 ///
 /// # Example
 /// ```tuo
@@ -554,7 +554,7 @@ pub fn startup_version(in user: Str, in database: Str) -> Int {
 
 spec startup {
     then startup_framing_ok("postgres", "app");
-    then startup_framing_ok("shallowflaws", "deepflaws");
+    then startup_framing_ok("tuo", "tuo_test");
     // The database is optional; both shapes must still be correctly framed.
     then startup_framing_ok("postgres", "");
     // The version the server checks before it will speak at all.

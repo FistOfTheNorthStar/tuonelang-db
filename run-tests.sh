@@ -2,7 +2,8 @@
 # run-tests.sh — the whole validation suite for tuonelang-db.
 #
 #   ./run-tests.sh                 specs + formatting (no server needed)
-#   ./run-tests.sh --live          also run the live oracles against a real server
+#   ./run-tests.sh --live          also run the live oracles; the PostgreSQL
+#                                  ones need `examples/test-server.sh start`
 #   ./run-tests.sh --core          check only the backend-neutral layer
 #   ./run-tests.sh --postgresql    check the core + the PostgreSQL adapter
 #   ./run-tests.sh --vector        check the core + the embedded vector store
@@ -71,6 +72,12 @@ done
 
 if [ "$live" -eq 1 ]; then
   if [ "$have_pg" -eq 1 ]; then
+    # Needs no server: SCRAM-SHA-256 at a real iteration count, against the
+    # exchange RFC 7677 publishes. It runs natively because 4096 rounds of
+    # PBKDF2 is more than a spec's fuel allows.
+    step "Live: SCRAM against RFC 7677"
+    "$TUO" run examples/scram_check.tuo "${SRC[@]}"; check $? "scram_check"
+
     step "Live: protocol oracle"
     "$TUO" run examples/live_check.tuo "${SRC[@]}"; check $? "live_check"
 

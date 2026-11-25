@@ -6,7 +6,7 @@
 // exactly as a search over the originals does. Exits non-zero the moment the
 // round trip disagrees with the pure model.
 //
-// Run it (against the docker-compose Postgres in ../shallowflaws):
+// Run it against the throwaway server `examples/test-server.sh start` brings up:
 //
 //     tuo run examples/bridge_check.tuo src/db/*.tuo src/pg/*.tuo src/vec/*.tuo
 //
@@ -177,7 +177,7 @@ fn same_ranking(in a: vec::db::Db, in b: vec::db::Db, take q: Array[Float]) -> B
 fn main() -> Int {
     say("=== tuonelang-db bridge oracle ===");
 
-    let opened = pg::conn::connect("127.0.0.1", 5432, "shallowflaws", "deepflaws", "", 30000);
+    let opened = pg::conn::connect("127.0.0.1", 54320, "tuo", "tuo_test", "tuo-test-only", 30000);
     if !pg::conn::is_ok_int(opened) {
         return fail("could not connect", 40);
     }

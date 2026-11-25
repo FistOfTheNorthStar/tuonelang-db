@@ -36,11 +36,18 @@ module pg::message;
 /// // let kind = pg::message::auth_kind(payload);
 /// ```
 pub fn auth_kind(in payload: String) -> Int {
+    // Too short to hold a kind at all: not a kind any plan recognizes, so it
+    // is refused as unsupported rather than trapping the process on a
+    // message from a server that has not authenticated yet.
+    if std::string::len(payload) < 4 {
+        return 0 - 1;
+    }
     db::bytes::be_i32(payload, 0)
 }
 
 /// The 4-byte salt from an `AuthenticationMD5Password` payload, as an
-/// `Array[Int]` of four bytes.
+/// `Array[Int]` of four bytes — or an empty array when the payload is too
+/// short to carry one, which `pg::auth::md5_response` refuses.
 ///
 /// Valid only when `auth_kind` is `pg::proto::auth_md5()`. The salt follows
 /// the Int32 kind, so it occupies bytes 4..8.
@@ -51,6 +58,9 @@ pub fn auth_kind(in payload: String) -> Int {
 /// ```
 pub fn auth_md5_salt(in payload: String) -> Array[Int] {
     var salt = std::array::empty();
+    if std::string::len(payload) < 8 {
+        return salt;
+    }
     std::array::push(salt, std::string::byte_at(payload, 4));
     std::array::push(salt, std::string::byte_at(payload, 5));
     std::array::push(salt, std::string::byte_at(payload, 6));
@@ -67,6 +77,9 @@ pub fn auth_md5_salt(in payload: String) -> Array[Int] {
 /// // let body = pg::message::auth_sasl_body(payload);
 /// ```
 pub fn auth_sasl_body(in payload: String) -> String {
+    if std::string::len(payload) < 4 {
+        return std::string::empty();
+    }
     std::string::slice(payload, 4, std::string::len(payload))
 }
 
@@ -558,6 +571,21 @@ pub fn fixture_tx_is_idle() -> Bool {
 spec auth_kind {
     then fixture_auth_kind_ok();
     then fixture_auth_kind_md5();
+    // A payload too short for what it claims is a value, not a trap: no
+    // kind, no salt, no SASL body.
+    then auth_kind(short_auth(3)) == 0 - 1;
+    then auth_kind(short_auth(0)) == 0 - 1;
+    then std::array::len(auth_md5_salt(short_auth(7))) == 0;
+    then std::string::len(auth_sasl_body(short_auth(2))) == 0;
+    then std::string::len(auth_sasl_body(short_auth(4))) == 0;
+}
+
+/// Spec helper: an authentication payload cut off after `n` bytes.
+pub fn short_auth(take n: Int) -> String {
+    var p = std::string::empty();
+    db::bytes::put_i32(p, pg::proto::auth_md5());
+    db::bytes::put_i32(p, 0);
+    std::string::slice(p, 0, n)
 }
 
 /// Spec helper: an `AuthenticationOk` payload decodes to kind 0.

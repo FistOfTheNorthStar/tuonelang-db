@@ -1,6 +1,6 @@
 // live_check — the adapter's acceptance oracle, run against a real server.
 //
-// The pure tiers of this adapter carry 87 executable specs, but a spec cannot
+// The pure tiers of this adapter carry the executable specs, but a spec cannot
 // touch a socket (`R0007`), so the effect tier — connecting, the handshake,
 // framing messages off a live stream — needs a different kind of proof. This
 // program is it: it connects to a real PostgreSQL server, runs real SQL, and
@@ -11,7 +11,7 @@
 // asserts a value the pure layer predicts, so a passing run means the wire
 // agrees with the model rather than merely that bytes moved.
 //
-// Run it (against the docker-compose Postgres in ../shallowflaws):
+// Run it against the throwaway server `examples/test-server.sh start` brings up:
 //
 //     tuo run examples/live_check.tuo src/db/*.tuo src/pg/*.tuo
 //
@@ -29,10 +29,14 @@
 //     18  two row-returning statements were not refused, or wedged the connection
 //     19  COPY was not refused as unsupported, or wedged the connection
 //     20  65536 parameters were sent instead of refused, or wedged the connection
+//     21  a million-row result was truncated, or left rows behind for the next query
+//     22  an out-of-range cell read did not read as NULL
+//     23  a timeout did not close the descriptor, or the closed descriptor still answered
 //
-// The connection parameters match `shallowflaws/docker/docker-compose.yml`,
-// whose `pg_hba.conf` grants `trust` from 127.0.0.1 — which is what lets this
-// run today, before ADR-0019 lands the crypto that md5/SCRAM would need.
+// The connection parameters below are that test server's, and exist for
+// nothing else. It demands SCRAM-SHA-256, so every run authenticates with
+// it; pointed elsewhere, the adapter answers whatever method is asked for,
+// and `auth_check.tuo` is the oracle that proves which one was demanded.
 
 module live_check;
 
@@ -41,20 +45,25 @@ fn host() -> Str {
     "127.0.0.1"
 }
 
+/// The test server's port — not 5432, so it never collides with a real one.
+fn port() -> Int {
+    54320
+}
+
 /// The database user.
 fn user() -> Str {
-    "shallowflaws"
+    "tuo"
 }
 
 /// The database name.
 fn database() -> Str {
-    "deepflaws"
+    "tuo_test"
 }
 
-/// The password. Unused under `trust`, and sent only if the server asks for
-/// cleartext.
+/// The password. Unused under `trust`; otherwise proven or sent as the
+/// server's authentication method requires.
 fn password() -> Str {
-    "half123"
+    "tuo-test-only"
 }
 
 /// A generous per-operation timeout: every wait in the adapter is bounded, so
@@ -71,7 +80,7 @@ fn say(in label: Str) -> Int {
 
 fn main() -> Int {
     // --- Connect and complete the startup handshake ------------------------
-    let connected = pg::conn::connect(host(), pg::conn::default_port(), user(), database(), password(), timeout_ms());
+    let connected = pg::conn::connect(host(), port(), user(), database(), password(), timeout_ms());
     if !pg::conn::is_ok_int(connected) {
         let _ = std::rt::write(1, "FAIL connect: ");
         let _ = std::rt::write_string(1, db::error::render(pg::conn::unwrap_err_int(connected)));
@@ -368,8 +377,79 @@ fn main() -> Int {
     }
     let _ = say("ok   65536 parameters refused before sending");
 
-    // --- Done --------------------------------------------------------------
+    // --- 10. A large result ------------------------------------------------
+    // More than a million messages in one reply. An earlier build capped the
+    // read loop at a million and handed back a truncated result, with the
+    // rest still on the stream for the next query to read as its own. Every
+    // row must arrive, and the query after it must see its own reply.
+    let r10 = pg::query::run(fd, "SELECT generate_series(1, 1000010)", timeout_ms());
+    if !pg::query::is_ok_result(r10) {
+        let _ = std::rt::write_string(1, pg::query::render_error(r10));
+        let _ = pg::conn::shutdown(fd);
+        return 21;
+    }
+    let rs10 = pg::query::unwrap_ok_result(r10);
+    if pg::query::row_count(rs10) != 1000010 || pg::query::affected(rs10) != 1000010 {
+        let _ = say("FAIL large result: rows were lost");
+        let _ = pg::conn::shutdown(fd);
+        return 21;
+    }
+    let r10b = pg::query::scalar_int(fd, "SELECT 10", 0, timeout_ms());
+    if !pg::conn::is_ok_int(r10b) || pg::conn::unwrap_ok_int(r10b) != 10 {
+        let _ = say("FAIL large result: the next query read leftover rows");
+        let _ = pg::conn::shutdown(fd);
+        return 21;
+    }
+    let _ = say("ok   1,000,010 rows in one result; stream in step afterwards");
+
+    // --- 11. Out of range is a value, not a trap ---------------------------
+    // Spec-checked on a fixture, but the live result is the one that would
+    // have ended a running program with an index trap.
+    if std::string::len(pg::query::cell(rs10, 5000000, 0)) != 0 || !pg::query::is_null(rs10, 0, 7) || pg::query::has_cell(rs10, 0, 0 - 1) {
+        let _ = say("FAIL out of range: did not read as NULL");
+        let _ = pg::conn::shutdown(fd);
+        return 22;
+    }
+    let _ = say("ok   out-of-range cell reads as NULL");
+
+    // --- Done with this connection -----------------------------------------
     let _ = pg::conn::shutdown(fd);
+
+    // --- 12. A timeout closes the descriptor -------------------------------
+    // On a fresh connection, because nothing is left to shut down afterwards:
+    // a query that outlives its timeout must come back as a fatal timeout,
+    // and the next use of that descriptor must be refused rather than handed
+    // the sleep's reply as its own.
+    let c2 = pg::conn::connect(host(), port(), user(), database(), password(), timeout_ms());
+    if !pg::conn::is_ok_int(c2) {
+        let _ = say("FAIL connect (second connection)");
+        return 10;
+    }
+    let fd2 = pg::conn::unwrap_ok_int(c2);
+    let r12 = pg::query::run(fd2, "SELECT pg_sleep(1.5), 7", 300);
+    if pg::query::is_ok_result(r12) {
+        let _ = say("FAIL timeout: a 1.5 s query returned within 300 ms");
+        let _ = pg::conn::shutdown(fd2);
+        return 23;
+    }
+    let e12 = pg::query::unwrap_err_result(r12);
+    if db::error::kind(e12) != db::error::kind_timeout() || !db::error::is_fatal(e12) {
+        let _ = say("FAIL timeout: wrong error kind");
+        return 23;
+    }
+    let r12b = pg::query::run(fd2, "SELECT 1", timeout_ms());
+    if pg::query::is_ok_result(r12b) {
+        let _ = say("FAIL timeout: the closed descriptor still answered");
+        return 23;
+    }
+    let e12b = pg::query::unwrap_err_result(r12b);
+    if db::error::kind(e12b) != db::error::kind_connection() {
+        let _ = say("FAIL timeout: reuse was not refused as a connection error");
+        return 23;
+    }
+    let _ = say("ok   timeout closes the descriptor; reuse is refused");
+
+    // --- Done --------------------------------------------------------------
     let _ = say("");
     let _ = say("all live checks passed");
     0
