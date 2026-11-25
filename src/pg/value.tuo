@@ -8,11 +8,7 @@
 //   * text format is what the *simple* query protocol always returns, so one
 //     decoder serves both protocols rather than two;
 //   * binary layouts are per-type, version-sensitive, and undocumented for
-//     several types, whereas the text rendering is stable and specified; and
-//   * decoding text needs no bitwise operations at all. (This was once the
-//     decisive reason: v0 had no bitwise operators. ADR-0019 Stage A has
-//     since landed them, so it is now a convenience rather than a constraint
-//     — the two reasons above are what keep the choice correct.)
+//     several types, whereas the text rendering is stable and specified.
 //
 // Everything here is pure, so every decoder below is spec-checked against the
 // exact renderings a real server produces.
@@ -355,8 +351,8 @@ pub fn as_float(in raw: Str) -> Result[Float, Str] {
     }
 
     // Integer part: consume digits, stopping at the first byte that is not
-    // one. `scanning` is the loop's own exit flag — v0 has no `break`, so the
-    // condition carries it explicitly rather than through an index sentinel.
+    // one. `scanning` is the loop's own exit flag: the condition carries it
+    // explicitly rather than through an index sentinel.
     var whole = 0.0;
     var saw_digit = false;
     var scanning = true;

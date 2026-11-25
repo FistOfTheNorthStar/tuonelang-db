@@ -98,6 +98,21 @@ pub fn server(in message: Str, in sqlstate: Str) -> PgError {
     PgError { kind: kind_server(), message: std::string::from_str(message), sqlstate: std::string::from_str(sqlstate) }
 }
 
+/// An error of any `kind` that still carries a SQLSTATE.
+///
+/// For the case where the server announced why before the connection was
+/// lost — `57P01`, "terminating connection due to administrator command" —
+/// so the error is a `kind_connection` (the descriptor is gone) that a
+/// program can nonetheless match on the server's code.
+///
+/// # Example
+/// ```tuo
+/// let e = db::error::with_sqlstate(db::error::kind_connection(), "terminating connection", "57P01");
+/// ```
+pub fn with_sqlstate(take kind: Int, in message: Str, in sqlstate: Str) -> PgError {
+    PgError { kind: kind, message: std::string::from_str(message), sqlstate: std::string::from_str(sqlstate) }
+}
+
 /// The error's kind tag.
 ///
 /// # Example
@@ -238,6 +253,23 @@ pub fn is_retryable(in e: PgError) -> Bool {
     is_sqlstate(e, sqlstate_serialization_failure()) || is_sqlstate(e, "40P01")
 }
 
+/// Is the connection gone? True for `kind_timeout` and `kind_connection`.
+///
+/// After either, a client cannot know where the stream stands — a reply may
+/// still be in flight, or half of one may already have been read — so the
+/// adapter **closes the descriptor before returning the error**, and the
+/// caller must not use it, or close it, again. Every other kind (a server
+/// error, an unsupported feature, a value that would not decode) leaves the
+/// connection in step and usable.
+///
+/// # Example
+/// ```tuo
+/// // if db::error::is_fatal(e) { reconnect } else { keep the descriptor }
+/// ```
+pub fn is_fatal(in e: PgError) -> Bool {
+    e.kind == kind_timeout() || e.kind == kind_connection()
+}
+
 // ----------------------------------------------------------------------------
 // Specs.
 // ----------------------------------------------------------------------------
@@ -250,6 +282,11 @@ pub fn render_is(take k: Int, in msg: Str, in expect: Str) -> Bool {
 /// Spec helper: the rendering of a server error.
 pub fn render_server_is(in msg: Str, in state: Str, in expect: Str) -> Bool {
     std::string::as_str(render(server(msg, state))) == expect
+}
+
+/// Spec helper: the rendering of a connection error that kept a SQLSTATE.
+pub fn render_is_with(in msg: Str, in state: Str, in expect: Str) -> Bool {
+    std::string::as_str(render(with_sqlstate(kind_connection(), msg, state))) == expect
 }
 
 /// Spec helper: round-trip a kind through construction.
@@ -304,4 +341,23 @@ spec is_retryable {
     then !server_retryable("23505");
     then !server_retryable("42601");
     then !is_retryable(new(kind_connection(), "x"));
+}
+
+spec with_sqlstate {
+    // The kind is whatever was asked for, and the SQLSTATE still matches.
+    then kind(with_sqlstate(kind_connection(), "m", "57P01")) == kind_connection();
+    then is_sqlstate(with_sqlstate(kind_connection(), "m", "57P01"), "57P01");
+    then render_is_with("terminating connection", "57P01", "connection: terminating connection (SQLSTATE 57P01)");
+}
+
+spec is_fatal {
+    // Exactly the two kinds after which the descriptor has been closed.
+    then is_fatal(new(kind_timeout(), "x"));
+    then is_fatal(new(kind_connection(), "x"));
+    then is_fatal(with_sqlstate(kind_connection(), "m", "57P01"));
+    then !is_fatal(server("m", "42601"));
+    then !is_fatal(new(kind_unsupported(), "x"));
+    then !is_fatal(new(kind_protocol(), "x"));
+    then !is_fatal(new(kind_decode(), "x"));
+    then !is_fatal(new(kind_auth(), "x"));
 }

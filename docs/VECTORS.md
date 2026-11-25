@@ -91,13 +91,13 @@ passes, and then one of two things happens:
 
 - a spec fails at run time with `the interpreter only executes functions present
   in the lowered MIR`, pointing at the wrong line; or
-- the build fails with `codegen: the program has no function named 'main' to
-  compile` — even though `main` is plainly there.
+- the build fails with `lowering: 'main' was not lowered: body contains type
+  errors or unresolved types` — even though `tuo check` found none.
 
 ```tuo
 // WRONG — `db` shadows the `db::` namespace, so `db::math::near` below
 // silently drops out and `main` fails to compile.
-var store = vec::db::in_memory(3, vec::metric::metric_cosine());
+var db = vec::db::in_memory(3, vec::metric::metric_cosine());
 if db::math::near(score, 1.0) { }
 
 // RIGHT
@@ -267,8 +267,7 @@ fn v3(take a: Float, take b: Float, take c: Float) -> Array[Float] {
 For a 384- or 1536-wide embedding, push in a loop from wherever the numbers come
 from. The array must be **exactly** `dim` long or `add` returns `-1`.
 
-`1.` and `.5` are **not** float literals — write `1.0` and `0.5`. There is no
-unary minus on a literal in every position either; write `0.0 - 1.0`.
+`1.` and `.5` are **not** float literals — write `1.0` and `0.5`.
 
 ---
 
@@ -311,8 +310,7 @@ let mut d = ...;                         var d = ...;
 n += 1;                                  n = n + 1;
 for h in hits { }                        while i < hit_count(hits) { }
 xs.len()                                 std::array::len(xs)
-std::math::sqrt(x)                       db::math::sqrt(x)   // no std::math
--1.0                                     0.0 - 1.0
+std::math::sqrt(x)                       db::math::sqrt(x)   // 0.0, not NaN, for x < 0
 1.                                       1.0
 vec::db::add(store, v, id, p) after         bind the result: let row = ...;
   reading `v` again                        `v` is moved into the store

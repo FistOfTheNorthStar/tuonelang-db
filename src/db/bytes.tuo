@@ -11,65 +11,21 @@
 // module in the adapter, and the one whose correctness everything else rests
 // on.
 //
-// WHY ARITHMETIC AND NOT SHIFTS.
+// BUILT ON `std::bits`.
 //
-// These encoders were written before tuonelang had bitwise operators, with
-// `*`, `/`, and `%` standing in for shifts and masks. **ADR-0019 Stage A has
-// since landed** `<<`/`>>`/`&`/`|`/`^`/`~`, so shifts are available now; the
-// `std::bits` helpers the ADR also promises (`be_u32`, `be_u16`, and their
-// decoders) are Stage B and still resolve to `R0002: no 'bits' in 'std'`.
+// The byte-order arithmetic itself is the standard library's: `std::bits`
+// has the big-endian pack and unpack (`be32`, `byte_of_be32`, and the 16-bit
+// pair), written over the shift and mask operators. What this module adds is
+// the layer a wire protocol needs on top of them — appending to and reading
+// from a `String` buffer at an offset, the **signed** readings (`-1` is how
+// the protocol spells SQL NULL), and C strings.
 //
-// The arithmetic below is left in place deliberately: it is exactly equivalent
-// to the shift form **provided every byte is in 0..=255 and no intermediate
-// overflows**, and those are the two conditions this module enforces rather
-// than assumes:
-//
-//   * every decoder is fed bytes from `std::string::byte_at`, which the
-//     compiler guarantees is `0..=255`; and
-//   * `i32` values are reassembled below 2^31 and sign-corrected explicitly
-//     in `be_i32`, so the multiply-add never carries into a sign bit the way
-//     ADR-0019 warns an unguarded `*`-based decoder does.
-//
-// MIGRATION. The bodies here can become one-liners — over the Stage A shifts
-// today, or over `std::bits` once Stage B lands — while every signature and
-// every spec below stays as-is. That is the point of routing all byte-order
-// work through this one module instead of open-coding `b0 * 16777216 + ...`
-// at each call site, which is the correctness trap the ADR calls out by name.
-// The specs are what make that rewrite safe to attempt.
+// Routing all byte-order work through this one module, instead of open-coding
+// shifts at each call site, is what keeps a sign or width mistake from being
+// made twice. The specs at the bottom pin the values the protocol actually
+// uses and the two's-complement boundaries.
 
 module db::bytes;
-
-// ----------------------------------------------------------------------------
-// Constants — the powers of two the big-endian codec needs.
-//
-// Written as functions because v0 has no `const` items; the optimizer folds
-// them, and naming them keeps the magic numbers out of the encoders.
-// ----------------------------------------------------------------------------
-
-/// 2^8 — one byte's worth of range.
-pub fn byte_max() -> Int {
-    256
-}
-
-/// 2^16.
-pub fn pow16() -> Int {
-    65536
-}
-
-/// 2^24.
-pub fn pow24() -> Int {
-    16777216
-}
-
-/// 2^32 — the modulus an unsigned 32-bit quantity wraps at.
-pub fn pow32() -> Int {
-    4294967296
-}
-
-/// 2^31 — the first value an `Int32` represents as negative.
-pub fn int32_sign_bit() -> Int {
-    2147483648
-}
 
 // ----------------------------------------------------------------------------
 // Encoding — appending big-endian integers to an owned buffer.
@@ -89,16 +45,12 @@ pub fn int32_sign_bit() -> Int {
 /// db::bytes::put_i32(buf, 196608); // the 3.0 protocol version
 /// ```
 pub fn put_i32(mut buf: String, take v: Int) {
-    // Fold a negative into its unsigned two's-complement image first, so the
-    // four extractions below are always over a non-negative number.
-    var n = v;
-    if n < 0 {
-        n = n + pow32();
-    }
-    std::string::push_byte(buf, n / pow24() % byte_max());
-    std::string::push_byte(buf, n / pow16() % byte_max());
-    std::string::push_byte(buf, n / byte_max() % byte_max());
-    std::string::push_byte(buf, n % byte_max());
+    // `byte_of_be32` masks to the low 32 bits first, which is exactly the
+    // two's-complement image of a negative `v`.
+    std::string::push_byte(buf, std::bits::byte_of_be32(v, 0));
+    std::string::push_byte(buf, std::bits::byte_of_be32(v, 1));
+    std::string::push_byte(buf, std::bits::byte_of_be32(v, 2));
+    std::string::push_byte(buf, std::bits::byte_of_be32(v, 3));
 }
 
 /// Append `v` as a big-endian **Int16** (2 bytes) — the width of a column
@@ -110,12 +62,8 @@ pub fn put_i32(mut buf: String, take v: Int) {
 /// db::bytes::put_i16(buf, 1);
 /// ```
 pub fn put_i16(mut buf: String, take v: Int) {
-    var n = v;
-    if n < 0 {
-        n = n + pow16();
-    }
-    std::string::push_byte(buf, n / byte_max() % byte_max());
-    std::string::push_byte(buf, n % byte_max());
+    std::string::push_byte(buf, std::bits::byte_of_be16(v, 0));
+    std::string::push_byte(buf, std::bits::byte_of_be16(v, 1));
 }
 
 /// Append one byte.
@@ -176,8 +124,8 @@ pub fn put_bytes(mut buf: String, in s: Str) {
 pub fn be_i32(in buf: String, take at: Int) -> Int {
     let n = be_u32(buf, at);
     // Reinterpret the top bit as a sign, which is what makes -1 read as -1.
-    if n >= int32_sign_bit() {
-        n - pow32()
+    if n >= 2147483648 {
+        n - 4294967296
     } else {
         n
     }
@@ -193,11 +141,7 @@ pub fn be_i32(in buf: String, take at: Int) -> Int {
 /// // let oid = db::bytes::be_u32(buf, 6);
 /// ```
 pub fn be_u32(in buf: String, take at: Int) -> Int {
-    let b0 = std::string::byte_at(buf, at);
-    let b1 = std::string::byte_at(buf, at + 1);
-    let b2 = std::string::byte_at(buf, at + 2);
-    let b3 = std::string::byte_at(buf, at + 3);
-    b0 * pow24() + b1 * pow16() + b2 * byte_max() + b3
+    std::bits::be32(std::string::byte_at(buf, at), std::string::byte_at(buf, at + 1), std::string::byte_at(buf, at + 2), std::string::byte_at(buf, at + 3))
 }
 
 /// The big-endian **Int16** at `at`, interpreted as signed.
@@ -207,11 +151,9 @@ pub fn be_u32(in buf: String, take at: Int) -> Int {
 /// // let cols = db::bytes::be_i16(buf, 5);
 /// ```
 pub fn be_i16(in buf: String, take at: Int) -> Int {
-    let hi = std::string::byte_at(buf, at);
-    let lo = std::string::byte_at(buf, at + 1);
-    let n = hi * byte_max() + lo;
+    let n = std::bits::be16(std::string::byte_at(buf, at), std::string::byte_at(buf, at + 1));
     if n >= 32768 {
-        n - pow16()
+        n - 65536
     } else {
         n
     }
@@ -266,7 +208,7 @@ pub fn cstr_end(in buf: String, take at: Int) -> Int {
 //
 // These are the invariants the whole adapter leans on, so they are pinned at
 // the exact values the protocol actually uses (196608 = 3.0, -1 = NULL) and at
-// the two's-complement boundaries where an arithmetic codec would break.
+// the two's-complement boundaries where a codec most easily breaks.
 // ----------------------------------------------------------------------------
 
 /// Spec helper: encode `v` as i32 and decode it back.
@@ -349,7 +291,7 @@ spec cstr_roundtrip_ok {
     then cstr_roundtrip_ok("");
     then cstr_roundtrip_ok("user");
     then cstr_roundtrip_ok("SELECT 1");
-    then cstr_roundtrip_ok("deepflaws");
+    then cstr_roundtrip_ok("tuo_test");
 }
 
 spec cstr_next_offset {

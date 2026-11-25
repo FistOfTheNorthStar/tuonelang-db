@@ -1,0 +1,92 @@
+// auth_check — one authentication method, proven against a real server.
+//
+// `live_check.tuo` authenticates however its server asks, which proves one
+// method per server. This program is pointed at a server by its arguments,
+// so each method a `pg_hba.conf` can demand — `scram-sha-256`, `md5`,
+// `password` — gets its own run against a server configured for it.
+//
+// It takes arguments, which `tuo run` does not forward, so build it first:
+//
+//     tuo build -o /tmp/auth_check examples/auth_check.tuo src/db/*.tuo src/pg/*.tuo
+//     /tmp/auth_check 127.0.0.1 5432 app appdb secret
+//
+// The arguments are host, port, user, database, password. `docs/GUIDE.md`
+// (§7, Authentication) has the `docker run` line for a server per method.
+//
+// Exit codes:
+//
+//      0  the password authenticated, and a wrong one was refused
+//     50  wrong number of arguments, or a port that is not a number
+//     51  the right password did not authenticate
+//     52  the authenticated connection could not run a query
+//     53  a wrong password authenticated — the server is not demanding one
+//     54  a wrong password failed, but not as a server's refusal (28P01)
+
+module auth_check;
+
+fn say(in label: Str) -> Int {
+    let _ = std::rt::write(1, label);
+    std::rt::write(1, "\n")
+}
+
+fn timeout_ms() -> Int {
+    10000
+}
+
+fn main() -> Int {
+    // arg(0) is the program itself.
+    if std::process::arg_count() != 6 {
+        let _ = say("usage: auth_check <host> <port> <user> <database> <password>");
+        return 50;
+    }
+    let host = std::process::arg(1);
+    let port = pg::value::as_int_or(std::string::as_str(std::process::arg(2)), 0);
+    let user = std::process::arg(3);
+    let database = std::process::arg(4);
+    let password = std::process::arg(5);
+    if port <= 0 {
+        let _ = say("FAIL the port is not a number");
+        return 50;
+    }
+
+    // --- The right password ------------------------------------------------
+    let c = pg::conn::connect(std::string::as_str(host), port, std::string::as_str(user), std::string::as_str(database), std::string::as_str(password), timeout_ms());
+    if !pg::conn::is_ok_int(c) {
+        let _ = std::rt::write(1, "FAIL connect: ");
+        let _ = std::rt::write_string(1, db::error::render(pg::conn::unwrap_err_int(c)));
+        let _ = say("");
+        return 51;
+    }
+    let fd = pg::conn::unwrap_ok_int(c);
+    let one = pg::query::scalar_int(fd, "SELECT 1", 0, timeout_ms());
+    if !pg::conn::is_ok_int(one) || pg::conn::unwrap_ok_int(one) != 1 {
+        let _ = say("FAIL the authenticated connection could not run a query");
+        return 52;
+    }
+    let _ = pg::conn::shutdown(fd);
+    let _ = say("ok   the password authenticated");
+
+    // --- A wrong one -------------------------------------------------------
+    // The server must refuse it in its own words. A success here means the
+    // server is not asking for a password at all (`trust`), and this run
+    // proved nothing about the method.
+    var wrong = std::string::from_str(std::string::as_str(password));
+    std::string::append(wrong, "-wrong");
+    let c2 = pg::conn::connect(std::string::as_str(host), port, std::string::as_str(user), std::string::as_str(database), std::string::as_str(wrong), timeout_ms());
+    if pg::conn::is_ok_int(c2) {
+        let _ = pg::conn::shutdown(pg::conn::unwrap_ok_int(c2));
+        let _ = say("FAIL a wrong password authenticated; is this server using trust?");
+        return 53;
+    }
+    let e = pg::conn::unwrap_err_int(c2);
+    if !db::error::is_sqlstate(e, "28P01") {
+        let _ = std::rt::write(1, "FAIL a wrong password failed for another reason: ");
+        let _ = std::rt::write_string(1, db::error::render(e));
+        let _ = say("");
+        return 54;
+    }
+    let _ = say("ok   a wrong password is refused by the server (28P01)");
+    let _ = say("");
+    let _ = say("all auth checks passed");
+    0
+}

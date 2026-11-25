@@ -266,7 +266,11 @@ Three properties worth knowing:
   precision. The acceptance oracle checks exactly this.
 - **Saving is verified.** `save_verified` (which `save` uses) writes a
   temporary, reads it back, checks it decodes to the expected row count, and
-  only then replaces the target. A failure leaves your existing file untouched.
+  only then rewrites the target. A verification failure leaves your existing
+  file untouched. The final rewrite itself is not atomic — v0 has no `rename`
+  to swap the checked temporary into place — so a crash inside that last
+  write can lose the target; keep the previous file, or `save_as` a snapshot
+  beside it, if that window matters.
 - **Components are fixed-point, not IEEE bytes.** tuonelang v0 cannot
   reinterpret a float's bits, so a component is stored as `round(x * 2^30)`.
   Round-trip error is about `5e-10` — far below anything an embedding means —

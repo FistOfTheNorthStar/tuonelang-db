@@ -196,7 +196,11 @@ pub fn load_error(in path: Str) -> String {
 /// sense and does not claim to be. What it does is strictly better than a bare
 /// `save`: it writes to `path.tmp`, reads that file back, checks that it
 /// decodes to a store with the same row count, and only then writes `path`. A
-/// crash mid-way leaves the previous `path` untouched.
+/// crash before that last step leaves the previous `path` untouched. The last
+/// step itself is a truncating open and a write of `path`, so a crash inside
+/// it can still lose the file — the verified `path.tmp` is what remains, and
+/// without `rename` there is no way to swap it in atomically. Keep the
+/// previous file (or `save_as` a snapshot beside it) if that window matters.
 ///
 /// Returns the bytes written to `path`, or a negative value on failure:
 /// `err_unrepresentable()` (-101) when the store holds a component this format

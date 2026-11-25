@@ -9,8 +9,8 @@
 //
 // A CONNECTION IS AN INT.
 //
-// v0 has no `Box`, no `Shared`, and no destructors, so a connection cannot be
-// an object that closes itself. It is what the OS calls it: a **descriptor**,
+// v0 has no destructors, so a connection cannot be an object that closes
+// itself. It is what the OS calls it: a **descriptor**,
 // an `Int`, which the caller passes back to every function here and eventually
 // hands to `close`. That is honest about the lifetime — nothing pretends to
 // manage it — and it costs nothing at runtime.
@@ -24,6 +24,17 @@
 // which the seam keeps distinct from end-of-input (`-1`) and host error
 // (`-2`), so "the server is slow" never gets confused with "the server is
 // gone".
+//
+// A LOST CONNECTION IS CLOSED HERE, NOT LEFT FOR THE CALLER.
+//
+// After a timeout or a failed read or write, nobody can say where the stream
+// stands: the reply may still be on its way, or half of it may already have
+// been consumed. A descriptor in that state is worse than a closed one — the
+// next query would read the previous query's rows as its own. So every path
+// that gives up on the stream goes through `lose`, which closes the
+// descriptor and marks the error (`db::error::is_fatal`) so the caller knows
+// not to touch it again. A server error is not that: the stream is drained
+// to `ReadyForQuery` and the connection stays usable.
 //
 // READING IS BYTE-AT-A-TIME.
 //
@@ -154,9 +165,70 @@ pub fn write_message(take fd: Int, in msg: String) -> Int {
 pub fn send(take fd: Int, in msg: String) -> Result[Int, db::error::PgError] {
     let n = write_message(fd, msg);
     if n < 0 {
-        return Err { error: db::error::new(db::error::kind_connection(), "the connection failed while sending (the server may have closed it)") };
+        return Err { error: lose(fd, db::error::new(db::error::kind_connection(), "the connection failed while sending (the server may have closed it)")) };
     }
     Ok { value: n }
+}
+
+// ----------------------------------------------------------------------------
+// Giving up on a connection.
+// ----------------------------------------------------------------------------
+
+/// The text every fatal error ends with, so a log line says the descriptor
+/// is gone without the reader having to know the kind rule.
+pub fn closed_suffix() -> Str {
+    "; the connection has been closed and the descriptor must not be used again"
+}
+
+/// `e` with `closed_suffix` appended to its message; kind and SQLSTATE are
+/// kept. Pure, so the shape of every fatal error is spec-checked.
+///
+/// # Example
+/// ```tuo
+/// let e = pg::conn::mark_closed(db::error::new(db::error::kind_timeout(), "slow"));
+/// ```
+pub fn mark_closed(in e: db::error::PgError) -> db::error::PgError {
+    var m = db::error::message(e);
+    std::string::append(m, closed_suffix());
+    db::error::with_sqlstate(db::error::kind(e), std::string::as_str(m), std::string::as_str(db::error::sqlstate(e)))
+}
+
+/// The error to report when a read failed after the server had already sent
+/// an `ErrorResponse` — as it does before closing a connection it is
+/// terminating (`57P01`). The server's own words and SQLSTATE are what the
+/// caller should see, as a `kind_connection` since the descriptor is gone;
+/// a timeout after a server error is still reported as a timeout, because
+/// then the server did not close anything.
+///
+/// # Example
+/// ```tuo
+/// // let e = pg::conn::lost_after(read_error, recorded, had_recorded);
+/// ```
+pub fn lost_after(in read_error: db::error::PgError, in recorded: db::error::PgError, take had_recorded: Bool) -> db::error::PgError {
+    if had_recorded && db::error::kind(read_error) == db::error::kind_connection() {
+        db::error::with_sqlstate(db::error::kind_connection(), std::string::as_str(db::error::message(recorded)), std::string::as_str(db::error::sqlstate(recorded)))
+    } else {
+        db::error::with_sqlstate(db::error::kind(read_error), std::string::as_str(db::error::message(read_error)), std::string::as_str(db::error::sqlstate(read_error)))
+    }
+}
+
+/// EFFECT: close `fd` and return `e` marked closed — the one exit for every
+/// error after which the stream's position is unknown.
+///
+/// Closing is the only honest move: v0 has no destructors and a connection is
+/// a bare `Int`, so there is nowhere to hang a "broken" flag, and a descriptor
+/// left open would hand the *next* query the previous one's reply. The caller
+/// sees `db::error::is_fatal` and reconnects; it must not `shutdown` or
+/// `close` the descriptor itself, because the number may already belong to
+/// something else.
+///
+/// # Example
+/// ```tuo
+/// // return Err { error: pg::conn::lose(fd, e) };
+/// ```
+pub fn lose(take fd: Int, in e: db::error::PgError) -> db::error::PgError {
+    let _ = close(fd);
+    mark_closed(e)
 }
 
 // ----------------------------------------------------------------------------
@@ -240,10 +312,8 @@ pub fn read_message_payload(take fd: Int, take timeout_ms: Int) -> Result[String
 
 /// EFFECT: read the payload of a message whose declared length is `len`.
 ///
-/// Split out of `read_message_payload` so the length check has somewhere to
-/// live: a `match` arm in this build takes an expression, not a statement
-/// block, so multi-step arms become named functions — which reads better here
-/// regardless.
+/// Split out of `read_message_payload` so the length check is a named step
+/// rather than a block inside a `match` arm.
 ///
 /// A length below 4 would claim the message is shorter than its own header, so
 /// it is a protocol violation rather than a read count.
@@ -265,9 +335,17 @@ pub fn read_body_of_length(take fd: Int, take len: Int, take timeout_ms: Int) ->
 /// it absorbs the `ParameterStatus` and `BackendKeyData` messages every server
 /// sends, which must be drained or they desynchronize the next query.
 ///
-/// Authentication is delegated to `pg::auth`: cleartext is answered here, and
-/// anything needing crypto is refused with the typed error that names the fix
-/// (see the ADR-0019 seam in that module).
+/// Authentication is decided and computed by `pg::auth`; this function only
+/// moves the bytes. Trust, cleartext, and `md5` are one reply each
+/// (`respond_to_auth`). SCRAM-SHA-256 is three server messages, so its state
+/// — the client's first message and the signature the server must answer
+/// with — lives across this loop, and `scram_next_stage` refuses any message
+/// that arrives out of order, including an `AuthenticationOk` from a server
+/// that skipped proving itself.
+///
+/// The time spent *computing* a SCRAM proof is not covered by `timeout_ms`,
+/// which bounds each wait on the socket; `pg::auth::scram_max_iterations`
+/// is what bounds the computation.
 ///
 /// # Example
 /// ```tuo
@@ -278,6 +356,11 @@ pub fn handshake(take fd: Int, in user: Str, in database: Str, in password: Str,
     if sent < 0 {
         return Err { error: db::error::new(db::error::kind_connection(), "the connection failed while sending the startup packet") };
     }
+
+    // SCRAM spans three server messages; this is what carries over.
+    var scram_stage = scram_idle();
+    var scram_bare = std::string::empty();
+    var scram_expect = std::string::empty();
 
     // Bound the exchange so a misbehaving peer cannot spin this loop forever.
     var guard = 0;
@@ -302,10 +385,35 @@ pub fn handshake(take fd: Int, in user: Str, in database: Str, in password: Str,
         }
 
         if type_byte == pg::proto::be_authentication() {
-            let outcome = respond_to_auth(fd, payload, password);
-            if outcome != auth_continue() {
-                return Err { error: auth_outcome_error(outcome, pg::message::auth_kind(payload)) };
+            let k = pg::message::auth_kind(payload);
+            let next = scram_next_stage(scram_stage, k);
+            if next < 0 {
+                return Err { error: out_of_order_error(k) };
             }
+            if k == pg::proto::auth_sasl() {
+                let began = scram_begin(fd, payload);
+                if !is_ok_string(began) {
+                    return Err { error: unwrap_err_string(began) };
+                }
+                scram_bare = unwrap_ok_string(began);
+            } else if k == pg::proto::auth_sasl_continue() {
+                let answered = scram_continue(fd, payload, password, std::string::as_str(scram_bare));
+                if !is_ok_string(answered) {
+                    return Err { error: unwrap_err_string(answered) };
+                }
+                scram_expect = unwrap_ok_string(answered);
+            } else if k == pg::proto::auth_sasl_final() {
+                let body = pg::message::auth_sasl_body(payload);
+                if !pg::auth::scram_server_ok(std::string::as_str(body), std::string::as_str(scram_expect)) {
+                    return Err { error: pg::auth::scram_server_error() };
+                }
+            } else {
+                let outcome = respond_to_auth(fd, payload, user, password);
+                if outcome != auth_continue() {
+                    return Err { error: auth_outcome_error(outcome, k) };
+                }
+            }
+            scram_stage = next;
         } else if type_byte == pg::proto::be_ready_for_query() {
             // The handshake is complete; report the transaction status.
             return Ok { value: pg::message::tx_status(payload) };
@@ -332,41 +440,67 @@ pub fn auth_send_failed() -> Int {
     2
 }
 
-/// EFFECT: answer one `AuthenticationRequest`. Returns `auth_continue` when
-/// the exchange may go on, `auth_refused` when the demanded method cannot be
-/// performed, and `auth_send_failed` when the password could not be written.
+/// `respond_to_auth`: the request itself was malformed (an `md5` request
+/// without its salt).
+pub fn auth_malformed() -> Int {
+    3
+}
+
+/// EFFECT: answer one single-reply `AuthenticationRequest` — ok, cleartext,
+/// or `md5`. Returns `auth_continue` when the exchange may go on,
+/// `auth_refused` when the demanded method cannot be performed,
+/// `auth_send_failed` when the answer could not be written, and
+/// `auth_malformed` when the request was not well-formed.
 ///
-/// The last two are kept apart because they call for different fixes: a
-/// refused method is a `pg_hba.conf` matter, a failed write means the socket
-/// is gone — and reporting the second as the first would send an operator
-/// to the wrong place.
+/// They are kept apart because they call for different fixes: a refused
+/// method is a `pg_hba.conf` matter, a failed write means the socket is gone
+/// — and reporting the second as the first would send an operator to the
+/// wrong place.
 ///
-/// Split from `handshake` so the authentication policy is one readable
-/// function rather than a nested branch inside a loop.
-pub fn respond_to_auth(take fd: Int, in payload: String, in password: Str) -> Int {
+/// SCRAM is not answered here: it is a conversation, not a reply, and
+/// `handshake` drives it through `scram_begin` and `scram_continue`.
+pub fn respond_to_auth(take fd: Int, in payload: String, in user: Str, in password: Str) -> Int {
     let k = pg::message::auth_kind(payload);
     let p = pg::auth::plan(k);
     if p == pg::auth::plan_ok() {
         // Authenticated; the caller keeps draining until ReadyForQuery.
         auth_continue()
     } else if p == pg::auth::plan_cleartext() {
-        let n = write_message(fd, pg::proto::password(password));
-        if n < 0 {
-            auth_send_failed()
-        } else {
-            auth_continue()
-        }
+        send_password(fd, password)
+    } else if p == pg::auth::plan_md5() {
+        send_md5(fd, pg::auth::md5_response(password, user, pg::message::auth_md5_salt(payload)))
     } else {
-        // md5 / SCRAM / Kerberos / GSSAPI — refused with a typed error by the
+        // Kerberos / GSSAPI / SSPI — refused with a typed error by the
         // caller, which has the auth kind to name it.
         auth_refused()
+    }
+}
+
+/// EFFECT: send a `PasswordMessage` carrying `secret` — the password itself
+/// under cleartext, its salted digest under `md5`.
+pub fn send_password(take fd: Int, in secret: Str) -> Int {
+    let n = write_message(fd, pg::proto::password(secret));
+    if n < 0 {
+        auth_send_failed()
+    } else {
+        auth_continue()
+    }
+}
+
+/// EFFECT: send an `md5` digest, or report the request that could not be
+/// answered as malformed.
+pub fn send_md5(take fd: Int, take response: Result[String, db::error::PgError]) -> Int {
+    match response {
+        Ok { value } => send_password(fd, std::string::as_str(value)),
+        Err { error: _ } => auth_malformed(),
     }
 }
 
 /// The error for a `respond_to_auth` outcome that ended the handshake.
 ///
 /// Pure, so the mapping is spec-checked: a refusal is `kind_auth` naming the
-/// method and the fix, a failed send is `kind_connection`.
+/// method and the fix, a failed send is `kind_connection`, a malformed
+/// request is `kind_protocol`.
 ///
 /// # Example
 /// ```tuo
@@ -375,17 +509,146 @@ pub fn respond_to_auth(take fd: Int, in payload: String, in password: Str) -> In
 pub fn auth_outcome_error(take outcome: Int, take auth_kind: Int) -> db::error::PgError {
     if outcome == auth_send_failed() {
         db::error::new(db::error::kind_connection(), "the connection failed while sending the password")
+    } else if outcome == auth_malformed() {
+        db::error::new(db::error::kind_protocol(), "the server's authentication request was malformed")
     } else {
         pg::auth::unsupported_error(auth_kind)
     }
 }
 
 // ----------------------------------------------------------------------------
+// SCRAM-SHA-256: the conversation. The cryptography is `pg::auth`'s.
+// ----------------------------------------------------------------------------
+
+/// No SCRAM exchange is under way.
+pub fn scram_idle() -> Int {
+    0
+}
+
+/// The client-first message has been sent; the server's first is awaited.
+pub fn scram_sent_first() -> Int {
+    1
+}
+
+/// The client's proof has been sent; the server's signature is awaited.
+pub fn scram_sent_final() -> Int {
+    2
+}
+
+/// The server's signature has been checked; only `AuthenticationOk` remains.
+pub fn scram_verified() -> Int {
+    3
+}
+
+/// The stage an authentication message of `auth_kind` moves a handshake at
+/// `stage` to, or `-1` when that message may not arrive there.
+///
+/// This is the whole ordering rule of the handshake, pure so it is
+/// spec-checked. The line that matters most: `AuthenticationOk` is refused
+/// while a SCRAM exchange is unfinished, because a server that skips its
+/// final message has not shown that it knows the password — and that proof
+/// is the only thing standing between a client and an impostor.
+///
+/// # Example
+/// ```tuo
+/// let s = pg::conn::scram_next_stage(pg::conn::scram_idle(), pg::proto::auth_sasl()); // scram_sent_first()
+/// ```
+pub fn scram_next_stage(take stage: Int, take auth_kind: Int) -> Int {
+    if auth_kind == pg::proto::auth_sasl() {
+        if stage == scram_idle() {
+            scram_sent_first()
+        } else {
+            0 - 1
+        }
+    } else if auth_kind == pg::proto::auth_sasl_continue() {
+        if stage == scram_sent_first() {
+            scram_sent_final()
+        } else {
+            0 - 1
+        }
+    } else if auth_kind == pg::proto::auth_sasl_final() {
+        if stage == scram_sent_final() {
+            scram_verified()
+        } else {
+            0 - 1
+        }
+    } else if stage == scram_idle() || stage == scram_verified() && auth_kind == pg::proto::auth_ok() {
+        // Outside an exchange anything may be asked; after one, only Ok.
+        stage
+    } else {
+        0 - 1
+    }
+}
+
+/// The error for an authentication message that arrived out of order.
+///
+/// An `AuthenticationOk` cutting a SCRAM exchange short is an authentication
+/// failure — the server never proved itself; anything else is a protocol
+/// violation.
+///
+/// # Example
+/// ```tuo
+/// let e = pg::conn::out_of_order_error(pg::proto::auth_ok());
+/// ```
+pub fn out_of_order_error(take auth_kind: Int) -> db::error::PgError {
+    if auth_kind == pg::proto::auth_ok() {
+        pg::auth::scram_server_error()
+    } else {
+        db::error::new(db::error::kind_protocol(), "the server sent its authentication messages out of order")
+    }
+}
+
+/// EFFECT: open a SCRAM exchange in answer to `AuthenticationSASL`. Draws
+/// the client nonce, sends the `SASLInitialResponse`, and returns the
+/// client-first-message-bare the rest of the exchange is computed over.
+///
+/// Refused when the server does not offer plain `SCRAM-SHA-256`, or when
+/// the platform has no entropy for a nonce.
+pub fn scram_begin(take fd: Int, in payload: String) -> Result[String, db::error::PgError] {
+    if !pg::auth::offers_scram(pg::message::auth_sasl_body(payload)) {
+        return Err { error: pg::auth::auth_error("the server offered no SASL mechanism this adapter speaks; it needs SCRAM-SHA-256 without channel binding") };
+    }
+    let nonce = std::crypto::base64_encode(std::crypto::nonce(pg::auth::scram_nonce_bytes()));
+    let first = pg::auth::scram_client_first(std::string::as_str(nonce));
+    if !is_ok_string(first) {
+        return Err { error: unwrap_err_string(first) };
+    }
+    let message = unwrap_ok_string(first);
+    let n = write_message(fd, pg::proto::sasl_initial(pg::auth::scram_mechanism(), std::string::as_str(message)));
+    if n < 0 {
+        return Err { error: db::error::new(db::error::kind_connection(), "the connection failed while sending the SCRAM client-first message") };
+    }
+    Ok { value: pg::auth::scram_client_first_bare(std::string::as_str(nonce)) }
+}
+
+/// EFFECT: answer `AuthenticationSASLContinue`. Computes the proof, sends
+/// it, and returns the signature the server's final message must carry.
+pub fn scram_continue(take fd: Int, in payload: String, in password: Str, in client_first_bare: Str) -> Result[String, db::error::PgError] {
+    let body = pg::message::auth_sasl_body(payload);
+    match pg::auth::scram_respond(password, client_first_bare, std::string::as_str(body)) {
+        Ok { value } => scram_send_final(fd, value),
+        Err { error } => Err { error: error },
+    }
+}
+
+/// EFFECT: send the client-final message of `exchange`; the second half of
+/// `scram_continue`.
+pub fn scram_send_final(take fd: Int, in exchange: pg::auth::Scram) -> Result[String, db::error::PgError] {
+    let message = pg::auth::scram_client_final(exchange);
+    let n = write_message(fd, pg::proto::sasl_response(std::string::as_str(message)));
+    if n < 0 {
+        return Err { error: db::error::new(db::error::kind_connection(), "the connection failed while sending the SCRAM proof") };
+    }
+    Ok { value: pg::auth::scram_server_signature(exchange) }
+}
+
+// ----------------------------------------------------------------------------
 // Result helpers.
 //
-// A `match` arm in this build takes an expression, not a statement block, so
-// the "inspect, then act" shape a protocol loop needs is expressed with these
-// small named projections instead of nested blocks.
+// The "inspect, then act" shape a protocol loop needs is expressed with these
+// small named projections: each borrows, so a result can be inspected and
+// still unwrapped afterwards, where a `match` on the owned value would move
+// it.
 // ----------------------------------------------------------------------------
 
 /// Is this `Result[Int, PgError]` an `Ok`? Borrows rather than consumes, so
@@ -522,12 +785,86 @@ spec default_port {
     then default_port() == 5432;
 }
 
+/// Spec helper: the kind of a marked-closed error of kind `k`.
+pub fn closed_kind(take k: Int) -> Int {
+    db::error::kind(mark_closed(db::error::new(k, "x")))
+}
+
+/// Spec helper: the message of a marked-closed timeout.
+pub fn closed_message_is(in expect: Str) -> Bool {
+    std::string::as_str(db::error::message(mark_closed(db::error::new(db::error::kind_timeout(), "slow")))) == expect
+}
+
+/// Spec helper: the kind `lost_after` reports for a read error of `read_kind`
+/// when a `57P01` was (or was not) recorded first.
+pub fn lost_after_kind(take read_kind: Int, take had: Bool) -> Int {
+    db::error::kind(lost_after(db::error::new(read_kind, "r"), db::error::server("gone", "57P01"), had))
+}
+
+/// Spec helper: the SQLSTATE `lost_after` reports in the same situation.
+pub fn lost_after_state_is(take read_kind: Int, take had: Bool, in expect: Str) -> Bool {
+    std::string::as_str(db::error::sqlstate(lost_after(db::error::new(read_kind, "r"), db::error::server("gone", "57P01"), had))) == expect
+}
+
+spec mark_closed {
+    // The kind survives, the message says the descriptor is gone, and the
+    // result is what `is_fatal` recognizes.
+    then closed_kind(db::error::kind_timeout()) == db::error::kind_timeout();
+    then closed_kind(db::error::kind_connection()) == db::error::kind_connection();
+    then closed_message_is("slow; the connection has been closed and the descriptor must not be used again");
+    then db::error::is_fatal(mark_closed(db::error::new(db::error::kind_timeout(), "x")));
+}
+
+spec lost_after {
+    // A server that announced why it was closing is reported in its own
+    // words, with its SQLSTATE, as a connection error.
+    then lost_after_kind(db::error::kind_connection(), true) == db::error::kind_connection();
+    then lost_after_state_is(db::error::kind_connection(), true, "57P01");
+    // No announcement: the read error stands as it was.
+    then lost_after_state_is(db::error::kind_connection(), false, "");
+    // A timeout is a timeout, whatever was recorded before it.
+    then lost_after_kind(db::error::kind_timeout(), true) == db::error::kind_timeout();
+    then lost_after_state_is(db::error::kind_timeout(), true, "");
+}
+
 spec auth_outcome_error {
     // A refused method is an auth error; a failed send is a connection
     // error, never an "unsupported cleartext" one.
-    then db::error::kind(auth_outcome_error(auth_refused(), pg::proto::auth_md5())) == db::error::kind_auth();
+    then db::error::kind(auth_outcome_error(auth_refused(), pg::proto::auth_kerberos())) == db::error::kind_auth();
     then db::error::kind(auth_outcome_error(auth_send_failed(), pg::proto::auth_cleartext())) == db::error::kind_connection();
-    // The three outcomes are distinct.
+    then db::error::kind(auth_outcome_error(auth_malformed(), pg::proto::auth_md5())) == db::error::kind_protocol();
+    // The outcomes are distinct.
     then auth_continue() != auth_refused();
     then auth_refused() != auth_send_failed();
+    then auth_send_failed() != auth_malformed();
+}
+
+spec scram_next_stage {
+    // The one legal path through an exchange.
+    then scram_next_stage(scram_idle(), pg::proto::auth_sasl()) == scram_sent_first();
+    then scram_next_stage(scram_sent_first(), pg::proto::auth_sasl_continue()) == scram_sent_final();
+    then scram_next_stage(scram_sent_final(), pg::proto::auth_sasl_final()) == scram_verified();
+    then scram_next_stage(scram_verified(), pg::proto::auth_ok()) == scram_verified();
+    // With no exchange under way, the single-reply methods pass through.
+    then scram_next_stage(scram_idle(), pg::proto::auth_ok()) == scram_idle();
+    then scram_next_stage(scram_idle(), pg::proto::auth_cleartext()) == scram_idle();
+    then scram_next_stage(scram_idle(), pg::proto::auth_md5()) == scram_idle();
+    // A server may not declare success before proving itself.
+    then scram_next_stage(scram_sent_first(), pg::proto::auth_ok()) == 0 - 1;
+    then scram_next_stage(scram_sent_final(), pg::proto::auth_ok()) == 0 - 1;
+    // Nor skip, repeat, or restart a step.
+    then scram_next_stage(scram_idle(), pg::proto::auth_sasl_continue()) == 0 - 1;
+    then scram_next_stage(scram_idle(), pg::proto::auth_sasl_final()) == 0 - 1;
+    then scram_next_stage(scram_sent_first(), pg::proto::auth_sasl_final()) == 0 - 1;
+    then scram_next_stage(scram_sent_first(), pg::proto::auth_sasl()) == 0 - 1;
+    then scram_next_stage(scram_verified(), pg::proto::auth_sasl()) == 0 - 1;
+    // Nor change its mind and ask for the password in the clear mid-exchange.
+    then scram_next_stage(scram_sent_first(), pg::proto::auth_cleartext()) == 0 - 1;
+    then scram_next_stage(scram_verified(), pg::proto::auth_cleartext()) == 0 - 1;
+    then scram_next_stage(scram_sent_final(), pg::proto::auth_md5()) == 0 - 1;
+}
+
+spec out_of_order_error {
+    then db::error::kind(out_of_order_error(pg::proto::auth_ok())) == db::error::kind_auth();
+    then db::error::kind(out_of_order_error(pg::proto::auth_sasl_final())) == db::error::kind_protocol();
 }

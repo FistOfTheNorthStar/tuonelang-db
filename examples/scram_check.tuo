@@ -1,0 +1,85 @@
+// scram_check — SCRAM-SHA-256 against RFC 7677's published exchange.
+//
+// The specs in `pg::auth` prove the exchange at two PBKDF2 iterations,
+// because the spec sandbox's fuel does not stretch further. A real server
+// asks for 4096, and RFC 7677 §3 publishes a complete exchange at that
+// count: user `user`, password `pencil`, both nonces, the salt, and the two
+// values that matter — the client's proof and the server's signature. This
+// program computes both natively and compares them to the RFC's text, so
+// the adapter's SCRAM is checked against a vector it did not produce.
+//
+// It needs no server:
+//
+//     tuo run examples/scram_check.tuo src/db/*.tuo src/pg/*.tuo
+//
+// Exit codes:
+//
+//      0  both values match the RFC
+//     30  scram_respond refused the RFC's server-first message
+//     31  the client-final message (and so the proof) differs
+//     32  the expected server signature differs
+//     33  the RFC's server-final message was not accepted
+//     34  a server-final message with a wrong signature was accepted
+
+module scram_check;
+
+fn say(in label: Str) -> Int {
+    let _ = std::rt::write(1, label);
+    std::rt::write(1, "\n")
+}
+
+/// The `client-final-message` of `r`, or the empty string for a refusal.
+fn final_of(in r: Result[pg::auth::Scram, db::error::PgError]) -> String {
+    match r {
+        Ok { value } => pg::auth::scram_client_final(value),
+        Err { error: _ } => std::string::empty(),
+    }
+}
+
+/// The expected server signature of `r`, or the empty string for a refusal.
+fn signature_of(in r: Result[pg::auth::Scram, db::error::PgError]) -> String {
+    match r {
+        Ok { value } => pg::auth::scram_server_signature(value),
+        Err { error: _ } => std::string::empty(),
+    }
+}
+
+fn main() -> Int {
+    // RFC 7677 §3. The RFC's client names its user in the first message;
+    // this adapter leaves that field empty, but the computation is over
+    // whatever bare message was sent, so the RFC's is passed as it stands.
+    let bare = "n=user,r=rOprNGfwEbeRWgbNEkqO";
+    let server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+    let want_final = "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=";
+    let want_signature = "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=";
+
+    let r = pg::auth::scram_respond("pencil", bare, server_first);
+    let got_final = final_of(r);
+    let got_signature = signature_of(r);
+    if std::string::len(got_final) == 0 {
+        let _ = say("FAIL scram_respond refused the RFC's server-first message");
+        return 30;
+    }
+    if std::string::as_str(got_final) != want_final {
+        let _ = say("FAIL client-final message differs from RFC 7677");
+        return 31;
+    }
+    let _ = say("ok   client proof matches RFC 7677 (4096 iterations)");
+    if std::string::as_str(got_signature) != want_signature {
+        let _ = say("FAIL server signature differs from RFC 7677");
+        return 32;
+    }
+    if !pg::auth::scram_server_ok("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=", std::string::as_str(got_signature)) {
+        let _ = say("FAIL the RFC's server-final message was not accepted");
+        return 33;
+    }
+    let _ = say("ok   server signature matches RFC 7677");
+    if pg::auth::scram_server_ok("v=7rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=", std::string::as_str(got_signature)) {
+        let _ = say("FAIL a wrong server signature was accepted");
+        return 34;
+    }
+    let _ = say("ok   a wrong server signature is refused");
+    let _ = say("");
+    let _ = say("all scram checks passed");
+    0
+}

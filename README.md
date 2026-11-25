@@ -11,22 +11,25 @@ Two features share one backend-neutral core:
 | **`vector`** | An embedded vector store for embeddings: cosine/L2/dot search, string payloads, and a single-file format. No server, no dependencies. |
 
 Both are implemented from their specifications, and both have their whole pure
-layer proven by colocated executable specs — **149** of them.
+layer proven by colocated executable specs — **160** of them.
 
 ```tuo
 module app;
 
 fn main() -> Int {
-    let opened = pg::conn::connect("127.0.0.1", 5432, "postgres", "app", "", 30000);
+    let opened = pg::conn::connect("127.0.0.1", 5432, "postgres", "app", "secret", 30000);
     if !pg::conn::is_ok_int(opened) {
         return 1;
     }
-    let db = pg::conn::unwrap_ok_int(opened);
+    let conn = pg::conn::unwrap_ok_int(opened);
 
-    let result = pg::query::run(db, "SELECT id, name FROM users ORDER BY id", 30000);
+    let result = pg::query::run(conn, "SELECT id, name FROM users ORDER BY id", 30000);
     if !pg::query::is_ok_result(result) {
-        let _ = std::rt::write_string(1, pg::query::render_error(result));
-        let _ = pg::conn::shutdown(db);
+        let e = pg::query::unwrap_err_result(result);
+        let _ = std::rt::write_string(1, db::error::render(e));
+        if !db::error::is_fatal(e) {
+            let _ = pg::conn::shutdown(conn); // a fatal error already closed it
+        }
         return 1;
     }
     let rows = pg::query::unwrap_ok_result(result);
@@ -38,7 +41,7 @@ fn main() -> Int {
         i = i + 1;
     }
 
-    let _ = pg::conn::shutdown(db);
+    let _ = pg::conn::shutdown(conn);
     0
 }
 ```
@@ -47,6 +50,15 @@ And the vector store, which needs nothing running at all:
 
 ```tuo
 module app;
+
+/// Build a 3-D vector. Real embeddings are pushed in a loop.
+fn v3(take a: Float, take b: Float, take c: Float) -> Array[Float] {
+    var xs = std::array::empty();
+    std::array::push(xs, a);
+    std::array::push(xs, b);
+    std::array::push(xs, c);
+    xs
+}
 
 fn main() -> Int {
     var store = vec::db::open("/tmp/docs.tvec", 3, vec::metric::metric_cosine());
@@ -84,7 +96,7 @@ fn main() -> Int {
 - ✅ A single-file format (`TVEC`) that round-trips a collection exactly, drops
       tombstones on save, and refuses a corrupt or truncated file rather than
       half-reading it
-- ✅ `sqrt` written in tuonelang, because there is no `std::math` — proven
+- ✅ `sqrt` over the native `std::float::sqrt`, with degenerate inputs clamped — proven
       against known roots *and* against its own definition
 
 Deliberately **not** implemented, and documented as absent rather than faked:
@@ -108,18 +120,27 @@ excellent to roughly 10^5 vectors and honest beyond it.
 - ✅ `ErrorResponse` → typed errors carrying the server's **SQLSTATE**
 - ✅ Bounded waits on every read and connect (ADR-0017) — no unbounded hang
 - ✅ Connection stays usable after a server error (the stream is drained)
-- ✅ Trust and cleartext-password authentication
+- ✅ A timeout or a lost connection **closes the descriptor** and the error
+  says so (`db::error::is_fatal`), so a late reply can never be read as the
+  next query's — and a server that announced why it was closing (`57P01`)
+  is reported in its own words
+- ✅ Results of any size: no message cap, and a million-row `SELECT` is one
+  of the live oracle's checks
+- ✅ Out-of-range cell reads are SQL NULL, never an index trap
+- ✅ **SCRAM-SHA-256** authentication (PostgreSQL's default since 14),
+  including the half that authenticates the *server*: a server that cannot
+  produce its signature is refused
+- ✅ `md5`, cleartext-password, and trust authentication
 
 **Blocked on the language, and refused rather than faked:**
 
-- ⛔ `md5` authentication — needs `std::crypto::md5`
-- ⛔ SCRAM-SHA-256 authentication — needs SHA-256, HMAC, PBKDF2
-- ⛔ TLS — out of scope for ADR-0014/0017/0019 alike
+- ⛔ TLS — `std::tls` is the server side of a handshake with Ed25519
+  certificates only; a client that could verify a real server's certificate
+  chain is not expressible yet. So no `sslmode=require`, and no
+  `SCRAM-SHA-256-PLUS` (channel binding needs the TLS channel)
+- ⛔ Host names — there is no DNS resolver
 
-Both auth methods are **fully wired up to the point crypto is needed**: the
-message framing is encoded byte-exactly and spec-checked, and the two functions
-that need a digest carry their final signatures and return a typed error naming
-the blocker and the operator's fix. See [Authentication](#authentication).
+See [Authentication](#authentication).
 
 Not implemented: LISTEN/NOTIFY delivery, cursors/portal suspension, binary
 format, connection pooling. Two things are **refused with `kind_unsupported`**,
@@ -140,7 +161,7 @@ pgvector's `vector`).
 
 ```tuo
 // Load every embedding in a table into an in-memory collection.
-let rows = pg::query::unwrap_ok_result(pg::query::run(db, "SELECT id, body, embedding FROM docs", 30000));
+let rows = pg::query::unwrap_ok_result(pg::query::run(conn, "SELECT id, body, embedding FROM docs", 30000));
 var store = vec::db::in_memory(384, vec::metric::metric_cosine());
 var i = 0;
 while i < pg::query::row_count(rows) {
@@ -167,16 +188,22 @@ are selected. pgvector's `vector` type works the same way with
 - **A numeric host address.** tuonelang v0 has no DNS resolver (ADR-0017 leaves
   it to be written in tuonelang on the UDP primitives), so pass `"127.0.0.1"`,
   not `"localhost"`.
+- **A server that accepts unencrypted connections** (`host`, not `hostssl`, in
+  `pg_hba.conf`): there is no TLS. Most managed PostgreSQL services require
+  it, so today this means a server you run.
 
 ## Running
 
 ```bash
-# Everything that needs no server: front end, 149 specs, formatting
+# Everything that needs no server: front end, 160 specs, formatting
 ./run-tests.sh
 
-# Also run the live oracles. The vector one needs only a writable /tmp;
-# the two PostgreSQL ones need a running server.
+# Also run the live oracles. The vector ones need only a writable /tmp and
+# the SCRAM one needs nothing; the other PostgreSQL ones talk to a throwaway
+# server in Docker, on a loopback port with credentials of its own.
+examples/test-server.sh start
 ./run-tests.sh --live
+examples/test-server.sh stop
 
 # Just the vector store, end to end — no server required at all
 ./run-tests.sh --vector --live
@@ -185,7 +212,8 @@ are selected. pgvector's `vector` type works the same way with
 Or drive the compiler directly:
 
 ```bash
-tuo verify src/db/*.tuo src/pg/*.tuo src/vec/*.tuo            # 149 specs, nothing running
+tuo verify src/db/*.tuo src/pg/*.tuo src/vec/*.tuo            # 160 specs, nothing running
+tuo run examples/scram_check.tuo src/db/*.tuo src/pg/*.tuo    # SCRAM vs RFC 7677, no server
 tuo run examples/live_check.tuo src/db/*.tuo src/pg/*.tuo     # protocol oracle
 tuo run examples/crud_check.tuo src/db/*.tuo src/pg/*.tuo     # the guide's patterns
 tuo run examples/vector_check.tuo src/db/*.tuo src/vec/*.tuo  # vector oracle
@@ -242,12 +270,12 @@ depending only on those above it.
 |--------|---------|------|--------------|
 | `db::bytes` | core | pure | Big-endian encode/decode, C strings. The byte-order layer. |
 | `db::error` | core | pure | Typed errors: kind + message + SQLSTATE. |
-| `db::math` | core | pure | `sqrt` and float helpers — v0 has no `std::math`. |
+| `db::math` | core | pure | Float helpers: a clamped `sqrt`, NaN/infinity classification, tolerant comparison. |
 | `db::text` | core | pure | Integers and floats as decimal text, for messages and literals. |
 | `pg::proto` | postgresql | pure | Protocol constants and every **frontend** message encoder. |
 | `pg::message` | postgresql | pure | **Backend** message decoding — field accessors over payload bytes. |
 | `pg::value` | postgresql | pure | Type OIDs, text-format value decoders, and the float-array / pgvector codec. |
-| `pg::auth` | postgresql | pure | Authentication policy, and the crypto seam. |
+| `pg::auth` | postgresql | pure | Authentication policy, and the `md5` and SCRAM-SHA-256 computations. |
 | `pg::conn` | postgresql | **effect** | The socket: connect, framed read/write, handshake. |
 | `pg::query` | postgresql | **effect** | `run` / `execute` / `scalar` and their `_params` forms, `run_params_null` for SQL NULL, and `ResultSet`. |
 | `vec::metric` | vector | pure | Cosine / L2 / dot kernels over flat float slices. |
@@ -273,13 +301,17 @@ The **pure/effect split** is the same one `tuo-stdlib` uses, and it is load
 bearing: a spec cannot touch an effect (`R0007`), so all the logic worth
 proving — framing, decoding, NULL handling, error mapping, auth policy, and on
 the vector side every metric, the ranking, and the whole file format — lives in
-the pure tier and carries **149 executable specs**. The effect tier is thin by
+the pure tier and carries **160 executable specs**. The effect tier is thin by
 design and is pinned by `examples/live_check.tuo` against a real server and by
 `examples/vector_check.tuo` against a real filesystem.
 
+The standard library does the arithmetic, and this library does not repeat
+it: byte order is `std::bits`, the square root is `std::float::sqrt`, and
+every digest in the authentication exchange is `std::crypto`.
+
 ### Design decisions worth knowing
 
-**A connection is an `Int`.** v0 has no `Box` and no destructors, so a
+**A connection is an `Int`.** v0 has no destructors, so a
 connection is the descriptor the OS calls it. Nothing pretends to manage its
 lifetime; you call `pg::conn::shutdown` (or `close`) yourself.
 
@@ -294,63 +326,63 @@ act on, so `PgError` carries a `kind_*` tag *and* the server's SQLSTATE.
 branch on a duplicate key without matching English text.
 
 **Text format everywhere.** The adapter requests text format for all columns:
-one decoder serves both protocols, the renderings are specified and stable, and
-no bitwise operations are required to parse them.
+one decoder serves both protocols, and the renderings are specified and stable.
 
 ## Authentication
 
 | Server demands | Adapter |
 |----------------|---------|
 | `trust` (`AuthenticationOk`) | ✅ works |
+| `scram-sha-256` | ✅ works |
+| `md5` | ✅ works |
 | `password` (cleartext) | ✅ works |
-| `md5` | ⛔ typed error naming the fix |
-| `scram-sha-256` | ⛔ typed error naming the fix |
+| `scram-sha-256` over `hostssl`, Kerberos, GSSAPI, SSPI | ⛔ typed error naming the fix |
 
-The two blocked methods need MD5 and SHA-256, which this adapter does not yet
-implement. [ADR-0019](https://github.com/FistOfTheNorthStar/tuonelang) has
-landed **Stage A**: `|`, `^`, `&`, `<<`, `>>`, and `~` all work today, so the
-hashes are now *expressible* — masking to 32 bits (`(x + 1) & 0xFFFFFFFF`) and
-composing a rotate from two shifts both behave correctly. What is still missing
-is **Stage B**: `std::crypto` (`md5`, `sha256`, `hmac_sha256`,
-`pbkdf2_sha256`, `base64_*`) and `std::bits` do not resolve yet, so the
-primitives must either be hand-written over the new operators or wait for the
-stdlib.
+Nothing changes at the call site: `pg::conn::connect` takes the password and
+answers whichever method the server asks for.
 
-Rather than pretend, the adapter **refuses** — the same rule the compiler
-applies to itself — and the error says what to do:
+**SCRAM-SHA-256** is the one to use. The password never crosses the wire —
+the client sends a proof derived from it — and the exchange runs in both
+directions: the server's last message must carry a signature only something
+holding the stored credentials can produce, and the adapter checks it in
+constant time. A server that skips or fails that step is refused with a
+`kind_auth` error even if it then says "authenticated", which is what stops
+an impostor from collecting queries.
+
+The cryptography is `std::crypto` (ADR-0019 Stage B) — SHA-256, HMAC, PBKDF2
+— and its use here is checked three ways: the specs in `pg::auth` against
+values computed independently, [`examples/scram_check.tuo`](examples/scram_check.tuo)
+against the complete exchange RFC 7677 publishes, and
+[`examples/auth_check.tuo`](examples/auth_check.tuo) against real servers
+configured for each method.
+
+What to know before relying on it:
+
+- **There is no TLS.** Authentication proves who is at each end; it does not
+  hide or protect what follows. Queries and results cross the network in the
+  clear, so use a loopback, a private network, or a tunnel.
+- **The adapter answers whatever the server asks.** Something in the path
+  that can impersonate the server can ask for the cleartext password instead
+  of SCRAM, and it will be sent. On a link you do not control, that is one
+  more reason for a tunnel.
+- **`md5`** works because servers still offer it; it is broken and PostgreSQL
+  has deprecated it. **`password`** sends the secret as it is.
+- **No SASLprep.** The password is used as the bytes given, which is exact
+  for ASCII; a password whose Unicode normalization differs from its spelling
+  will not authenticate.
+- **The iteration count is the server's**, and the client does that much
+  work: about 13 ms at PostgreSQL's default of 4096 in a `tuo run` (debug)
+  build. A count above 1,000,000 — about three seconds — is refused rather
+  than run, and that computation is not covered by the connect timeout.
+
+A method the adapter cannot perform is refused with an error that says what
+to do:
 
 ```
-auth: server requested md5 authentication, which this adapter cannot
-perform: it needs hashing that this adapter does not yet implement.
-ADR-0019 Stage A landed the bitwise operators, but std::crypto (Stage B)
-is not available yet; until then, either use trust or password
-authentication for this host in pg_hba.conf, or connect over a channel
-that has already authenticated.
+auth: server requested GSSAPI authentication, which this adapter does not
+implement. Configure the server to offer scram-sha-256, md5, password, or
+trust for this host in pg_hba.conf.
 ```
-
-To connect today, grant `trust` (or `password`) for your client host in
-`pg_hba.conf`. With no TLS, `password` sends the secret in cleartext, so keep
-it to loopback or a link you already trust:
-
-```
-host  all  all  127.0.0.1/32  trust
-```
-
-### When ADR-0019 Stage B lands
-
-The migration is deliberately small, because the seam was built for it (and
-Stage A, the operator half, is already in place):
-
-1. `pg::auth::md5_response` and `scram_client_first` — replace the `Err` body
-   with the real computation. **Signatures do not change.**
-2. `pg::auth::is_supported` — let `plan_md5` and `plan_sasl` through. Its spec
-   already pins that these two are the only ones that should flip.
-3. `pg::conn::respond_to_auth` — add the two branches.
-4. `db::bytes` — bodies become one-liners over `std::bits`; every signature and
-   all 6 specs stay as they are.
-
-No caller changes, and the SASL message framing in `pg::proto` is already
-encoded and spec-checked.
 
 ## Documentation
 
@@ -369,6 +401,11 @@ encoded and spec-checked.
   oracle, and the best worked example of the API in use.
 - [`examples/crud_check.tuo`](examples/crud_check.tuo) — transactions, unique
   violations by SQLSTATE, and OID classification, all proven live.
+- [`examples/scram_check.tuo`](examples/scram_check.tuo) — SCRAM-SHA-256
+  against RFC 7677's published exchange; needs no server.
+- [`examples/auth_check.tuo`](examples/auth_check.tuo) — one authentication
+  method against a server you point it at, including that a wrong password
+  is refused.
 - [`examples/vector_check.tuo`](examples/vector_check.tuo) — the vector
   acceptance oracle: real files, and a proof that persistence does not perturb
   search ranking.
